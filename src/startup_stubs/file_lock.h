@@ -55,8 +55,9 @@ public:
     LockResult acquire(const std::filesystem::path& file, bool exclusive, std::chrono::milliseconds timeout)
     {
         release();
+        last_error_ = 0;
         if (!open(file)) return LockResult::error;
-        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        const auto deadline = deadline_after(std::chrono::steady_clock::now(), timeout);
         for (int pause = 1;; pause = pause < 16 ? pause * 2 : pause) {
             last_error_ = 0;
             const Attempt attempt = try_lock_once(exclusive);
@@ -72,8 +73,8 @@ public:
         return LockResult::error;
     }
 
-    // The system error (GetLastError, or errno) of the last failed lock attempt; 0 when none failed.
-    // Kept for diagnostics: it says why a lock ended in busy or error.
+    // The system error (GetLastError, or errno) of the last failed open or lock attempt; 0 when none
+    // failed. Kept for diagnostics: it says why a lock ended in busy or error.
     std::uint32_t last_error() const noexcept { return last_error_; }
 
     void release() noexcept
@@ -90,15 +91,37 @@ public:
 private:
     enum class Attempt { locked, busy, error };
 
+    // now + timeout without overflow: a timeout too large for the clock saturates at the latest time
+    // point (wait for ever); zero or negative means one attempt only.
+    static std::chrono::steady_clock::time_point deadline_after(std::chrono::steady_clock::time_point now,
+                                                                std::chrono::milliseconds timeout)
+    {
+        using Clock = std::chrono::steady_clock;
+        if (timeout <= std::chrono::milliseconds::zero()) return now;
+        const auto max_step = std::chrono::duration_cast<std::chrono::milliseconds>((Clock::duration::max)());
+        while (now.time_since_epoch() < Clock::duration::zero()) {
+            if (timeout <= max_step) return now + timeout;
+            now += max_step;
+            timeout -= max_step;
+        }
+        const auto room = std::chrono::duration_cast<std::chrono::milliseconds>((Clock::time_point::max)() - now);
+        if (timeout >= room) return (Clock::time_point::max)();
+        return now + timeout;
+    }
+
     bool open(const std::filesystem::path& file)
     {
 #ifdef _WIN32
         handle_ = CreateFileW(file.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                               nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        return handle_ != INVALID_HANDLE_VALUE;
+        if (handle_ != INVALID_HANDLE_VALUE) return true;
+        last_error_ = GetLastError();
+        return false;
 #else
         fd_ = ::open(file.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
-        return fd_ >= 0;
+        if (fd_ >= 0) return true;
+        last_error_ = static_cast<std::uint32_t>(errno);
+        return false;
 #endif
     }
 

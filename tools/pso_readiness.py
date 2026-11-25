@@ -8,6 +8,8 @@ import re
 
 
 def shader_key(record):
+    if not isinstance(record, dict):
+        raise ValueError("shader references require a stage and a full native SHA-256")
     digest = record["sha256"]
     stage = record["stage"]
     if not isinstance(stage, str) or not stage or not isinstance(digest, str) or not re.fullmatch(
@@ -101,6 +103,8 @@ def report(manifest, pipelines, root, llvm=None):
     ids = set()
     rows = []
     for pipeline in pipelines["pipelines"]:
+        if not isinstance(pipeline, dict):
+            raise ValueError("pipeline entries must be JSON objects")
         identity = pipeline["id"]
         if not isinstance(identity, str) or not identity or identity in ids:
             raise ValueError(f"empty or duplicate pipeline ID {identity!r}")
@@ -109,6 +113,8 @@ def report(manifest, pipelines, root, llvm=None):
         if root_status not in ("present", "missing", "unknown"):
             raise ValueError(f"invalid root signature status for {identity}")
         stages = {}
+        if not isinstance(pipeline["shaders"], list):
+            raise ValueError(f"pipeline {identity} shaders must be a list")
         if not pipeline["shaders"]:
             raise ValueError(f"pipeline {identity} has no shader references")
         for reference in pipeline["shaders"]:

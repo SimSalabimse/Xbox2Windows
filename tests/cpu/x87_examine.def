@@ -5,3 +5,5 @@ EXPORTS
     fnop_fclex
     legacy_controls
     ffreep_top
+    ffree_empty
+    fstsw_top

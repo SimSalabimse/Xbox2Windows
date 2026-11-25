@@ -1,6 +1,7 @@
 """Publish two placed R8 textures by address, render their texels, and test rejected updates."""
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -41,11 +42,43 @@ def draw_texture(directory, consumer, backend, hlsl, modes, view_kind="tex2d", *
     return output.read_bytes()
 
 
+R8_RESOURCE = r"res\{dim=3 fmt=61 size=%sx2x1 mips=1 layout=0x0 flags=0x0 align=0 samples=1/0\}"
+R8_VIEW = r"view\{dim=4 fmt=61 map=0x1688 mostmip=0 mips=1 plane=0 clamp=0\}"
+HEX = r"0x[0-9a-f]+"
+
+
+def check_refusal_lines(log):
+    """Each refused slot 70 call logs one line with the cause and the fields the checks read."""
+    prefix = r"x2w-d3d12 Device::slot70 "
+    expected = [
+        # zero address, wrong width, interior address, buffer view, destination off the heap
+        prefix + r"unsupported memory SRV arguments: reason=null_address " + R8_RESOURCE % 2 + " " + R8_VIEW
+        + rf" dest={HEX} dest_in_view_heap=1 address=0x0 address_readable=0",
+        prefix + r"unavailable texture at the supplied base and layout: reason=texture_unavailable " + R8_RESOURCE % 1
+        + " " + R8_VIEW + rf" dest={HEX} dest_in_view_heap=1 address={HEX} address_readable=1",
+        prefix + r"unavailable texture at the supplied base and layout: reason=texture_unavailable " + R8_RESOURCE % 2
+        + " " + R8_VIEW + rf" dest={HEX} dest_in_view_heap=1 address={HEX} address_readable=1",
+        prefix + r"unavailable buffer at the supplied address: reason=buffer_unavailable "
+        + r"res\{dim=1 fmt=0 size=256x1x1 mips=1 layout=0x1 flags=0x0 align=0 samples=1/0\} "
+        + r"view\{dim=1 fmt=0 map=0x1688 first=0 count=64 stride=4 flags=0x0 \(buffer views are not supported\)\} "
+        + rf"dest={HEX} dest_in_view_heap=1 address={HEX} address_readable=1",
+        prefix + r"unsupported memory SRV arguments: reason=destination_outside_view_heaps " + R8_RESOURCE % 2 + " "
+        + R8_VIEW + rf" dest={HEX} dest_in_view_heap=0 address={HEX} address_readable=1",
+    ]
+    lines = [line.rstrip() for line in log.splitlines() if "Device::slot70" in line]
+    if len(lines) != len(expected):
+        raise AssertionError(f"{len(lines)} slot 70 lines, expected {len(expected)}:\n" + "\n".join(lines))
+    for line, pattern in zip(lines, expected):
+        if not re.fullmatch(pattern, line):
+            raise AssertionError(f"slot 70 line does not match\n  line     {line}\n  expected {pattern}")
+
+
 def check(directory, consumer, backend):
     hlsl = ("Texture2D<float> t : register(t0);\n"
             "float4 main(float4 p : SV_Position) : SV_Target {\n"
             "  return float4(t.Load(int3(uint2(p.xy) % 2, 0)), 0, 0, 1);\n}\n")
-    actual = draw_texture(directory, consumer, backend, hlsl, {"X2W_TEST_ADDRESS_SRV": "1"})
+    trap_log = directory / "trap.log"
+    actual = draw_texture(directory, consumer, backend, hlsl, {"X2W_TEST_ADDRESS_SRV": "1", "X2W_TRAP_LOG": str(trap_log)})
     if actual is None:
         return 77
     plane_at_x = (0, 1, 0, 0, 1, 1, 1, 0)
@@ -53,6 +86,7 @@ def check(directory, consumer, backend):
                      for c in (16 + plane * 128 + (y % 2) * 32 + (x % 2) * 7, 0, 0, 255))
     if actual != expected:
         raise AssertionError(f"actual {actual.hex()} expected {expected.hex()}")
+    check_refusal_lines(trap_log.read_text(errors="replace"))
     print(f"{backend}: ordinary view, alternating addresses, zero/interior/mismatched updates; all 32 RGBA pixels exact")
     return 0
 

@@ -1079,10 +1079,498 @@ def fp_inputs(seed, kinds):
     return values
 
 
+# Mid-body RSP changes: functions whose RSP moves after the prologue, by SUB and ADD RSP, by PUSH and POP of a
+# saved register that holds data, differently in the two arms of a branch, around a direct call, and below an RBP
+# anchor that LEAVE or POP RBP releases. Each export is fn(x, y, out) with x in RCX, y in RDX and the output
+# buffer in R8. cpu_switch_aot gives every [RSP+d] and [RBP+d] operand a constant index into one frame array,
+# so a value stored at one depth and read back at another, through either base, must reach the same bytes.
+RSP_SHAPES = ("adjust", "push", "branch", "call", "anchor_leave", "anchor_pop")
+RSP_STEPS = (8, 16, 24, 32, 40, 48)
+# RSP stays within 256 bytes below entry RSP.
+RSP_DEEPEST = -0x100
+# Output words 0 to 19 take reloaded values and call results, the words from RSP_REGISTERS on the saved
+# registers' final values, and each call's callee writes its own word from RSP_CALLEE on.
+RSP_LOADS = 20
+RSP_MIN_LOADS = 4
+RSP_REGISTERS = 0xA0
+RSP_CALLEE = 0xC0
+# Each shape: the weight of every body operation, and the operations that it makes at least once.
+RSP_WEIGHTS = {
+    "adjust": ({"store": 3, "load": 3, "rmw": 1, "grow": 2, "shrink": 2}, ()),
+    "push": ({"store": 2, "load": 3, "push": 3, "pop": 3, "grow": 1, "shrink": 1}, ("push",)),
+    "branch": ({"store": 2, "load": 2, "rmw": 1, "grow": 1, "shrink": 1, "push": 1, "pop": 1}, ("branch",)),
+    "call": ({"store": 2, "load": 2, "grow": 1, "shrink": 1}, ("call",)),
+    "anchor_leave": ({"store": 3, "load": 3, "rmw": 1, "grow": 2, "shrink": 1, "push": 1, "pop": 1}, ("grow",)),
+    "anchor_pop": ({"store": 3, "load": 3, "rmw": 1, "grow": 2, "shrink": 1, "push": 1, "pop": 1}, ("grow",)),
+}
+# Negative controls: a body after a 16-byte allocation that the translator must refuse, and the reason it must give.
+RSP_CONTROLS = {
+    "released": (["sub rsp, 16", "mov QWORD PTR [rsp], rcx", "add rsp, 16", "sub rsp, 16", "mov rax, QWORD PTR [rsp]",
+                  "add rsp, 16"], "undefined stack byte"),
+    "join": (["test cl, 1", "jz {name}_join", "sub rsp, 8", "{name}_join:", "mov QWORD PTR [rsp], rdx", "mov rax, rdx"],
+             "stack depth differs at join"),
+    "below": (["sub rsp, 16", "mov QWORD PTR [rsp], rcx", "add rsp, 16", "mov rax, QWORD PTR [rsp-8]"],
+              "stack access below RSP"),
+    "unaligned": (["sub rsp, 4", "mov DWORD PTR [rsp], ecx", "add rsp, 4", "mov rax, rcx"],
+                  "unsupported stack adjustment"),
+}
+
+
+class RspBuilder:
+    """Emits one function whose RSP moves after the prologue, and follows which stack bytes hold a defined
+    value, so that it reads only what cpu_switch_aot accepts: a read needs each byte written on every path, and
+    the bytes that ADD RSP and POP leave below RSP, and the callee's home space after a call, are undefined.
+
+    Offsets are from entry RSP. The prologue pushes one to three saved registers (and RBP for an anchored
+    shape) and allocates 16 to 48 bytes; the body may use that allocation, the caller's home space and what it
+    allocates itself, but never the pushed slots or the return address. Every saved register is overwritten
+    from the arguments before it is read, and the body pushes and pops only those registers."""
+
+    def __init__(self, name, rng, shape, callees):
+        self.name, self.rng, self.shape, self.callees = name, rng, shape, callees
+        self.prolog, self.lines, self.used = [], [], []
+        self.saved = rng.sample(NONVOLATILE, 3 if shape == "call" else rng.choice((1, 2, 3)))
+        for register in self.saved:
+            self.prolog += [f"push {register}", f".pushreg {register}"]
+        pushed = 8 * len(self.saved)
+        self.anchor = None
+        if shape.startswith("anchor"):
+            pushed += 8
+            self.anchor = -pushed
+            self.prolog += ["push rbp", ".pushreg rbp", "mov rbp, rsp", ".setframe rbp, 0"]
+        self.size = rng.choice((16, 24, 32, 40, 48))
+        self.prolog += [f"sub rsp, {self.size}", f".allocstack {self.size}"]
+        # RSP after the prologue; the body never releases bytes above it.
+        self.floor = self.depth = -pushed - self.size
+        self.blocked = set(range(-pushed, 8))
+        self.defined, self.stored_at = set(), {}
+        # A caller keeps its output pointer in a saved register, because the call overwrites R8.
+        self.out = self.saved[0] if shape == "call" else "r8"
+        self.data = [register for register in self.saved if register != self.out]
+        self.arguments = True  # RCX and RDX still hold x and y
+        self.slots = self.labels = self.calls = self.loads = 0
+        self.cross = 0  # reloads of bytes stored at another RSP
+
+    def emit(self, line):
+        self.lines.append(line)
+
+    def state(self):
+        return self.depth, set(self.defined), dict(self.stored_at)
+
+    def restore(self, state):
+        self.depth, self.defined, self.stored_at = state[0], set(state[1]), dict(state[2])
+
+    def operand(self, offset, width):
+        """[RSP+d] at the current RSP or, in an anchored function, often [RBP+d] for the same bytes."""
+        if self.anchor is not None and self.rng.random() < 0.5:
+            return f"{PTR[width]} [rbp{offset - self.anchor:+d}]"
+        return f"{PTR[width]} [rsp+{offset - self.depth}]"
+
+    def sources(self):
+        return [*self.data, *(("rcx", "rdx") if self.arguments else ()), "rax"]
+
+    def release(self, low, high):
+        for offset in range(low, high):
+            self.defined.discard(offset)
+            self.stored_at.pop(offset, None)
+
+    def spots(self, width, defined):
+        """Offsets where width bytes lie above RSP and below the end of the home space, outside the pushed
+        slots and the return address, and are all defined when defined is set."""
+        found = []
+        for offset in range(self.depth, 40 - width + 1):
+            span = range(offset, offset + width)
+            if any(byte in self.blocked for byte in span):
+                continue
+            if defined and not all(byte in self.defined for byte in span):
+                continue
+            found.append(offset)
+        return found
+
+    def store(self):
+        width = self.rng.choice((1, 2, 4, 8))
+        spots = self.spots(width, False)
+        if not spots:
+            return False
+        # Mostly near RSP, where a later ADD RSP or POP releases the bytes and a deeper RSP reads them back.
+        near = [offset for offset in spots if offset < self.depth + 24]
+        at = self.rng.choice(near if near and self.rng.random() < 0.6 else spots)
+        if self.rng.random() < 0.2:
+            source = self.rng.choice((0x5A, 0x7F, 0x81, 0x33))
+        else:
+            source = part(self.rng.choice(self.sources()), width)
+        self.emit(f"mov {self.operand(at, width)}, {source}")
+        for byte in range(at, at + width):
+            self.defined.add(byte)
+            self.stored_at[byte] = self.depth
+        return True
+
+    def load(self):
+        # Room is kept for the forced cross-depth reload and two call results.
+        if self.slots >= RSP_LOADS - 3:
+            return False
+        width = self.rng.choice((1, 2, 4, 8))
+        spots = self.spots(width, True)
+        if not spots:
+            return False
+        cross = [offset for offset in spots
+                 if any(self.stored_at[byte] != self.depth for byte in range(offset, offset + width))]
+        at = self.rng.choice(cross if cross and self.rng.random() < 0.8 else spots)
+        self.cross += at in cross
+        self.loads += 1
+        operand, signed = self.operand(at, width), self.rng.random() < 0.5
+        if width == 8:
+            self.emit(f"mov r10, {operand}")
+        elif width == 4:
+            self.emit(f"movsxd r10, {operand}" if signed else f"mov r10d, {operand}")
+        else:
+            self.emit(f"{'movsx r10' if signed else 'movzx r10d'}, {operand}")
+        self.result("r10")
+        return True
+
+    def result(self, register):
+        self.emit(f"mov QWORD PTR [{self.out}+{8 * self.slots}], {register}")
+        self.slots += 1
+        if register != "rax":
+            self.emit(self.rng.choice((f"xor rax, {register}", f"add rax, {register}", f"sub rax, {register}")))
+        self.emit("rol rax, 7")
+
+    def rmw(self):
+        width = self.rng.choice((1, 2, 4, 8))
+        spots = self.spots(width, True)
+        if not spots:
+            return False
+        at = self.rng.choice(spots)
+        source = part(self.rng.choice(self.sources()), width)
+        self.emit(f"{self.rng.choice(('add', 'xor', 'sub'))} {self.operand(at, width)}, {source}")
+        for byte in range(at, at + width):
+            self.stored_at[byte] = self.depth
+        return True
+
+    def grow(self, steps=RSP_STEPS):
+        steps = [step for step in steps if self.depth - step >= RSP_DEEPEST]
+        if not steps:
+            return False
+        step = self.rng.choice(steps)
+        self.emit(f"sub rsp, {step}")
+        self.depth -= step
+        return True
+
+    def shrink(self):
+        room = self.floor - self.depth
+        if not room:
+            return False
+        step = room if self.rng.random() < 0.4 else self.rng.choice(range(8, room + 1, 8))
+        self.emit(f"add rsp, {step}")
+        self.release(self.depth, self.depth + step)
+        self.depth += step
+        return True
+
+    def push(self):
+        if not self.data or self.depth - 8 < RSP_DEEPEST:
+            return False
+        self.emit(f"push {self.rng.choice(self.data)}")
+        self.depth -= 8
+        for byte in range(self.depth, self.depth + 8):
+            self.defined.add(byte)
+            self.stored_at[byte] = self.depth
+        return True
+
+    def pop(self):
+        if (not self.data or self.depth >= self.floor
+                or not all(byte in self.defined for byte in range(self.depth, self.depth + 8))):
+            return False
+        self.cross += any(self.stored_at[byte] != self.depth for byte in range(self.depth, self.depth + 8))
+        self.emit(f"pop {self.rng.choice(self.data)}")
+        self.release(self.depth, self.depth + 8)
+        self.depth += 8
+        return True
+
+    def straight(self):
+        """A store, a reload or an in-place update at the current RSP."""
+        for _ in range(12):
+            if getattr(self, self.rng.choice(("store", "store", "load", "load", "rmw")))():
+                return
+
+    def branch(self):
+        """A TEST and a conditional jump on a saved register, and two arms that move RSP by the same amount in
+        different ways (SUB RSP or PUSH, with or without a balanced excursion), so the join sees one depth.
+        A byte that only one arm defines is undefined after the join."""
+        if not self.data:
+            return False
+        drops = [drop for drop in (0, 8, 16, 24) if self.depth - drop - 48 >= RSP_DEEPEST]
+        if not drops:
+            return False
+        self.labels += 1
+        other, join = f"{self.name}_other{self.labels}", f"{self.name}_join{self.labels}"
+        self.emit(f"test {part(self.rng.choice(self.data), 1)}, {self.rng.choice((1, 2, 4))}")
+        self.emit(f"j{self.rng.choice(('z', 'nz'))} {other}")
+        drop, start, outcomes = self.rng.choice(drops), self.state(), []
+        for arm in (0, 1):
+            self.restore(start)
+            if arm:
+                self.emit(f"{other}:")
+            target = self.depth - drop
+            self.straight()
+            while self.depth > target:
+                if self.depth - 8 == target or self.rng.random() < 0.4:
+                    self.push()
+                else:
+                    self.grow([step for step in RSP_STEPS if self.depth - step >= target])
+                if self.rng.random() < 0.6:
+                    self.straight()
+            if self.rng.random() < 0.3:
+                # An excursion that the arm releases again before the join.
+                step = self.rng.choice((8, 16, 32))
+                self.emit(f"sub rsp, {step}")
+                self.depth -= step
+                self.straight()
+                self.straight()
+                self.emit(f"add rsp, {step}")
+                self.release(self.depth, self.depth + step)
+                self.depth += step
+            outcomes.append(self.state())
+            if not arm:
+                self.emit(f"jmp {join}")
+        self.emit(f"{join}:")
+        self.defined = outcomes[0][1] & outcomes[1][1]
+        self.stored_at = {byte: min(outcome[2][byte] for outcome in outcomes) for byte in self.defined}
+        return True
+
+    def call(self):
+        """A mid-body SUB RSP that leaves RSP 16-byte aligned with room for the callee's home space, a direct
+        call, and the callee's result in RAX. After the call the volatile registers and the 32 bytes at RSP are
+        undefined; the rest of the frame is kept."""
+        first = (self.depth - 8) % 16
+        step = first + 16 * self.rng.choice((1, 2) if not first else (0, 1, 2))
+        if self.depth - step < RSP_DEEPEST:
+            return False
+        self.emit(f"sub rsp, {step}")
+        self.depth -= step
+        callee = self.rng.choice(self.callees)
+        if callee not in self.used:
+            self.used.append(callee)
+        x, y = self.rng.choice((*self.data, "rax")), self.rng.choice(self.data)
+        self.emit(f"mov rcx, {x}")
+        self.emit(f"lea rdx, [{y}+{self.rng.randrange(1, 0x8000)}]")
+        self.emit(f"lea r8, [{self.out}+{RSP_CALLEE + 8 * self.calls}]")
+        self.emit(f"call {callee.name}")
+        self.calls += 1
+        self.arguments = False
+        self.release(self.depth, self.depth + 32)
+        self.result("rax")
+        return True
+
+    def operation(self, name):
+        return getattr(self, name)()
+
+    def cross_depth(self):
+        """A store at the current RSP, a move of RSP and a reload of those bytes at the new RSP."""
+        if self.depth - 8 < RSP_DEEPEST:
+            self.emit(f"add rsp, {self.floor - self.depth}")
+            self.release(self.depth, self.floor)
+            self.depth = self.floor
+        width = self.rng.choice((2, 4, 8))
+        at = self.rng.choice(self.spots(width, False))
+        self.emit(f"mov {self.operand(at, width)}, {part(self.rng.choice(self.sources()), width)}")
+        for byte in range(at, at + width):
+            self.defined.add(byte)
+            self.stored_at[byte] = self.depth
+        self.grow([step for step in RSP_STEPS if self.depth - step >= RSP_DEEPEST] or [8])
+        self.cross += 1
+        self.loads += 1
+        operand = self.operand(at, width)
+        self.emit(f"mov r10, {operand}" if width == 8 else f"movzx r10d, {operand}" if width == 2
+                  else f"mov r10d, {operand}")
+        self.result("r10")
+
+    def build(self):
+        rng = self.rng
+        if self.out != "r8":
+            self.emit(f"mov {self.out}, r8")
+        for register in self.data:
+            self.emit(rng.choice((f"mov {register}, rcx", f"mov {register}, rdx", f"lea {register}, [rcx+rdx*2]",
+                                  f"lea {register}, [rdx+rcx*4+7]")))
+            self.emit(rng.choice((f"xor {register}, rdx", f"rol {register}, 13", f"add {register}, rcx")))
+        self.emit("mov rax, rcx")
+        for _ in range(rng.randint(2, 4)):
+            self.store()
+        weights, required = RSP_WEIGHTS[self.shape]
+        names = list(weights)
+        operations = [rng.choices(names, [weights[name] for name in names])[0] for _ in range(rng.randint(6, 12))]
+        for name in required * rng.choice((1, 2)):
+            operations.insert(rng.randrange(len(operations) + 1), name)
+        for name in operations:
+            if not self.operation(name):
+                for _ in range(12):
+                    if self.operation(rng.choices(names, [weights[name] for name in names])[0]):
+                        break
+        if not self.cross:
+            self.cross_depth()
+        for _ in range(48):
+            if self.loads >= RSP_MIN_LOADS:
+                break
+            # More reloads at the final RSP, after a store when nothing is defined.
+            self.load() or self.store()
+        for slot, register in enumerate(self.data):
+            self.emit(f"mov QWORD PTR [{self.out}+{RSP_REGISTERS + 8 * slot}], {register}")
+        if self.shape == "anchor_leave":
+            # LEAVE restores RSP from the anchor, so the body may end below the prologue's RSP.
+            self.emit("leave")
+        else:
+            while self.depth < self.floor:
+                if not (rng.random() < 0.4 and self.pop()):
+                    self.shrink()
+            self.emit(f"add rsp, {self.size}")
+            if self.anchor is not None:
+                self.emit("pop rbp")
+        self.lines += [f"pop {register}" for register in reversed(self.saved)]
+        self.emit("ret")
+        return Function(self.name, self.lines, self.prolog, self.used)
+
+
+def rsp_callee(name, index):
+    """A frameless callee that only the generated callers reach: it writes one word through R8 and returns a
+    value that is not symmetric in RCX and RDX."""
+    if index == 0:
+        lines = ["lea rax, [rcx+rdx*2]", "xor rax, 5A5Ah", "mov QWORD PTR [r8], rax", "rol rax, 5", "ret"]
+    else:
+        lines = ["mov rax, rdx", "sub rax, rcx", "mov DWORD PTR [r8+4], eax", "imul rax, rax, 7", "ret"]
+    return Function(name, lines, export=False)
+
+
+def rsp_control(name, kind):
+    """A negative control: a mid-body RSP change that the translator must refuse."""
+    body, reason = RSP_CONTROLS[kind]
+    lines = [*(line.format(name=name) for line in body), "mov QWORD PTR [r8], rax", "add rsp, 16", "ret"]
+    return Function(name, lines, ["sub rsp, 16", ".allocstack 16"], refused=reason)
+
+
+def generate_rsp(seed, count):
+    """Exports whose RSP moves after the prologue, cycling through six shapes, then four refused controls.
+
+    Two frameless callees, which no export names, serve the calling shape."""
+    rng = random.Random(seed)
+    callees = [rsp_callee(f"fuzz_rsp_callee_{index}", index) for index in range(2)]
+    functions = [RspBuilder(f"fuzz_rsp_{index}", rng, RSP_SHAPES[index % len(RSP_SHAPES)], callees).build()
+                 for index in range(count)]
+    return [*callees, *functions, *(rsp_control(f"fuzz_rsp_refused_{kind}", kind) for kind in RSP_CONTROLS)]
+
+
+# Counted loops: leaf functions, some with pushed registers, whose loops end in a backward conditional branch.
+# Every trip count comes from x masked to 4 bits (3 bits for a nested loop) and the counter is written only by
+# the loop's own update, so each input terminates within 16 iterations, or 8 times 8 when nested. The output
+# buffer keeps the final carried registers at 0 to 23, a value carried through memory at 24, an iteration count
+# at 32, the final counter (the count in the up form) at 36, an early-exit record at 40 to 55, the first saved
+# register at 56, one word per outer iteration from 64 to 191 and one word per inner iteration from 192 to 255.
+LOOP_FORMS = ("dec", "up", "guarded", "step")
+LOOP_CARRIED = ("rax", "rdx", "r10")
+LOOP_SAVED = ("rbx", "rsi", "rdi")
+LOOP_MEMORY, LOOP_COUNT, LOOP_FINAL, LOOP_EARLY, LOOP_SAVES, LOOP_TRACE, LOOP_INNER = 24, 32, 36, 40, 56, 64, 192
+
+
+def loop_operation(rng, target, sources):
+    """One update of a carried register from itself and the other carried values."""
+    source = rng.choice(sources)
+    dword = rng.random() < 0.2
+    a, b = (REGISTER_PARTS[target][0], REGISTER_PARTS[source][0]) if dword else (target, source)
+    return rng.choice((f"add {a}, {b}", f"sub {a}, {b}", f"xor {a}, {b}", f"imul {a}, {b}, {rng.choice((3, 5, 7, 31))}",
+                       f"rol {target}, {rng.choice((5, 13, 29))}", f"ror {target}, {rng.choice((3, 11))}",
+                       f"lea {target}, [{target}+{source}*{rng.choice((2, 4, 8))}+{rng.choice((1, 7, 0x51))}]",
+                       f"add {a}, {REGISTER_PARTS['r9'][0] if dword else 'r9'}", f"not {target}", f"neg {target}"))
+
+
+def loop_function(name, rng, form, nested, early):
+    """A counted loop of one of four forms, with an optional data-dependent early exit and nested loop.
+
+    dec: the counter runs from n down to 1 (DEC or SUB 1, then JNZ) or from n-1 down to 0 (DEC, then JNS).
+    up: an index runs from 0 up to n-1 (INC, CMP with the count, then JB, JNE or JL).
+    guarded: as dec from n, but n may be 0 and a TEST and JZ in front skips the loop.
+    step: the counter drops by 2 or 3 while it stays above 0 (SUB, then JG).
+    """
+    saved = rng.sample(LOOP_SAVED, rng.choice((0, 0, 1, 2)))
+    prolog = [line for register in saved for line in (f"push {register}", f".pushreg {register}")]
+    carried = [*LOOP_CARRIED, *saved]
+    top, exit_, out = f"{name}_top", f"{name}_exit", f"{name}_early"
+    # The count n is x masked, plus 1 where the loop has no guard; a dec loop that ends at 0 starts from n-1.
+    to_zero = form == "dec" and rng.random() < 0.5
+    lines = ["mov r9d, ecx", f"and r9d, {7 if nested else 15}"]
+    if form != "guarded" and not to_zero:
+        lines.append("inc r9d")
+    # Carried values defined from both arguments; each saved register is overwritten before it is read.
+    lines += ["mov rax, rcx", "lea r10, [rdx+rcx*2+3]", f"mov QWORD PTR [r8+{LOOP_MEMORY}], rdx",
+              f"mov DWORD PTR [r8+{LOOP_COUNT}], 0"]
+    for register in saved:
+        lines += [f"mov {register}, rdx", rng.choice((f"xor {register}, rcx", f"rol {register}, 17", f"add {register}, rcx"))]
+    if form == "up":
+        lines.append("xor r11d, r11d")
+    if form == "guarded":
+        lines += ["test r9d, r9d", f"jz {exit_}"]
+    # The outer trace: one word per iteration indexed by the counter or index, from LOOP_TRACE.
+    if form == "up":
+        trace = f"mov QWORD PTR [r8+r11*8+{LOOP_TRACE}], rax"
+    elif to_zero:
+        trace = f"mov QWORD PTR [r8+r9*8+{LOOP_TRACE}], rax"
+    else:
+        trace = f"mov QWORD PTR [r8+r9*8+{LOOP_TRACE - 8}], rax"
+
+    # RAX and a saved register, when there is one, change in every iteration.
+    targets = ["rax", *saved[:1], *rng.sample(carried, rng.choice((1, 2)))]
+    body = [loop_operation(rng, target, [r for r in carried if r != target]) for target in targets]
+    body.append(rng.choice((f"add QWORD PTR [r8+{LOOP_MEMORY}], rax", f"xor QWORD PTR [r8+{LOOP_MEMORY}], r10",
+                            f"sub QWORD PTR [r8+{LOOP_MEMORY}], rdx")))
+    body.append(rng.choice((f"add rax, QWORD PTR [r8+{LOOP_MEMORY}]", f"xor r10, QWORD PTR [r8+{LOOP_MEMORY}]",
+                            f"add rdx, QWORD PTR [r8+{LOOP_MEMORY}]")))
+    body += [f"add DWORD PTR [r8+{LOOP_COUNT}], 1", trace]
+    if early:
+        producer = rng.choice((f"test al, {rng.choice((3, 7))}", f"test r10d, {rng.choice((0xF, 0x1F))}",
+                               f"cmp eax, {rng.choice((0x10000000, 0x20000000))}"))
+        # After the first update, so the flags never cross the loop head.
+        at = rng.randrange(1, len(body) + 1)
+        body[at:at] = [producer, f"{'jb' if producer.startswith('cmp') else 'jz'} {out}"]
+    if nested:
+        # The inner count comes from the carried RAX, so it differs from one outer iteration to the next.
+        inner = f"{name}_inner"
+        body += ["mov ecx, eax", "and ecx, 7", "inc ecx", f"{inner}:",
+                 *(loop_operation(rng, target, [r for r in carried if r != target])
+                   for target in rng.sample(carried, rng.choice((1, 2)))),
+                 f"add QWORD PTR [r8+rcx*8+{LOOP_INNER - 8}], r10", "dec ecx", f"jnz {inner}"]
+    if form == "dec":
+        if to_zero:
+            body += ["dec r9d", f"jns {top}"]
+        else:
+            body += [rng.choice(("dec r9d", "sub r9d, 1")), f"jnz {top}"]
+    elif form == "guarded":
+        body += ["dec r9d", f"jnz {top}"]
+    elif form == "step":
+        body += [f"sub r9d, {rng.choice((2, 3))}", f"jg {top}"]
+    else:
+        body += ["inc r11d", "cmp r11d, r9d", f"{rng.choice(('jb', 'jne', 'jl'))} {top}"]
+
+    restore = [f"pop {register}" for register in reversed(saved)]
+    stores = [f"mov QWORD PTR [r8+{LOOP_SAVES}], {saved[0]}", f"add rax, {saved[0]}"] if saved else ["xor rax, r10"]
+    lines += [f"{top}:", *body, f"{exit_}:", "mov QWORD PTR [r8], rax", "mov QWORD PTR [r8+8], r10",
+              "mov QWORD PTR [r8+16], rdx", f"mov DWORD PTR [r8+{LOOP_FINAL}], r9d", *stores, *restore, "ret"]
+    if early:
+        lines += [f"{out}:", f"mov DWORD PTR [r8+{LOOP_EARLY}], 0EA51h", f"mov QWORD PTR [r8+{LOOP_EARLY + 8}], r9",
+                  "mov QWORD PTR [r8+16], rdx", "lea rax, [rax+r10*2]", *restore, "ret"]
+    return Function(name, lines, prolog)
+
+
+def generate_loops(seed, count):
+    """Exports with counted loops: the 16 combinations of form, nesting and early exit in a seeded order,
+    repeated with other bodies."""
+    rng = random.Random(seed)
+    shapes = [(form, nested, early) for form in LOOP_FORMS for nested in (False, True) for early in (False, True)]
+    rng.shuffle(shapes)
+    return [loop_function(f"fuzz_loop_{index}", rng, *shapes[index % len(shapes)]) for index in range(count)]
+
+
 AREAS = {"leaf": (generate, "cpu_fuzz"), "frames": (generate_frames, "cpu_fuzz_frames"),
          "calls": (generate_calls, "cpu_fuzz_calls"), "chains": (generate_chains, "cpu_fuzz_chains"),
          "switches": (generate_switches, "cpu_fuzz_switches"),
-         "scalar_fp": (generate_scalar_fp, "cpu_fuzz_scalar_fp")}
+         "scalar_fp": (generate_scalar_fp, "cpu_fuzz_scalar_fp"), "rsp": (generate_rsp, "cpu_fuzz_rsp"),
+         "loops": (generate_loops, "cpu_fuzz_loops")}
 
 
 def inputs_for(seed, area="leaf", signature=None):
@@ -1378,9 +1866,76 @@ def plant_minmax_swap(cpu_sse_aot, image, functions):
         extrema[low], extrema[high] = extrema[high], extrema[low]
 
 
+def plant_stale_rsp(cpu_switch_aot, image, functions):
+    """Resolve every [RSP+d] operand against the RSP that the prologue's allocation leaves (after the first
+    SUB RSP in address order), as if no later SUB, ADD, PUSH or POP had moved RSP.
+
+    This is a planted translator fault for the negative control: the frame proof, PUSH, POP and every
+    [RBP+d] operand are unchanged, but a value stored at one RSP and read back at another reaches other
+    frame bytes. An operand whose moved bytes would leave the frame array keeps its index.
+    """
+    from iced_x86 import Mnemonic as M, MemorySizeExt, Register as R
+
+    shifts = {}  # RVA -> (RSP at the instruction minus RSP after the prologue, bytes of the frame array)
+    original_frame = cpu_switch_aot.Frame.__init__
+
+    def frame_init(self, function, edges):
+        original_frame(self, function, edges)
+        if self.adjustments:
+            floor = self.offsets[function.instructions[min(self.adjustments)].next_ip]
+            for ip, offset in self.offsets.items():
+                if offset != floor and ip in self.accesses:
+                    shifts[ip] = (offset - floor, self.size)
+
+    original_slot = cpu_switch_aot.Lifter.slot
+
+    def slot(self, ins):
+        text = original_slot(self, ins)
+        if ins.ip in shifts and ins.memory_base == R.RSP and ins.mnemonic not in (M.PUSH, M.POP):
+            shift, size = shifts[ins.ip]
+            index = self.frame[ins.ip]
+            if 0 <= index - shift <= size - MemorySizeExt.size(ins.memory_size):
+                text = text.replace(f"frame + {index})", f"frame + {index - shift})")
+        return text
+
+    cpu_switch_aot.Frame.__init__ = frame_init
+    cpu_switch_aot.Lifter.slot = slot
+
+
+def plant_back_edge_exit(cpu_switch_aot, image, functions):
+    """Retarget every backward conditional branch to its own fallthrough, the instruction after the loop.
+
+    This is a planted translator fault for the negative control: each loop body runs once, so any input
+    with more than one iteration leaves another trace, count and carried value. Every input still terminates.
+    """
+    from iced_x86 import FlowControl
+
+    original = cpu_switch_aot.Function.decode
+    planted = []
+
+    def decode(self, ip):
+        ins = original(self, ip)
+        if ins.flow_control == FlowControl.CONDITIONAL_BRANCH and ins.near_branch_target <= ip:
+            ins.near_branch64 = ins.next_ip
+            planted.append(ip)
+        return ins
+
+    cpu_switch_aot.Function.decode = decode
+    translate_original = cpu_switch_aot.translate
+
+    def translate(*args, **kwargs):
+        result = translate_original(*args, **kwargs)
+        if not planted:
+            raise SystemExit("the back_edge_exit fault found no backward branch")
+        return result
+
+    cpu_switch_aot.translate = translate
+
+
 MUTANTS = {"frames": ("reload_shift", plant_reload_shift), "calls": ("call_retarget", plant_call_retarget),
            "chains": ("swapped_arguments", plant_swapped_arguments),
-           "switches": ("table_rotate", plant_table_rotate), "scalar_fp": ("minmax_swap", plant_minmax_swap)}
+           "switches": ("table_rotate", plant_table_rotate), "scalar_fp": ("minmax_swap", plant_minmax_swap),
+           "rsp": ("stale_rsp", plant_stale_rsp), "loops": ("back_edge_exit", plant_back_edge_exit)}
 
 
 def translate(seed, count, image, output, area="leaf", mutant=False):

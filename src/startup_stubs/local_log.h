@@ -33,20 +33,22 @@ inline void logf(const char* format, ...) noexcept
     line[n++] = '\n';
     const DWORD error = GetLastError();
     x2w_trap::write_all(GetStdHandle(STD_ERROR_HANDLE), line, static_cast<DWORD>(n));
-    wchar_t log_path[MAX_PATH];
-    const DWORD length = GetEnvironmentVariableW(L"X2W_TRAP_LOG", log_path, MAX_PATH);
-    if (length && length < MAX_PATH) {
-        HANDLE out = CreateFileW(log_path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                                 OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (out != INVALID_HANDLE_VALUE) {
-            x2w_trap::write_all(out, line, static_cast<DWORD>(n));
-            CloseHandle(out);
-        }
-    }
+    x2w_trap::append_log(line, static_cast<DWORD>(n), false);
     SetLastError(error);
 }
 
-inline bool first_calls(LONG& counter, LONG limit) noexcept { return InterlockedIncrement(&counter) <= limit; }
+// True for the first `limit` calls on `counter`. The counter stops at the limit instead of counting
+// every call: a gate on a hot path would otherwise pass 2^31 calls, turn negative and pass again.
+inline bool first_calls(volatile LONG& counter, LONG limit) noexcept
+{
+    LONG seen = counter;
+    while (seen < limit) {
+        const LONG previous = InterlockedCompareExchange(&counter, seen + 1, seen);
+        if (previous == seen) return true;
+        seen = previous;
+    }
+    return false;
+}
 
 // Number of contiguous readable bytes at start, up to bytes, found by touching one byte per page.
 // VirtualQuery is not used for this: on the title's multi-gigabyte regions one query takes about a
@@ -94,7 +96,8 @@ inline bool accessible(const void* pointer, std::size_t bytes, bool write) noexc
                           protect == PAGE_EXECUTE_WRITECOPY;
     const auto begin = reinterpret_cast<std::uintptr_t>(info.BaseAddress);
     const auto end = begin + info.RegionSize;
-    if (start + bytes > end || (write && !writable)) return false;
+    // start lies inside the queried region, so end - start cannot wrap; start + bytes could.
+    if (bytes > end - start || (write && !writable)) return false;
     return true;
 }
 inline bool readable(const void* pointer, std::size_t bytes) noexcept { return accessible(pointer, bytes, false); }

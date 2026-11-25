@@ -214,6 +214,23 @@ partial_write PROC
     ret
 partial_write ENDP
 
+; A byte xor of a register with itself clears only the low 8 bits: the word stays 05E50000h, so
+; the site must not be reported as the constant 0 that xor edx, edx gives.
+partial_xor_byte PROC
+    mov edx, 05E50007h
+    xor dl, dl
+    call QWORD PTR __imp_XMemAlloc
+    ret
+partial_xor_byte ENDP
+
+; The same with a 16-bit xor, which clears only the low 16 bits.
+partial_xor_word PROC
+    mov edx, 05E51234h
+    xor dx, dx
+    call QWORD PTR __imp_XMemAlloc
+    ret
+partial_xor_word ENDP
+
 ; Internal pass-through: not exported, so its one caller in the image decides the word.
 forward_alloc PROC
     mov edx, 05E50000h

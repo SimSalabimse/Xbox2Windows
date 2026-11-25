@@ -50,6 +50,7 @@ inline const DeclaredOut* declared(unsigned long provider, int slot)
         {0x01acd177, 40, 1, 8, no_argument, no_argument, 0},    // find for device
         {0xcef4fac0, 3, 3, 0, 2, 4, 8},                         // gamertag interface: buffer, &used
         {0x37e56907, 15, 0, 16, no_argument, no_argument, 0},   // connectivity hint: four words
+        {0x0dd112ac, 3, 1, 8, no_argument, no_argument, 0},     // XStoreCreateContext: &context
     };
     for (const DeclaredOut& entry : table)
         if (entry.provider == provider && entry.slot == slot) return &entry;

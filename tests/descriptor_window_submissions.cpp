@@ -1,4 +1,6 @@
 #include "desktop_gpu.h"
+#include "../src/cpu_srv_upload.h"
+#include "cpu_srv_refresh_cs.h"
 #include "descriptor_window_submissions_cs.h"
 
 #include <array>
@@ -212,5 +214,79 @@ void check_descriptor_window_submissions(ID3D12Device* device, DescriptorWindowC
         if (fence->GetCompletedValue() != fence_value) throw std::runtime_error("Unexpected descriptor-window fence value");
 
         compare_words(fence_value, read_words(readback.Get()), expected[i]);
+    }
+}
+
+void check_cpu_srv_refresh(ID3D12Device* device, bool stale)
+{
+    const auto root = create_root(device);
+    D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
+    desc.pRootSignature = root.Get();
+    desc.CS = {cpu_srv_refresh_cs, sizeof(cpu_srv_refresh_cs)};
+    ComPtr<ID3D12PipelineState> pipeline;
+    check(device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pipeline)), "Create CPU-SRV pipeline");
+    ComputeCommands commands(device, pipeline.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT);
+    ComPtr<ID3D12Fence> retire;
+    check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&retire)), "Create CPU-SRV fence");
+    constexpr UINT first = 16;
+    constexpr UINT bytes = first + 2 * sizeof(UINT16);
+    const auto upload = make_buffer(device, bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+    const auto output = make_buffer(device, sizeof(Words), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON,
+                                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    const auto readback = make_buffer(device, sizeof(Words), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1,
+                                               D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    ComPtr<ID3D12DescriptorHeap> heap;
+    check(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap)), "Create CPU-SRV heap");
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    srv.Format = DXGI_FORMAT_R16_UINT;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Buffer.FirstElement = first / sizeof(UINT16);
+    srv.Buffer.NumElements = 2;
+    device->CreateShaderResourceView(upload.Get(), &srv, heap->GetCPUDescriptorHandleForHeapStart());
+
+    constexpr std::array<UINT16, 2> original{0x1398, 0x2467}, replacement{0x8765, 0xfe01};
+    auto source = original;
+    check(cpu_srv::refresh(upload.Get(), first, source.data(), sizeof(source), nullptr, 0), "Refresh initial SRV");
+    for (UINT i = 0; i < 2; ++i) {
+        auto* list = commands.list.Get();
+        if (i == 1) {
+            source = replacement;
+            if (cpu_srv::refresh(upload.Get(), first, source.data(), sizeof(source), retire.Get(), 2) !=
+                    DXGI_ERROR_WAS_STILL_DRAWING ||
+                cpu_srv::refresh(upload.Get(), first + 1, source.data(), sizeof(source), retire.Get(), 1) != E_INVALIDARG ||
+                cpu_srv::refresh(upload.Get(), SIZE_MAX, source.data(), sizeof(source), retire.Get(), 1) != E_INVALIDARG)
+                throw std::runtime_error("CPU-SRV accepted an outstanding fence or an out-of-range refresh");
+            auto* inaccessible = VirtualAlloc(nullptr, 1, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS);
+            if (!inaccessible) throw std::runtime_error("Cannot allocate unreadable CPU-SRV control");
+            const HRESULT rejected = cpu_srv::refresh(upload.Get(), first, inaccessible, sizeof(source), retire.Get(), 1);
+            VirtualFree(inaccessible, 0, MEM_RELEASE);
+            if (SUCCEEDED(rejected)) throw std::runtime_error("CPU-SRV accepted unreadable input");
+            if (!stale)
+                check(cpu_srv::refresh(upload.Get(), first, source.data(), sizeof(source), retire.Get(), 1),
+                      "Refresh SRV after fence");
+            check(commands.allocator->Reset(), "Reset CPU-SRV allocator");
+            check(list->Reset(commands.allocator.Get(), pipeline.Get()), "Reset CPU-SRV list");
+        }
+        transition(list, output.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        list->SetComputeRootSignature(root.Get());
+        ID3D12DescriptorHeap* heaps[]{heap.Get()};
+        list->SetDescriptorHeaps(1, heaps);
+        list->SetComputeRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
+        list->SetComputeRootUnorderedAccessView(1, output->GetGPUVirtualAddress());
+        list->SetComputeRoot32BitConstant(2, 0, 0);
+        list->Dispatch(1, 1, 1);
+        transition(list, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        list->CopyResource(readback.Get(), output.Get());
+        transition(list, output.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+        check(list->Close(), "Close CPU-SRV list");
+        ID3D12CommandList* batch[]{list};
+        commands.queue->ExecuteCommandLists(1, batch);
+        check(commands.queue->Signal(retire.Get(), i + 1), "Signal CPU-SRV fence");
+        check(retire->SetEventOnCompletion(i + 1, nullptr), "Wait for CPU-SRV fence");
+        check(device->GetDeviceRemovedReason(), "Complete CPU-SRV read");
+        const auto expected = (i == 1 && !stale) ? replacement : original;
+        compare_words(i + 1, read_words(readback.Get()), {expected[0], expected[1]});
     }
 }

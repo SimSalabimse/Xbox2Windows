@@ -13,6 +13,9 @@ struct PipelineInfo {
     Translation* stream_translation = nullptr;
     bool has_stream_blend = false;
     D3D12_BLEND_DESC stream_blend{};
+    bool has_stream_depth_stencil = false;
+    D3D12_DEPTH_STENCIL_DESC stream_depth_stencil{};
+    DXGI_FORMAT stream_dsv_format = DXGI_FORMAT_UNKNOWN;
     int path = 0;                    // creating device slot: 57, 67, 55, 86, 62
     Wrapper* base = nullptr;         // slot 55: the pipeline it derives from
     std::vector<unsigned char> desc;
@@ -52,6 +55,7 @@ std::unordered_map<const Wrapper*, std::vector<unsigned char>>& root_blobs() { s
 std::unordered_map<const Wrapper*, ResourceInfo>& resource_infos() { static std::unordered_map<const Wrapper*, ResourceInfo> m; return m; }
 std::vector<HeapInfo>& heap_infos() { static std::vector<HeapInfo> v; return v; }
 std::vector<ViewRecord>& view_records() { static std::vector<ViewRecord> v; return v; }
+std::vector<std::uint8_t>& view_materialized() { static std::vector<std::uint8_t> v; return v; }  // 1 if desktop view was created
 std::unordered_map<u64, std::uint32_t>& view_ids() { static std::unordered_map<u64, std::uint32_t> m; return m; }  // content hash -> view id
 LONG64 views_noted, views_distinct, descriptors_copied;
 
@@ -88,7 +92,9 @@ bool title_backed(u64 title_handle, u64 bytes)
 }
 
 void note_pipeline(Wrapper* w, int path, const void* base, const void* desc, std::size_t bytes,
-                   Translation* translation = nullptr, const D3D12_BLEND_DESC* blend = nullptr)
+                   Translation* translation = nullptr, const D3D12_BLEND_DESC* blend = nullptr,
+                   const D3D12_DEPTH_STENCIL_DESC* depth_stencil = nullptr,
+                   DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN)
 {
     PipelineInfo info;
     info.stream_translation = translation;
@@ -96,6 +102,11 @@ void note_pipeline(Wrapper* w, int path, const void* base, const void* desc, std
         info.stream_blend = *blend;
         info.has_stream_blend = true;
     }
+    if (depth_stencil) {
+        info.stream_depth_stencil = *depth_stencil;
+        info.has_stream_depth_stencil = true;
+    }
+    info.stream_dsv_format = dsv_format;
     info.path = path;
     info.base = as_wrapper(base);
     const std::size_t have = desc ? readable_window(reinterpret_cast<u64>(desc), bytes) : 0;
@@ -212,7 +223,8 @@ void note_heap(Wrapper* w, UINT type, UINT count, UINT logical_count, UINT incre
 }
 // A view is created: remembered by id; the id is also written into title-owned descriptor memory so
 // that copies the title makes there itself can be followed.
-void note_view(int slot, u64 resource, u64 counter, const void* desc, std::size_t desc_bytes, u64 dest_title, u64 dest_desktop)
+void note_view(int slot, u64 resource, u64 counter, const void* desc, std::size_t desc_bytes, u64 dest_title, u64 dest_desktop,
+               bool materialized = true)
 {
     ViewRecord record{};
     record.slot = static_cast<std::uint32_t>(slot);
@@ -224,12 +236,13 @@ void note_view(int slot, u64 resource, u64 counter, const void* desc, std::size_
         record.desc_bytes = static_cast<std::uint32_t>(desc_bytes);
         std::memcpy(record.desc, desc, desc_bytes);
     }
-    // Views with the same content share one id, so per-frame re-creation does not grow the list.
+    const std::uint8_t created = materialized ? 1 : 0;
+    // Views with the same content and materialization state share one id, so per-frame re-creation does not grow the list.
     u64 hash = 1469598103934665603ull;
     const auto mix = [&hash](const void* data, std::size_t bytes) {
         for (std::size_t i = 0; i < bytes; ++i) hash = (hash ^ static_cast<const unsigned char*>(data)[i]) * 1099511628211ull;
     };
-    mix(&record.slot, 4); mix(&record.resource, 8); mix(&record.counter, 8); mix(record.desc, sizeof(record.desc));
+    mix(&record.slot, 4); mix(&record.resource, 8); mix(&record.counter, 8); mix(record.desc, sizeof(record.desc)); mix(&created, 1);
     AcquireSRWLockExclusive(&note_lock);
     ++views_noted;
     const auto found = view_ids().find(hash);
@@ -238,6 +251,7 @@ void note_view(int slot, u64 resource, u64 counter, const void* desc, std::size_
     } else {
         record.id = static_cast<std::uint32_t>(view_records().size());
         view_records().push_back(record);
+        view_materialized().push_back(created);
         view_ids()[hash] = record.id;
         ++views_distinct;
     }

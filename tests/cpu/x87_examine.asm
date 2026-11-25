@@ -1,7 +1,7 @@
 ; coverage: source cpu_aot_x87_examine
 ; Source-owned differential fixture for FTST, FXAM, FICOM, FICOMP, FNOP, FNCLEX and FCLEX, and the
 ; 8087/287 controls FENI, FNENI, FDISI, FNDISI and FSETPM (ML64 has no FNSETPM spelling and assembles
-; FSETPM without a WAIT), and FFREEP ST(0), in the x87 leaf-function profile. Each export reads an input block at RCX (an m80 value at +0, an m16 integer at
+; FSETPM without a WAIT), FFREEP ST(0), FFREE of an empty register and FSTSW AX, in the x87 leaf-function profile. Each export reads an input block at RCX (an m80 value at +0, an m16 integer at
 ; +16 and an m32 integer at +24), records C0, C2 and C3 after each status-word writer as bytes of the
 ; output block at RDX, and returns with the x87 stack empty.
 .code
@@ -203,5 +203,69 @@ ffreep_top PROC FRAME
     mov eax, 0
     ret
 ffreep_top ENDP
+
+; FFREE of an already empty register changes neither occupancy nor TOP. Output: TOP bytes (TOP << 3) at +0
+; (depth 0, after ffree st(0) and st(7)), +1 (depth 1, after ffree st(1), st(4) and st(7)) and +2 (depth 8,
+; after ffree st(7) at depth 7 and one more load, which must not overflow), then 0.0 at +16, 1.0 at +26 and the
+; input m80 at +40.
+ffree_empty PROC FRAME
+    .endprolog
+    ffree st(0)
+    ffree st(7)
+    fnstsw ax
+    and ah, 38h
+    mov byte ptr [rdx+0], ah
+    fld tbyte ptr [rcx]
+    ffree st(1)
+    ffree st(4)
+    ffree st(7)
+    fnstsw ax
+    and ah, 38h
+    mov byte ptr [rdx+1], ah
+    fld1
+    fld1
+    fld1
+    fld1
+    fld1
+    fld1
+    ffree st(7)
+    fldz
+    fnstsw ax
+    and ah, 38h
+    mov byte ptr [rdx+2], ah
+    fstp tbyte ptr [rdx+16]
+    fstp tbyte ptr [rdx+26]
+    fstp st(0)
+    fstp st(0)
+    fstp st(0)
+    fstp st(0)
+    fstp st(0)
+    fstp tbyte ptr [rdx+40]
+    mov eax, 0
+    ret
+ffree_empty ENDP
+
+; FSTSW AX assembles as WAIT and FNSTSW AX. WAIT leaves C0 to C3 undefined, so the C0, C2 and C3 that FTST set
+; before the last read are unknown and only TOP is: AH is masked to TOP. Output: TOP bytes (TOP << 3) at +0
+; (depth 0), +1 (depth 1) and +2 (depth 2, after FTST), and the input m80 at +16.
+fstsw_top PROC FRAME
+    .endprolog
+    fstsw ax
+    and ah, 38h
+    mov byte ptr [rdx+0], ah
+    fld tbyte ptr [rcx]
+    fstsw ax
+    and ah, 38h
+    mov byte ptr [rdx+1], ah
+    fld1
+    ftst
+    fstsw ax
+    and ah, 38h
+    mov byte ptr [rdx+2], ah
+    fstp st(0)
+    fstp tbyte ptr [rdx+16]
+    mov eax, 0
+    ret
+fstsw_top ENDP
 
 END

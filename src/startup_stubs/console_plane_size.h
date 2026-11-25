@@ -33,8 +33,13 @@ inline std::uint64_t plane_bytes(std::uint64_t width, std::uint64_t height, std:
 // Texel bytes of the colour formats answered for multisampling; 0 for every other format.
 inline unsigned colour_texel_bytes(unsigned format)
 {
+    if (format >= 1 && format <= 4) return 16;    // R32G32B32A32
     if (format >= 9 && format <= 14) return 8;    // R16G16B16A16
     if (format >= 23 && format <= 32) return 4;   // R10G10B10A2, R11G11B10, R8G8B8A8
+    if (format >= 33 && format <= 38) return 4;   // R16G16
+    if (format >= 39 && format <= 43) return 4;   // R32
+    if (format >= 53 && format <= 59) return 2;   // R16
+    if (format >= 60 && format <= 65) return 1;   // R8, A8
     if (format >= 87 && format <= 93) return 4;   // B8G8R8A8, B8G8R8X8
     return 0;
 }
@@ -55,8 +60,8 @@ inline bool console_plane_shape(const D3D12_RESOURCE_DESC& desc)
 }
 
 // Replaces info with the console size for a description of the shape above that is depth with
-// stencil (R32G8X24 family, or the console's 16-bit depth with stencil, formats 118-120) or
-// multisampled in one of the colour formats above. Returns false and leaves info alone otherwise.
+// stencil (R32G8X24 or R24G8 families, or the console's 16-bit depth with stencil, formats 118-120)
+// or multisampled in one of the colour formats above. Returns false and leaves info alone otherwise.
 //
 // A desktop failure (size all ones) is kept for the desktop formats: nothing here shows that a
 // shape desktop rejects is valid on the console. Formats 118-120 do not exist on desktop, so for
@@ -67,13 +72,14 @@ inline bool console_plane_size(const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_A
     using namespace plane_detail;
     if (!console_plane_shape(desc)) return false;
     const unsigned format = static_cast<unsigned>(desc.Format);
-    const bool d32s8 = format >= 19 && format <= 22, d16s8 = format >= 118 && format <= 120;
+    const bool d32s8 = format >= 19 && format <= 22, d24s8 = format >= 44 && format <= 47;
+    const bool d16s8 = format >= 118 && format <= 120;
     const bool desktop_failed = info.SizeInBytes == ~0ull;
     if (desktop_failed && !d16s8) return false;
-    // At most 16384 x 16384 texels, 32 bytes of samples a texel and 2048 slices: below 2^45, no overflow.
+    // At most 16384 x 16384 texels, 128 bytes of samples a texel and 2048 slices: below 2^47, no overflow.
     const std::uint64_t samples = desc.SampleDesc.Count, slices = desc.DepthOrArraySize;
     std::uint64_t size = 0;
-    if (d32s8) {
+    if (d32s8 || d24s8) {
         size = plane_bytes(desc.Width, desc.Height, 4 * samples, slices) + plane_bytes(desc.Width, desc.Height, samples, slices);
     } else if (d16s8) {
         size = plane_bytes(desc.Width, desc.Height, 2 * samples, slices) + plane_bytes(desc.Width, desc.Height, samples, slices);

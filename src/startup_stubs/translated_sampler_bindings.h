@@ -19,7 +19,9 @@ constexpr UINT translated_sampler_space = 1;
 constexpr UINT translated_sampler_fallback = translated_sampler_count - 1;
 constexpr UINT title_sampler_stride = sizeof(SamplerWords);
 
-inline D3D12_STATIC_SAMPLER_DESC decode_sampler(const SamplerWords& words, UINT shader_register)
+// comparison: the sampler is read through a SamplerComparisonState (manifest line smpc). SQ_IMG_SAMP_WORD0 bits
+// 14:12 hold SQ_TEX_DEPTH_COMPARE, which lists NEVER..ALWAYS in the order of D3D12_COMPARISON_FUNC minus one.
+inline D3D12_STATIC_SAMPLER_DESC decode_sampler(const SamplerWords& words, UINT shader_register, bool comparison = false)
 {
     static const D3D12_TEXTURE_ADDRESS_MODE modes[8] = {
         D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_ADDRESS_MODE_MIRROR, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
@@ -35,6 +37,10 @@ inline D3D12_STATIC_SAMPLER_DESC decode_sampler(const SamplerWords& words, UINT 
     s.MaxAnisotropy = 1u << ((words[0] >> 9) & 7);
     if (s.MaxAnisotropy > 16) s.MaxAnisotropy = 16;
     s.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    if (comparison) {
+        s.Filter = D3D12_ENCODE_BASIC_FILTER(min & 1, mag & 1, mip == 2 ? 1 : 0, D3D12_FILTER_REDUCTION_TYPE_COMPARISON);
+        s.ComparisonFunc = static_cast<D3D12_COMPARISON_FUNC>(((words[0] >> 12) & 7) + 1);
+    }
     s.BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
     s.MaxLOD = D3D12_FLOAT32_MAX;
     s.ShaderRegister = shader_register;
@@ -44,6 +50,7 @@ inline D3D12_STATIC_SAMPLER_DESC decode_sampler(const SamplerWords& words, UINT 
 
 struct TranslatedSamplers {
     std::vector<SamplerWords> statics;
+    std::vector<bool> comparison;  // parallel to statics: bound as SamplerComparisonState
     bool heap = false;
     bool reserved_fallback = false;
 
@@ -64,12 +71,25 @@ struct TranslatedSamplers {
         } else {
             int index = 0;
             unsigned words[4] = {};
-            if (std::sscanf(line, "smp %d %x %x %x %x", &index, &words[0], &words[1], &words[2], &words[3]) == 5)
+            const bool compare = std::strncmp(line, "smpc", 4) == 0;
+            if (std::sscanf(line, compare ? "smpc %d %x %x %x %x" : "smp %d %x %x %x %x", &index, &words[0], &words[1],
+                            &words[2], &words[3]) == 5) {
                 statics.push_back({words[0], words[1], words[2], words[3]});
+                comparison.push_back(compare);
+            }
         }
         return true;
     }
 };
+
+// The static sampler bound at register i, in manifest order.
+inline std::vector<D3D12_STATIC_SAMPLER_DESC> decode_statics(const TranslatedSamplers& samplers)
+{
+    std::vector<D3D12_STATIC_SAMPLER_DESC> statics;
+    for (UINT i = 0; i < samplers.statics.size(); ++i)
+        statics.push_back(decode_sampler(samplers.statics[i], i, i < samplers.comparison.size() && samplers.comparison[i]));
+    return statics;
+}
 
 inline UINT sampler_root_parameter(UINT srvs) { return srvs ? 2u : 1u; }
 
@@ -90,8 +110,7 @@ inline HRESULT create_translated_root(ID3D12Device* device, UINT constants, UINT
         parameters[count].DescriptorTable = {1, &sampler_range};
         ++count;
     }
-    std::vector<D3D12_STATIC_SAMPLER_DESC> statics;
-    for (UINT i = 0; i < samplers.statics.size(); ++i) statics.push_back(decode_sampler(samplers.statics[i], i));
+    const auto statics = decode_statics(samplers);
     const D3D12_ROOT_SIGNATURE_DESC desc{count, parameters, static_cast<UINT>(statics.size()), statics.data(),
                                          D3D12_ROOT_SIGNATURE_FLAG_NONE};
     ComPtr<ID3DBlob> blob;

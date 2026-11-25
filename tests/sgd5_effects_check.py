@@ -1,4 +1,5 @@
 """Source-built SGD5 program groups and independently framed effect records."""
+import contextlib
 import hashlib
 import io
 import json
@@ -20,16 +21,24 @@ def name(s: str) -> bytes:
     return bytes([len(encoded)]) + encoded
 
 
-def program(label: str, kind: int, identity: int, *, words: int = 8, trailer: bytes = b"",
-            payload_magic: bytes = b"BC\xc0\xde") -> tuple[bytes, str]:
-    dxil = struct.pack("<HHI4sIII4sI", 0x60, kind, words, b"DXIL", 0x100, 16, 8, payload_magic, identity) + trailer
-    blob = b"DXBC" + bytes(16) + struct.pack("<4I", 1, 44 + len(dxil), 1, 36) + b"DXIL" + word(len(dxil)) + dxil
+def deflate(blob: bytes, mode: int = zlib.Z_FINISH) -> bytes:
     compressor = zlib.compressobj(wbits=-15)
-    packed = compressor.compress(blob) + compressor.flush()
+    return compressor.compress(blob) + compressor.flush(mode)
+
+
+def program(label: str, kind: int, identity: int, *, words: int = 8, trailer: bytes = b"",
+            payload_magic: bytes = b"BC\xc0\xde", dxil: bytes | None = None, pack=deflate,
+            declared: int = 0, reflection: tuple[int, int, int, int] = (0, 0, 9, 9)) -> tuple[bytes, str]:
+    if dxil is None:
+        dxil = struct.pack("<HHI4sIII4sI", 0x60, kind, words, b"DXIL", 0x100, 16, 8, payload_magic, identity) + trailer
+    blob = b"DXBC" + bytes(16) + struct.pack("<4I", 1, 44 + len(dxil), 1, 36) + b"DXIL" + word(len(dxil)) + dxil
+    packed = pack(blob)
     size = 12 + len(packed)
-    wrapped = struct.pack("<3I", 0xddce7, size, len(blob)) + packed
-    reflection = struct.pack("<4HB", 0, 0, 0, 9, 0)
-    record = name(label) + b"\x20" + word(size) + wrapped + bytes(152) + word(9) + reflection
+    wrapped = struct.pack("<3I", 0xddce7, size, len(blob) + declared) + packed
+    # Reflection word, then register count, buffer count, an opaque half and the repeated length.
+    registers, buffers, length, repeated = reflection
+    block = word(length) + struct.pack("<4H", registers, buffers, 0, repeated) + bytes(length - 8)
+    record = name(label) + b"\x20" + word(size) + wrapped + bytes(152) + block
     return record, hashlib.sha256(blob).hexdigest()
 
 
@@ -57,8 +66,44 @@ class EffectChecks(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         candidates(io.BytesIO(data), "probe", 0, len(data), 32, len(table), len(data))
 
+    def test_container_fields(self) -> None:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+        from sgd5_effects import candidates
+
+        def inventory(entry: bytes) -> list:
+            table = b"SGD5" + bytes(28) + word(0) + word(1) + entry + word(0) * 4 + word(1)
+            data = table + effect("probe", [], [0])
+            return candidates(io.BytesIO(data), "probe", 0, len(data), 32, len(table), len(data))
+
+        # One register and one buffer add 24 bytes each to the 9-byte reflection block: 9 + 48 = 57.
+        entry, digest = program("fields", 0, 5, reflection=(1, 1, 57, 57))
+        self.assertEqual([item.container_sha256 for item in inventory(entry)], [digest])
+
+        def header(tag: bytes = b"DXIL", start: int = 16, size: int = 8) -> bytes:
+            # Eight declared words hold 32 bytes; 8 + 15 + 8 and 8 + 16 + 3 both still fit.
+            return struct.pack("<HHI4sIII4sI", 0x60, 0, 8, tag, 0x100, start, size, b"BC\xc0\xde", 5)
+
+        for case, message, options in (
+            ("repeated reflection length", "reflection block", {"reflection": (0, 0, 9, 10)}),
+            ("empty compressed stream", "bounded", {"pack": lambda blob: b""}),
+            ("bytes after the final block", "container disagrees", {"pack": lambda blob: deflate(blob) + b"\0"}),
+            ("no final block", "container disagrees", {"pack": lambda blob: deflate(blob, zlib.Z_SYNC_FLUSH)}),
+            ("decoded size one byte long", "container disagrees", {"declared": 1}),
+            ("part shorter than its header", "Truncated", {"dxil": header()[:20]}),
+            ("program tag", "invalid header", {"dxil": header(tag=b"DXBC")}),
+            ("payload offset 15", "invalid header", {"dxil": header(start=15)}),
+            ("payload size 3", "invalid header", {"dxil": header(size=3)}),
+        ):
+            with self.subTest(case=case), self.assertRaisesRegex(ValueError, message):
+                inventory(program("fields", 0, 5, **options)[0])
+
     def test_candidates_and_boundaries(self) -> None:
-        tool = Path(__file__).resolve().parents[1] / "tools" / "sgd5_effects.py"
+        tools_dir = str(Path(__file__).resolve().parents[1] / "tools")
+        if tools_dir not in sys.path:
+            sys.path.insert(0, tools_dir)
+        from sgd5_effects import main as sgd5_main
+
+        tool = Path(tools_dir) / "sgd5_effects.py"
         mesh, mesh_digest = program("shared", 13, 1, payload_magic=b"TEST")
         ps0, first_digest = program("shared", 0, 2)
         ps1, second_digest = program("shared", 0, 3)
@@ -74,20 +119,46 @@ class EffectChecks(unittest.TestCase):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "fixture.bin"
 
+            def argv(label: str, start: int, stop: int, group_end: int) -> list[str]:
+                return [str(path), label, "--group", str(group_start), str(group_end),
+                        "--arrays", str(len(header)), "--record", str(start), str(stop)]
+
             def run(data: bytes, label: str = "choice", start: int = selected, stop: int = end,
                     group_end: int = end) -> subprocess.CompletedProcess[str]:
                 path.write_bytes(data)
-                return subprocess.run([sys.executable, "-B", tool, path, label, "--group", str(group_start),
-                                       str(group_end), "--arrays", str(len(header)), "--record", str(start), str(stop)],
+                args = argv(label, start, stop, group_end)
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    try:
+                        rc = sgd5_main(args)
+                    except SystemExit as exc:
+                        if exc.code is None:
+                            rc = 0
+                        elif isinstance(exc.code, int):
+                            rc = int(exc.code)
+                        else:
+                            stderr.write(f"{exc.code}\n")
+                            rc = 1
+                return subprocess.CompletedProcess(args, rc, stdout.getvalue(), stderr.getvalue())
+
+            def run_subprocess(data: bytes, label: str = "choice", start: int = selected, stop: int = end,
+                               group_end: int = end) -> subprocess.CompletedProcess[str]:
+                path.write_bytes(data)
+                return subprocess.run([sys.executable, "-B", tool, *argv(label, start, stop, group_end)],
                                       capture_output=True, text=True)
 
-            result = run(archive)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(json.loads(result.stdout), {"effect": "choice", "candidates": [
+            expected_choice = {"effect": "choice", "candidates": [
                 {"group": "VS", "index": 0, "name": "shared", "dxil_kind": 13, "container_sha256": mesh_digest},
                 {"group": "PS", "index": 1, "name": "shared", "dxil_kind": 0, "container_sha256": second_digest},
                 {"group": "PS", "index": 0, "name": "shared", "dxil_kind": 0, "container_sha256": first_digest},
-            ]})
+            ]}
+            result = run_subprocess(archive)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), expected_choice)
+            in_proc = run(archive)
+            self.assertEqual(in_proc.returncode, 0, in_proc.stderr)
+            self.assertEqual(json.loads(in_proc.stdout), expected_choice)
             empty = run(archive, "empty", begin, selected)
             self.assertEqual(empty.returncode, 0, empty.stderr)
             self.assertEqual(json.loads(empty.stdout), {"effect": "empty", "candidates": []})

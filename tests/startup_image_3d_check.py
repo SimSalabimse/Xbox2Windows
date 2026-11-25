@@ -101,14 +101,17 @@ def controls():
     assert 'srv 0 tex2d table 0 0' in manifest, manifest
     print('dim 2D (same words, dim field changed): Texture2D r0, float2(F(v0), F(v1)); manifest srv 0 tex2d')
 
-    # Other dimensions are refused rather than sampled as 2D (2D arrays: tests/startup_image_2d_array_check.py).
+    pipe = translate(WORDS_1D)
+    assert 'Texture1D<float4> r0' in pipe.hlsl_ps()
+    assert 'r0.Sample(q0, F(v0))' in pipe.hlsl_ps()
+    assert 'srv 0 tex1d table 0 0' in pipe.manifest()
+    unsupported = WORDS_1D.replace(bytes.fromhex('000f80f0'), bytes.fromhex('180f80f0'))
     try:
-        translate(WORDS_1D)
-    except G.Unsupported as error:
-        assert 'image dimension SQ_RSRC_IMG_1D' in str(error), error
+        translate(unsupported)
+    except G.Unsupported:
+        pass
     else:
-        raise AssertionError('dim:SQ_RSRC_IMG_1D accepted')
-    print('dim 1D: refused')
+        raise AssertionError('unverified image dimension accepted')
 
 
 def assemble(llvm_mc, source):
@@ -163,6 +166,24 @@ def check_draw(dxc, renderer, adapter, fxc=None):
         for kind, compiler, vs_profile, ps_profile in compilers:
             vs = compile_hlsl(compiler, kind, FULLSCREEN_VS, 'fullscreen_%s' % kind, vs_profile, directory)
             shader = compile_hlsl(compiler, kind, translated, 'ps_%s' % kind, ps_profile, directory)
+            # Select only alpha, export it through all four channels, and change the input x.
+            alpha = WORDS_1D.replace(bytes.fromhex('000f80f0'), bytes.fromhex('000880f0')).replace(
+                bytes.fromhex('0f1800f800010203'), bytes.fromhex('0f1800f800000000'))
+            for word, expected in [(0x3f400000, '3f400000'), (0x3e800000, '3f000000')]:
+                code = alpha.replace(struct.pack('<I', 0x3f400000), struct.pack('<I', word))
+                text = translate(code).hlsl_ps()
+                ps1 = compile_hlsl(compiler, kind, text, 'ps_1d_' + kind, ps_profile, directory)
+                args = [renderer, adapter, '--startup-image-1d', str(vs), str(ps1), '0', ','.join([expected] * 4)]
+                run = subprocess.run(args, capture_output=True, text=True)
+                if run.returncode == 77:
+                    sys.exit(77)
+                assert run.returncode == 0, (run.stdout, run.stderr)
+                mutant = text.replace('U(t.w)', 'U(t.x)')
+                assert mutant != text
+                args[4] = str(compile_hlsl(compiler, kind, mutant, 'ps_1d_wrong', ps_profile, directory))
+                failed = subprocess.run(args, capture_output=True, text=True)
+                wrong = '3e800000' if word == 0x3f400000 else '3e000000'
+                assert failed.returncode != 0 and 'actual=' + ','.join([wrong] * 4) in failed.stderr, failed.stderr
             for z, expected in cases:
                 run = subprocess.run([renderer, adapter, '--startup-image-3d', str(vs), str(shader), z, expected],
                                      capture_output=True, text=True)

@@ -133,6 +133,25 @@ int run()
     if (rc.consumed_frames != 3ull * block) return fail("case c consumption incomplete", 10);
     // A failed padding query is not a measurement: reject the run instead of counting frames as consumed.
     if (ra.padding_errors || rb.padding_errors || rc.padding_errors) return fail("GetCurrentPadding failed during a case (endpoint lost?)", 11);
+
+    // (d) Negative control + 5.1 / 44.1 kHz downmix & resample submission when endpoint is mono or stereo.
+    if (mix.channels <= 2) {
+        AudioSink d;
+        if (const std::string why = d.open(); !why.empty()) return skip(why);
+        const BlockFormat invalid_fmt{SampleKind::Float32, 2, 0};
+        const float zero_pair[2] = {0.0f, 0.0f};
+        if (d.submit(invalid_fmt, 1, zero_pair) != Submit::Unsupported)
+            return fail("case d zero sample rate was not rejected as Unsupported", 12);
+        const BlockFormat ch6_44{SampleKind::Float32, 6, 44100};
+        std::vector<float> blk6(441 * 6, 0.0f);
+        for (uint32_t i = 0; i < 441; ++i) blk6[i * 6 + 0] = 0.1f;
+        if (d.submit(ch6_44, 441, blk6.data()) != Submit::Accepted)
+            return fail("case d 5.1 44.1 kHz block not accepted", 13);
+        const Report rd = d.report();
+        if (rd.unsupported != 1 || rd.submitted_frames + 2 < resampled_frame_count(441, 44100, mix.rate) ||
+            rd.submitted_frames > resampled_frame_count(441, 44100, mix.rate))
+            return fail("case d report counts mismatch", 14);
+    }
     std::puts("startup_audio_output: PASS (no capture-path verification; glitch count not available from the render API)");
     return 0;
 }

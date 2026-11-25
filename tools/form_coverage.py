@@ -19,7 +19,8 @@ Rules:
   of each line of every program tools/pixel_aot.py lowered without an error, in the file CTest names
   in FORM_COVERAGE_RECORD (<build>/form_coverage/<test>.txt). Programs a check expects to be rejected
   raise before they are recorded. A record not written during the JUnit file's run is ignored, so a
-  record and a test status always come from the same run.
+  record and a test status always come from the same run. A --records path that is not a directory is an
+  error (exit 2); a directory whose records all come from another run is measured with a warning.
 - Reference lists (denominators) live in docs/coverage/ and are produced by tools/form_reference.py.
 Python standard library only.
 """
@@ -110,8 +111,9 @@ CPU_FIXTURES = {
 # their passing differential test, rather than guessing the macro expansion.
 CPU_RECORD_FIXTURES = {"flag_conditions"}
 
-MASM_DIRECTIVES = {"ifdef", "ifndef", "if", "else", "elseif", "endif", "end", "public", "extern",
-                   "externdef", "include", "includelib", "option", "align", "even", "org", "assume", "local"}
+MASM_DIRECTIVES = {"ifdef", "ifndef", "if", "else", "elseif", "elseifdef", "endif",
+                   "ifidni", "rept", "end", "public", "extern", "externdef", "include", "includelib",
+                   "option", "align", "even", "org", "assume", "local"}
 MASM_DEFINERS = {"proc", "endp", "label", "equ", "db", "dw", "dd", "dq", "byte", "word", "dword",
                  "qword", "segment", "ends", "struct", "macro", "endm", "textequ"}
 MASM_PREFIXES = {"lock", "rep", "repe", "repz", "repne", "repnz"}
@@ -125,8 +127,11 @@ def masm_mnemonics(text):
     found = set()
     macros = set()
     for line in text.splitlines():
-        line = re.sub(r"^\s*\w+::?", "", line.split(";", 1)[0]).strip()  # local or global label
+        # Local (`@@:`) or global label, then a MASM assembly-time assignment.
+        line = re.sub(r"^\s*(?:@@|[@$?A-Za-z_][\w@$?]*)::?", "", line.split(";", 1)[0]).strip()
         words = line.lower().split()
+        if len(words) > 1 and words[1] == "=":
+            continue
         if len(words) > 1 and words[1] == "macro":
             macros.add(words[0])
             continue
@@ -141,6 +146,11 @@ def masm_mnemonics(text):
             # ML64 has no INT3 mnemonic and encodes INT 3 (also written 3h or 03h) as the one-byte CC form,
             # the reference's int3.
             found.add("int3")
+            continue
+        if words[0] == "fsetpm":
+            # ML64 has no FNSETPM spelling and assembles FSETPM as DB E4 without a WAIT (9B), the
+            # reference's fnsetpm. Its other WAIT spellings (FCLEX, FINIT, FSTSW, ...) do emit the 9B.
+            found.add("fnsetpm")
             continue
         found.add(x64_canonical(words[0]))
     return found
@@ -323,7 +333,19 @@ def main(argv):
     except (OSError, ET.ParseError, ValueError) as error:
         print(f"form_coverage: {args.junit}: {error}", file=sys.stderr)
         return 2
-    m = measure(results, records=read_records(args.records, window), gaps_for=args.gaps)
+    # Reading nothing from a mistyped or wrong --records path would silently count every record-mode and shader
+    # form as uncovered, so a path that is not a directory is an error.
+    if not args.records.is_dir():
+        problem = "records path is not a directory" if args.records.exists() else "records directory does not exist"
+        print(f"form_coverage: {args.records}: {problem}", file=sys.stderr)
+        return 2
+    records = read_records(args.records, window)
+    stored = sum(1 for _ in args.records.glob("*.txt"))
+    if stored and not records:
+        # For example the records of another preset's build directory: valid, but nothing from this run counts.
+        print(f"form_coverage: {args.records}: none of the {stored} records here was written during this JUnit "
+              "run, so no record-mode or shader form is counted", file=sys.stderr)
+    m = measure(results, records=records, gaps_for=args.gaps)
     if args.gaps:
         gaps = m[args.gaps].pop("gaps")
     if args.json:

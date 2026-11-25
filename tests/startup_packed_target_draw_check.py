@@ -13,9 +13,8 @@ this adapter takes:
   B4G4R4A4_UNORM           (119, 51, 204, 255)
   B5G6R5_UNORM             (115, 53, 206, 255)
 
-Controls: B5G6R5_UNORM (a packed format outside the rule, never substituted) and R8G8B8A8_UNORM with
-its own view format must draw their own values. A packed view of a plain R8G8B8A8_UNORM texture, and
-a B5G5R5A1 view of a B4G4R4A4 texture, must be refused by name and leave the draw without the clear
+Control: R8G8B8A8_UNORM with its own view format must draw its own values. A packed view of a plain
+R8G8B8A8_UNORM texture, and a B5G5R5A1 view of a B4G4R4A4 texture, must be refused by name and leave the draw without the clear
 colour.
 
 Not covered: unordered-access writes, and texel data written or read by the CPU in the 16-bit layout.
@@ -117,18 +116,18 @@ def check(work, consumer, dxc, backend):
 
     paths = set()
     for name, resource_format, flags in (("B5G5R5A1 render target with unordered access", B5G5R5A1, RT | UAV),
-                                         ("B4G4R4A4 render target", B4G4R4A4, RT)):
+                                         ("B4G4R4A4 render target", B4G4R4A4, RT),
+                                         ("B5G6R5 render target", B5G6R5, RT)):
         created, got = rendered(name, resource_format, flags, {resource_format, RGBA8})
         paths.add("stand-in" if created == RGBA8 else "as described")
-    # Controls that draw: never substituted.
-    control, _ = rendered("control, B5G6R5 render target", B5G6R5, RT, {B5G6R5})
+    # Control that draws: never substituted.
     plain, _ = rendered("control, R8G8B8A8 render target", RGBA8, RT, {RGBA8})
     assert stored(B5G5R5A1) != stored(RGBA8) != stored(B4G4R4A4) and stored(B5G6R5) != stored(RGBA8)
     # Controls that must be refused.
     refused("B5G5R5A1 views of a plain R8G8B8A8 texture", RGBA8, RT, B5G5R5A1)
     refused("B5G5R5A1 views of a B4G4R4A4 render target", B4G4R4A4, RT, B5G5R5A1)
     print(f"startup_packed_target_draw: PASS on {backend} (packed targets drawn {' and '.join(sorted(paths))} on this adapter; "
-          f"2 drawn controls, 2 refused view pairs; unordered-access writes and CPU-written texels not covered)")
+          f"1 drawn control, 2 refused view pairs; unordered-access writes and CPU-written texels not covered)")
     return 0
 
 

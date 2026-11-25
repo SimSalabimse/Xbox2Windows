@@ -1,0 +1,55 @@
+"""The parallel check runner reports every script's output and fails when any script fails."""
+import os
+import subprocess
+import sys
+import tempfile
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RUNNER = os.path.join(ROOT, "tools", "run_checks_parallel.py")
+
+
+def run(*scripts, jobs="2"):
+    return subprocess.run([sys.executable, "-B", RUNNER, "-j", jobs, *scripts],
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+
+def group(out, script, status):
+    """Return the text between this script's group header and its endgroup line."""
+    header = f"::group::{script} ({status}, "
+    assert out.count(header) == 1, (header, out)
+    start = out.index(header)
+    return out[start:out.index("::endgroup::", start)]
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    good = os.path.join(tmp, "good.py")
+    bad = os.path.join(tmp, "bad.py")
+    fail = os.path.join(tmp, "fail.py")
+    with open(good, "w") as f:
+        # The usage line promises `python -B <script>`.
+        f.write("import sys\nassert sys.flags.dont_write_bytecode\nprint('good ran')\n")
+    with open(bad, "w") as f:
+        f.write("import sys\nprint('bad ran')\nsys.exit(3)\n")
+    with open(fail, "w") as f:
+        # An uncaught assertion exits 1 and writes its traceback to stderr, the usual way a check fails.
+        f.write("assert False, 'fail ran'\n")
+    ok = run(good, good)
+    assert ok.returncode == 0 and ok.stdout.count("good ran") == 2, ok.stdout
+    assert "all 2 checks passed" in ok.stdout, ok.stdout
+    mixed = run(bad, good)
+    assert mixed.returncode == 1, mixed.stdout
+    assert "bad ran" in mixed.stdout and "good ran" in mixed.stdout and "FAILED: " + bad in mixed.stdout, mixed.stdout
+    assert mixed.stdout.index("bad ran") < mixed.stdout.index("good ran"), "output must keep the given order"
+    # Two failures: the status is still 1, the FAILED line names both in the given order, each
+    # header carries its exit code, and stderr lands inside the failing script's own group.
+    many = run(bad, fail, good)
+    assert many.returncode == 1, many.stdout
+    assert "FAILED: " + bad + " " + fail + "\n" in many.stdout, many.stdout
+    assert "bad ran" in group(many.stdout, bad, "exit 3"), many.stdout
+    assert "AssertionError: fail ran" in group(many.stdout, fail, "exit 1"), many.stdout
+    assert "good ran" in group(many.stdout, good, "ok"), many.stdout
+    assert many.stdout.count("::endgroup::") == 3, many.stdout
+    # -j 0 is clamped to one worker instead of reaching ThreadPoolExecutor(max_workers=0).
+    serial = run(good, jobs="0")
+    assert serial.returncode == 0 and "all 1 checks passed" in serial.stdout, serial.stdout
+print("run_checks_parallel_check: ok")

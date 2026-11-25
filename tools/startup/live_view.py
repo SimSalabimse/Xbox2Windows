@@ -10,6 +10,9 @@ import re
 import sys
 import time
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 rundir = sys.argv[1]
 # The package root the run uses as its working directory (run.ps1 -DataDir), next to the G:\ mount.
 roots = ["G:\\"] + [os.path.join(os.path.abspath(sys.argv[2]), "")] if len(sys.argv) > 2 else ["G:\\"]
@@ -88,11 +91,18 @@ def on_shim(line):
             say("storage", f"read batch complete: {m.group(1)} compressed chunks decompressed so far, {m.group(2)} failed")
     elif "EnqueueRequest" in line or "options=" in line or "Queue::Submit" in line or "IsComplete" in line:
         return
+    elif line.startswith("x2w-dstorage heartbeat "):
+        m = re.search(r"\binflated=(\d+)", line)
+        if m:
+            counts["chunks"] = int(m.group(1))
+        say("storage", line)
+    elif line.startswith("x2w-render totals:"):
+        say("render", line)
     elif "heartbeat" in line:
         m = re.search(r"heartbeat: (\d+) frames presented in ([\d.]+) s \(([\d.]+) fps", line)
         if m:
             frames = m.group(1)
-            say("frames", f"{m.group(1)} frames presented, {m.group(3)} fps (every draw dropped: no GPU translation yet)")
+            say("frames", f"{m.group(1)} frames presented, {m.group(3)} fps")
     elif "title main state" in line:
         m = re.search(r"state (-?\d+) -> (-?\d+)", line)
         if m:
@@ -117,9 +127,9 @@ def on_shim(line):
 
 sources = {"events.txt": on_event, "files.txt": on_file, "trap.log": on_shim}
 positions = {name: 0 for name in sources}
-partial = {name: "" for name in sources}
+partial = {name: b"" for name in sources}  # bytes: a character can be split between two reads
 print("Xbox2Windows local startup experiment: live log of " + os.path.abspath(rundir))
-print("Columns: time since this window opened, category, detail. The game runs offline (network opens are refused).")
+print("Columns: time since this window opened, category, detail. Network refusals are shown when observed.")
 print("-" * 110, flush=True)
 finished = os.path.join(rundir, "finished.txt")
 ended = False
@@ -128,20 +138,20 @@ while True:
     for name, handler in sources.items():
         path = os.path.join(rundir, name)
         try:
-            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            with open(path, "rb") as handle:
                 handle.seek(positions[name])
                 chunk = handle.read()
-                positions[name] = handle.tell()
+                positions[name] += len(chunk)
         except OSError:
             continue
         if not chunk:
             continue
         progressed = True
-        lines = (partial[name] + chunk).split("\n")
+        lines = (partial[name] + chunk).split(b"\n")
         partial[name] = lines.pop()
-        for line in lines:
+        for raw in lines:
             try:
-                handler(line)
+                handler(raw.decode("utf-8", errors="replace").rstrip("\r"))
             except Exception as error:  # a viewer bug must not hide the rest of the log
                 say("viewer", f"could not format a line: {error}")
     if time.time() - last_status >= 10 and not ended:
@@ -157,7 +167,8 @@ while True:
     time.sleep(0.25)
 print("-" * 110)
 try:
-    print(open(finished, encoding="utf-8", errors="replace").read().strip())
+    with open(finished, encoding="utf-8", errors="replace") as handle:
+        print(handle.read().strip())
 except OSError:
     pass
 print("\nRun ended. Full logs are in " + os.path.abspath(rundir) + " (events.txt, files.txt, trap.log).")

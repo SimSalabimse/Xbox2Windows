@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <new>
 #include <stdexcept>
@@ -25,6 +26,8 @@ template<class Records, class Key, class Record>
 HRESULT publish_placement(SRWLOCK& lock, Records get_records, std::multimap<std::uint64_t, Key>& by_start,
                           std::uint64_t& max_width, Key owner, std::uint64_t start, const Record& record)
 {
+    if (!start || !record.bytes || record.bytes > (std::numeric_limits<std::uint64_t>::max)() - start)
+        return E_INVALIDARG;
     ExclusiveNoteLock guard(lock);
     try {
         auto& records = get_records();

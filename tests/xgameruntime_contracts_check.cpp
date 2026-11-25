@@ -215,6 +215,19 @@ bool contract_checks(HMODULE module)
         return result == HRESULT_FROM_WIN32(ERROR_NOT_FOUND) && count == 0;
     };
 
+    // A null entry in the name list is an argument error that leaves the
+    // caller's buffer untouched.
+    auto read_null_name = [&](XGameSaveContainerHandle container, const char** names,
+                              std::uint32_t requested) {
+        alignas(XGameSaveBlob) std::uint8_t storage[512]{};
+        auto* blobs = reinterpret_cast<XGameSaveBlob*>(storage);
+        std::uint32_t count = requested;
+        const HRESULT result = read_blob_data(container, names, &count, sizeof(storage), blobs);
+        return result == E_INVALIDARG && count == 0 &&
+               std::all_of(std::begin(storage), std::end(storage),
+                           [](std::uint8_t byte) { return byte == 0; });
+    };
+
     if (FAILED(initialize_provider(user, configuration_id, false, &provider)) || !provider ||
         FAILED(create_container(provider, slot_a_name, &slot_a_first)) || !slot_a_first ||
         FAILED(create_update(slot_a_first, slot_a_name, &player_update)) || !player_update ||
@@ -225,6 +238,16 @@ bool contract_checks(HMODULE module)
         return false;
     }
     close_update(player_update);
+
+    // slot-a now holds one live blob, so every requested name is compared with
+    // it. The create-container call below takes the exclusive lock afterwards.
+    const char* null_name[] = {nullptr};
+    const char* null_second_name[] = {player_blob, nullptr};
+    if (!read_null_name(slot_a_first, null_name, 1) ||
+        !read_null_name(slot_a_first, null_second_name, 2)) {
+        std::printf("FAIL: XGameSave read did not refuse a null blob name\n");
+        return false;
+    }
 
     if (!read_payload(slot_a_first, player_blob, player_payload, sizeof(player_payload)) ||
         FAILED(create_container(provider, slot_a_name, &slot_a_second)) || !slot_a_second ||
@@ -297,6 +320,7 @@ bool log_checks(HMODULE module, std::size_t expected_calls)
     bool saw_package = false;
     bool saw_expired_submit = false;
     bool saw_missing_read = false;
+    bool saw_invalid_read = false;
     constexpr const char* implemented_names[] = {
         "XUserFindUserById", "XUserGetId", "XUserDuplicateHandle", "XUserCloseHandle",
         "XGameSaveInitializeProvider", "XGameSaveCreateContainer", "XGameSaveCreateUpdate",
@@ -325,6 +349,10 @@ bool log_checks(HMODULE module, std::size_t expected_calls)
             entry.result == HRESULT_FROM_WIN32(ERROR_NOT_FOUND)) {
             saw_missing_read = true;
         }
+        if (std::strcmp(entry.function, "XGameSaveReadBlobData") == 0 &&
+            entry.result == E_INVALIDARG) {
+            saw_invalid_read = true;
+        }
         for (std::size_t j = 0; j < std::size(implemented_names); ++j) {
             if (std::strcmp(entry.function, implemented_names[j]) == 0) {
                 if (entry.result == not_implemented) {
@@ -336,7 +364,7 @@ bool log_checks(HMODULE module, std::size_t expected_calls)
         }
     }
     if (!saw_user || !saw_save || !saw_package || !saw_expired_submit ||
-        !saw_missing_read ||
+        !saw_missing_read || !saw_invalid_read ||
         std::find(implemented_seen.begin(), implemented_seen.end(), false) != implemented_seen.end()) {
         std::printf("FAIL: log does not contain positive and negative controls\n");
         return false;
@@ -355,7 +383,7 @@ bool run(const wchar_t* dll_path, const wchar_t* fixture_dir, const wchar_t* nor
     ClearLog clear_log = nullptr;
     const bool has_log = find_proc(module, "XGameRuntimeShimClearLog", clear_log);
     if (has_log) clear_log();
-    const bool passed = has_log && contract_checks(module) && log_checks(module, 34);
+    const bool passed = has_log && contract_checks(module) && log_checks(module, 36);
     FreeLibrary(module);
     return passed;
 }

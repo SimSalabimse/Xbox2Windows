@@ -3,11 +3,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cwchar>
 #include <fstream>
 #include <vector>
 
 using Word = std::uint64_t;
 Word invoke(void*, unsigned, Word = 0, Word = 0, Word = 0, Word = 0, Word = 0, Word = 0, Word = 0, Word = 0);
+extern "C" __declspec(dllimport) void x2w_d3d12_texture_written(void* base, unsigned long long bytes);
+extern "C" __declspec(dllimport) void x2w_d3d12_bc7_4k_s_written(void* base, UINT width, UINT height);
 namespace {
 template<class T> Word ptr(T* value) { return reinterpret_cast<Word>(value); }
 struct ViewAt {
@@ -78,8 +81,58 @@ int draw_address_srvs(ID3D12Device* desktop, void* guest, void* list)
     auto wrong_desc = desc;
     wrong_desc.Width = 1;
     publish(wrong_desc, ptr(planes[0].data())); draw(5);
-    publish(desc, ptr(planes[0].data()) + 1); draw(6); // Interior address, not the registered base.
+    publish(desc, ptr(planes[0].data()) + 1); // Interior address, not the registered base.
+    // Refusals that name their cause in the log; draw 6 shows each left the descriptor alone.
+    D3D12_RESOURCE_DESC buffer_desc{};
+    buffer_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer_desc.Width = 256;
+    buffer_desc.Height = buffer_desc.DepthOrArraySize = buffer_desc.MipLevels = buffer_desc.SampleDesc.Count = 1;
+    buffer_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ViewAt buffer_view{};
+    buffer_view.view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    buffer_view.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    buffer_view.view.Buffer.NumElements = 64;
+    buffer_view.view.Buffer.StructureByteStride = 4;
+    buffer_view.address = ptr(planes[0].data());
+    invoke(guest, 70, ptr(&buffer_desc), ptr(&buffer_view), cpu);
+    v.address = ptr(planes[0].data());
+    invoke(guest, 70, ptr(&desc), ptr(&v), cpu + 1); // Not the start of a descriptor in the view heap.
+    draw(6);
     publish(desc, ptr(planes[0].data())); draw(7);
+    return 0;
+}
+
+// Exercise the same four columns twice. The fourth view deliberately names a 2D resource.
+int draw_1d_srvs(void* guest, void* list)
+{
+    const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_TEXTURE1D, 0, 4, 1, 1, 1,
+        DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
+    static std::array<std::array<unsigned char, 16>, 4> data;
+    void* resources[4]{};
+    for (unsigned i = 0; i < data.size(); ++i) {
+        auto shape = desc;
+        if (i == 3) shape.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        for (unsigned x = 0; x < 4; ++x) {
+            data[i][4*x] = static_cast<unsigned char>(7 + 3*x);
+            data[i][4*x+3] = static_cast<unsigned char>(24 + 48*i + 8*x);
+        }
+        if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(data[i].data()), ptr(&shape),
+                    D3D12_RESOURCE_STATE_COMMON, 0, ptr(&__uuidof(ID3D12Resource)), ptr(&resources[i]))))) return 41;
+    }
+    Word cpu = 0;
+    if (!bind_view_table(guest, list, cpu)) return 42;
+    for (unsigned x = 0; x < 8; ++x) {
+        const unsigned i = x % 4;
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+        view.Format = desc.Format;
+        view.ViewDimension = i == 3 ? D3D12_SRV_DIMENSION_TEXTURE2D : D3D12_SRV_DIMENSION_TEXTURE1D;
+        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.Texture1D.MipLevels = 1;
+        invoke(guest, 18, ptr(resources[i]), i == 1 ? 0 : ptr(&view), cpu);
+        const D3D12_RECT strip{LONG(x), 0, LONG(x + 1), 4};
+        invoke(list, 22, 1, ptr(&strip));
+        invoke(list, 12, 3, 1);
+    }
     return 0;
 }
 
@@ -89,7 +142,13 @@ int draw_bc_address_srvs(void* guest, void* list)
     const DWORD length = GetEnvironmentVariableW(L"X2W_TEST_BC_VIEW", path, MAX_PATH);
     if (!length || length >= MAX_PATH) return 43;
     const bool bc3 = GetEnvironmentVariableW(L"X2W_TEST_BC3", nullptr, 0) != 0;
-    constexpr UINT tile = 4096, width = 128, height = 128;
+    // X2W_TEST_BC_SIZE=<width>x<height> (default 128x128) keeps the 2x2 tiles; a smaller size leaves the
+    // last tile column and row partial, so the padding blocks must stay outside the texture.
+    constexpr UINT tile = 4096, panel = 128;
+    UINT width = panel, height = panel;
+    wchar_t size[16]{};
+    if (GetEnvironmentVariableW(L"X2W_TEST_BC_SIZE", size, 16) &&
+        (swscanf_s(size, L"%ux%u", &width, &height) != 2 || width > panel || height > panel)) return 43;
     alignas(4096) static std::array<std::array<char, 4 * tile>, 2> backing{};
     std::ifstream input(path, std::ios::binary);
     if (!input.read(backing[0].data(), 4 * tile) || input.peek() != std::char_traits<char>::eof()) return 43;
@@ -109,9 +168,56 @@ int draw_bc_address_srvs(void* guest, void* list)
     for (LONG i = 0; i < 4; ++i) {
         v.address = addresses[i];
         invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
-        const D3D12_RECT region{i * LONG(width), 0, (i + 1) * LONG(width), LONG(height)};
+        // Keep the already-published descriptor while the backing changes to a row layout.
+        if (i == 3 && (width % 64 || height % 64))
+            x2w_d3d12_texture_written(backing[0].data(), backing[0].size());
+        const D3D12_RECT region{i * LONG(panel), 0, (i + 1) * LONG(panel), LONG(panel)};
         invoke(list, 22, 1, ptr(&region));
         invoke(list, 12, 3, 1);
+    }
+    // Refused, with nothing drawn after them (the check reads the log): not whole 4x4 blocks in either
+    // direction, and padded tiles past the size XG reports (1028 x 1028 pads to 1,183,744 bytes; the
+    // footprint rounded to 64 KiB is 1,179,648).
+    const auto refused = [&](UINT64 w, UINT h) {
+        auto shape = desc;
+        shape.Width = w;
+        shape.Height = h;
+        v.address = ptr(backing[1].data());
+        invoke(guest, 70, ptr(&shape), ptr(&v), cpu);
+    };
+    refused(width - 2, height);
+    refused(width, height - 2);
+    refused(1028, 1028);
+    // Published at the boundary: 256 x 196 (only the height partial) pads to 64 KiB, exactly the reported size.
+    alignas(4096) static std::array<char, 16 * tile> boundary{};
+    auto exact = desc;
+    exact.Width = 256;
+    exact.Height = 196;
+    v.address = ptr(boundary.data());
+    invoke(guest, 70, ptr(&exact), ptr(&v), cpu);
+    // A partial-tile view over memory the XG stand-in announced as copied rows stays refused; over blocks
+    // its opt-in BC7 4 KiB copy announced as tiled, it is published. Only partial sizes are affected.
+    if (width % 64 || height % 64) {
+        alignas(4096) static std::array<std::array<char, 4 * tile>, 2> announced{};
+        x2w_d3d12_texture_written(announced[0].data(), announced[0].size());
+        x2w_d3d12_bc7_4k_s_written(announced[1].data(), width, height);
+        for (const auto& backing : announced) {
+            v.address = ptr(backing.data());
+            invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
+        }
+        // Published first, then overwritten by an XG row copy: a second request is refused and leaves the
+        // destination naming the view it held before (the second backing's).
+        alignas(4096) static std::array<char, 4 * tile> reused{};
+        v.address = ptr(reused.data());
+        invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
+        v.address = ptr(backing[1].data());
+        invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
+        v.address = ptr(reused.data());
+        std::array<char, 32> written{};
+        std::memcpy(written.data(), reinterpret_cast<const void*>(cpu), written.size());
+        x2w_d3d12_texture_written(reused.data(), reused.size());
+        invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
+        if (std::memcmp(written.data(), reinterpret_cast<const void*>(cpu), written.size())) return 44;
     }
     return 0;
 }
@@ -226,4 +332,91 @@ void release_placed_vertices(bool done)
         invoke(p.resource[0], 2);
         p.resource[0] = nullptr;
     }
+}
+
+int draw_address_buffer_srvs(ID3D12Device* desktop, void* guest, void* list)
+{
+    static std::array<std::uint8_t, 65536 + 256> raw_buf0{};
+    static std::array<std::uint8_t, 65536 + 256> raw_buf1{};
+    auto* const buf0 = reinterpret_cast<std::uint32_t*>((ptr(raw_buf0.data()) + 0xffff) & ~Word{0xffff});
+    auto* const buf1 = reinterpret_cast<std::uint32_t*>((ptr(raw_buf1.data()) + 0xffff) & ~Word{0xffff});
+    std::memset(buf0, 0, 256);
+    std::memset(buf1, 0, 256);
+    buf0[0] = 17;
+    buf0[1] = 99;
+    buf0[4] = 63;
+    buf1[4] = 141;
+
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = 256;
+    desc.Height = desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    void* placed[2]{};
+    if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(buf0), ptr(&desc), D3D12_RESOURCE_STATE_COMMON,
+                                           0, ptr(&__uuidof(ID3D12Resource)), ptr(&placed[0]))))) return 47;
+    if (FAILED(static_cast<HRESULT>(invoke(guest, 133, ptr(buf1), ptr(&desc), D3D12_RESOURCE_STATE_COMMON,
+                                           0, ptr(&__uuidof(ID3D12Resource)), ptr(&placed[1]))))) return 47;
+
+    Word cpu = 0;
+    if (!bind_view_table(guest, list, cpu)) return 42;
+
+    const auto draw = [&](LONG x) {
+        const D3D12_RECT strip{x, 0, x + 1, 4};
+        invoke(list, 22, 1, ptr(&strip));
+        invoke(list, 12, 3, 1);
+    };
+
+    ViewAt raw{};
+    raw.view.Format = DXGI_FORMAT_R32_TYPELESS;
+    raw.view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    raw.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    raw.view.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+    raw.view.Buffer.NumElements = 4;
+
+    raw.address = ptr(buf0);
+    invoke(guest, 70, ptr(&desc), ptr(&raw), cpu);
+    draw(0);
+
+    raw.address = ptr(buf0 + 4);
+    invoke(guest, 70, ptr(&desc), ptr(&raw), cpu);
+    draw(1);
+
+    raw.address = ptr(buf1);
+    raw.view.Buffer.FirstElement = 4;
+    invoke(guest, 70, ptr(&desc), ptr(&raw), cpu);
+    draw(2);
+
+    // Unaligned interior address for a raw buffer must be refused and keep the previous descriptor.
+    raw.view.Buffer.FirstElement = 0;
+    raw.address = ptr(buf0 + 1);
+    invoke(guest, 70, ptr(&desc), ptr(&raw), cpu);
+    draw(3);
+
+    ViewAt structured{};
+    structured.view.Format = DXGI_FORMAT_UNKNOWN;
+    structured.view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    structured.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    structured.view.Buffer.FirstElement = 1;
+    structured.view.Buffer.NumElements = 1;
+    structured.view.Buffer.StructureByteStride = 4;
+    structured.address = ptr(buf0);
+    invoke(guest, 70, ptr(&desc), ptr(&structured), cpu);
+    // An acceleration-structure view is refused; draw(4) proves the structured descriptor stayed in place.
+    ViewAt as_view{};
+    as_view.view.Format = DXGI_FORMAT_UNKNOWN;
+    as_view.view.ViewDimension = static_cast<D3D12_SRV_DIMENSION>(11);
+    as_view.view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    as_view.address = ptr(buf0);
+    invoke(guest, 70, ptr(&desc), ptr(&as_view), cpu);
+    draw(4);
+
+    raw.address = ptr(buf0);
+    raw.view.Buffer.FirstElement = 0;
+    invoke(guest, 70, ptr(&desc), ptr(&raw), cpu);
+    draw(5);
+    draw(6);
+    draw(7);
+    return 0;
 }

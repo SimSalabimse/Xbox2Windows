@@ -7,15 +7,23 @@ The translator models the bounded 832-byte x87|SSE|AVX standard-format XSAVE
 state (XCR0[2:0] = 7) in a local portable XState struct (leaving host XMM6..15,
 YMM6..15, x87/MMX and MXCSR untouched across lifted calls).
 
-Entry-state contract (`--entry-state`):
+Entry-state contract (`--entry-state`) and XRSTOR format contract (`--compacted-xrstor`):
   - defined (default): the three-pointer ABI carries no incoming x87/SSE/AVX
     state; every xsave/xsave64 must only save components previously initialized
     by a supported xrstor/xrstor64 (or vzeroupper for AVX). Entry-only xsave*
     and partially initialized restore/save paths that observe uninitialized
     components from entry are rejected. MXCSR is tracked apart from the
-    components: only an xrstor whose RFBM selects SSE or AVX defines it, so
-    vzeroupper alone does not, and a save that stores MXCSR (xsaveopt with SSE
-    or AVX selected, xsave/xsavec with SSE selected) is rejected without it.
+    components: by default (standard-only XRSTOR), an xrstor whose RFBM selects
+    SSE or AVX defines MXCSR, so vzeroupper alone does not, and a save that
+    stores MXCSR (xsaveopt with SSE or AVX selected, xsave/xsavec with SSE
+    selected) is rejected without it.
+  - --compacted-xrstor (opt-in): permits XRSTOR to accept compacted headers
+    (XCOMP_BV[63] set) in addition to standard headers. Because the header
+    format is data and cannot be distinguished at lift time, a compacted
+    restore selecting AVX without SSE leaves MXCSR untouched; therefore, with
+    --compacted-xrstor, only an xrstor whose RFBM selects SSE defines MXCSR
+    under the defined profile, and AVX-only xrstor -> xsaveopt(AVX) requires
+    --entry-state canonical (or a prior SSE restore).
   - canonical (opt-in): permits xsave/xsave64 before full component definition
     assuming the native caller establishes canonical architectural XSAVE state
     on entry (FCW=0x037F, FSW=0, FTW=0, FOP=0, FIP=0, FCS=0, FDP=0, FDS=0,
@@ -47,17 +55,33 @@ group XSAVE):
                        modified optimization (XMODIFIED after a prior XRSTOR to the same address) is
                        not modeled: the lifted code writes every component that is in use.
   - xrstor / xrstor64: require 64-byte-aligned [base + disp] and bounded mask
-                       (edx == 0 && (eax & ~7) == 0); validate XCOMP_BV == 0,
+                       (edx == 0 && (eax & ~7) == 0). The header selects the format.
+                       Standard (XCOMP_BV[63] clear): validate XCOMP_BV == 0,
                        header [528..535] == 0, (XSTATE_BV & ~7) == 0, and
                        (when rfbm & 6 != 0) MXCSR against host MXCSR_MASK
                        (#GP before mutating state), then restore or init each
                        requested component and update XINUSE[2:0].
+                       Compacted (XCOMP_BV[63] set, the layout xsavec writes):
+                       validate that XCOMP_BV[62:0] lists nothing outside
+                       x87|SSE|AVX, that XSTATE_BV is a subset of XCOMP_BV[62:0]
+                       and that every header byte [528..575] is zero (#GP before
+                       mutating state). A requested component restores from its
+                       compacted slot (x87 and SSE in the legacy area, AVX at 576, the
+                       first extended slot) when XSTATE_BV and XCOMP_BV both list it,
+                       and is initialized otherwise, which includes a component
+                       XCOMP_BV does not list. MXCSR belongs to the SSE component:
+                       loaded (and checked against MXCSR_MASK) when RFBM[1] and
+                       XSTATE_BV[1] are set, reset to 0x1F80 when RFBM[1] is set and
+                       XSTATE_BV[1] is clear, untouched when RFBM[1] is clear, so an
+                       AVX-only restore keeps the current MXCSR. The xsavec writer
+                       leaves bytes [528..575] alone, so a caller that restores a
+                       buffer xsavec filled must have zeroed them first.
 
 Transport/ABI glue: vmovdqa/vmovdqu (XMM0..5, YMM0..5), vzeroupper,
 movdqa/movdqu (XMM0..5), paddd (XMM0..5), movq (MM0..7 <-> m64 / volatile
 scratch r64), emms, 32/64-bit volatile GPR mov/xor, and terminal ret.
 
-XSAVES/XRSTORS, compacted XRSTOR, FXSAVE/FXRSTOR, EVEX encodings, nonvolatile
+XSAVES/XRSTORS, FXSAVE/FXRSTOR, EVEX encodings, nonvolatile
 registers (XMM6..15, YMM6..15, ZMM0..15, RBX/RBP/RSI/RDI/R12..R15/RSP),
 non-argument memory bases, stores outside r8, RIP-relative/indexed addressing,
 prefixes, branches, unclosed MMX state before ret, and trailing bytes reject.
@@ -316,6 +340,12 @@ static inline std::uint64_t load64(word address) {
     return value;
 }
 
+static inline void store64(word address, std::uint64_t value) {
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    *reinterpret_cast<volatile std::uint64_t __unaligned*>(address) = value;
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+}
+
 static inline Vec128 load128(word address, bool aligned) {
     if (aligned && (address & 15ull) != 0ull) raise_gp();
     std::atomic_signal_fence(std::memory_order_seq_cst);
@@ -449,7 +479,7 @@ static inline void init_x87(XState& state) {
     for (unsigned i = 0; i < 8u; ++i) std::memset(state.st[i], 0, 16);
 }
 
-static inline void op_xrstor(XState& state, word address, word rax_val, word rdx_val, bool is64) {
+static inline void op_xrstor(XState& state, word address, word rax_val, word rdx_val, bool is64, bool allow_compacted = false) {
     const std::uint32_t mask_lo = static_cast<std::uint32_t>(rax_val);
     const std::uint32_t mask_hi = static_cast<std::uint32_t>(rdx_val);
     if ((address & 63ull) != 0ull) raise_gp();
@@ -468,13 +498,43 @@ static inline void op_xrstor(XState& state, word address, word rax_val, word rdx
     std::memcpy(&xstate_bv, raw + 512, 8);
     std::memcpy(&xcomp_bv, raw + 520, 8);
     std::memcpy(&hdr_reserved, raw + 528, 8);
-    if (xcomp_bv != 0ull || hdr_reserved != 0ull) raise_gp();
-    if ((xstate_bv & ~7ull) != 0ull) raise_gp();
+    // XCOMP_BV[63] selects the compacted format when allow_compacted is enabled.
+    const bool compacted = allow_compacted && ((xcomp_bv >> 63) != 0ull);
+    const std::uint64_t xcomp_components = xcomp_bv & ~(1ull << 63);
+    if (compacted) {
+        // Compacted header: every header byte after XCOMP_BV is reserved, XSTATE_BV must be a subset of the
+        // components XCOMP_BV lists, and XCOMP_BV may list nothing outside x87|SSE|AVX.
+        for (unsigned i = 528u; i < 576u; i += 8u) {
+            std::uint64_t word = 0ull;
+            std::memcpy(&word, raw + i, 8);
+            if (word != 0ull) raise_gp();
+        }
+        if ((xcomp_components & ~7ull) != 0ull) raise_gp();
+        if ((xstate_bv & ~xcomp_components) != 0ull) raise_gp();
+    } else {
+        if (xcomp_bv != 0ull || hdr_reserved != 0ull) raise_gp();
+        if ((xstate_bv & ~7ull) != 0ull) raise_gp();
+    }
 
+    // MXCSR: the standard format loads it whenever RFBM selects SSE or AVX. The compacted format keeps it with
+    // the SSE component only: loaded when RFBM[1] and XSTATE_BV[1] are set, reset to 0x1F80 when RFBM[1] is set
+    // and XSTATE_BV[1] is clear, and left alone when RFBM[1] is clear (an AVX-only restore does not touch it).
+    // The #GP check applies to a loaded value only.
     std::uint32_t new_mxcsr = 0u;
-    if ((rfbm & 6ull) != 0ull) {
-        std::memcpy(&new_mxcsr, raw + 24, 4);
-        if ((new_mxcsr & ~state.mxcsr_mask) != 0u) raise_gp();
+    bool restores_mxcsr = false;
+    if (!compacted) {
+        restores_mxcsr = (rfbm & 6ull) != 0ull;
+        if (restores_mxcsr) {
+            std::memcpy(&new_mxcsr, raw + 24, 4);
+            if ((new_mxcsr & ~state.mxcsr_mask) != 0u) raise_gp();
+        }
+    } else if ((rfbm & 2ull) != 0ull) {
+        restores_mxcsr = true;
+        new_mxcsr = 0x1F80u;
+        if ((xstate_bv & 2ull) != 0ull) {
+            std::memcpy(&new_mxcsr, raw + 24, 4);
+            if ((new_mxcsr & ~state.mxcsr_mask) != 0u) raise_gp();
+        }
     }
 
     if ((rfbm & 1ull) != 0ull) {
@@ -522,7 +582,7 @@ static inline void op_xrstor(XState& state, word address, word rax_val, word rdx
         }
     }
 
-    if ((rfbm & 6ull) != 0ull) {
+    if (restores_mxcsr) {
         state.mxcsr = new_mxcsr;
     }
 
@@ -540,6 +600,7 @@ static inline void op_xrstor(XState& state, word address, word rax_val, word rdx
 
     if ((rfbm & 4ull) != 0ull) {
         if ((xstate_bv & 4ull) != 0ull) {
+            // The compacted AVX slot is the first extended slot, 576, as x87 and SSE live in the legacy area.
             for (unsigned i = 0; i < 16u; ++i) {
                 std::memcpy(state.ymm_hi[i], raw + 576u + i * 16u, 16);
             }
@@ -718,7 +779,7 @@ def flat_address(ins, ptr_origins, *, expected_bytes=None, write=False):
     return f"({base_name} + {disp:#x}ull)" if disp else base_name
 
 
-def lift_code(name, start, raw, *, entry_state="defined"):
+def lift_code(name, start, raw, *, entry_state="defined", compacted_xrstor=False):
     """Decode and lift one bounded straight-line XSAVE/XRSTOR leaf function."""
     if entry_state not in ENTRY_STATES:
         raise ValueError(f"unsupported entry-state profile {entry_state!r}")
@@ -868,13 +929,19 @@ def lift_code(name, start, raw, *, entry_state="defined"):
             is64 = XRSTOR_CODES[ins.code]
             require_xsave_masks(ins)
             addr = flat_address(ins, ptr_origins, write=False)
-            statements.append(f"op_xrstor(state, {addr}, rax, rdx, {'true' if is64 else 'false'});")
+            statements.append(
+                f"op_xrstor(state, {addr}, rax, rdx, {'true' if is64 else 'false'}, "
+                f"{'true' if compacted_xrstor else 'false'});"
+            )
             rax_val = const_gpr.get("rax")
             rdx_val = const_gpr.get("rdx")
             if rdx_val == 0 and rax_val is not None and (rax_val & ~7) == 0:
                 defined_xcomp |= rax_val & 7
-                # xrstor loads MXCSR whenever RFBM selects SSE or AVX.
-                if rax_val & 6:
+                # Standard-only XRSTOR defines MXCSR whenever RFBM selects SSE or AVX.
+                # When compacted inputs are allowed, only RFBM[1] (SSE) guarantees MXCSR is defined,
+                # because compacted XRSTOR with RFBM=4 (AVX only) leaves MXCSR unchanged.
+                mxcsr_mask_bits = 2 if compacted_xrstor else 6
+                if rax_val & mxcsr_mask_bits:
                     defined_mxcsr = True
             defined_xmm.update(range(6))
             defined_ymm.update(range(6))
@@ -1076,33 +1143,35 @@ def lift_code(name, start, raw, *, entry_state="defined"):
     return "\n".join(lines), len(instructions)
 
 
-def lift(pe, name, *, entry_state="defined"):
+def lift(pe, name, *, entry_state="defined", compacted_xrstor=False):
     entry = export_rva(pe, name)
     raw = bounded_code(pe, entry)
-    source, count = lift_code(name, entry, raw, entry_state=entry_state)
+    source, count = lift_code(name, entry, raw, entry_state=entry_state, compacted_xrstor=compacted_xrstor)
     return source, entry, count
 
 
-def translate_pe(pe, names, *, entry_state="defined"):
+def translate_pe(pe, names, *, entry_state="defined", compacted_xrstor=False):
     if entry_state not in ENTRY_STATES:
         raise ValueError(f"unsupported entry-state profile {entry_state!r}")
     if pe.FILE_HEADER.Machine != 0x8664 or pe.OPTIONAL_HEADER.Magic != 0x20B:
         raise ValueError("expected AMD64 PE32+")
-    lifted = [lift(pe, name, entry_state=entry_state) for name in names]
+    lifted = [lift(pe, name, entry_state=entry_state, compacted_xrstor=compacted_xrstor) for name in names]
     is_canonical = 1 if entry_state == "canonical" else 0
+    is_compacted = 1 if compacted_xrstor else 0
     profile_block = (
-        f'\n// Entry-state profile: {entry_state}\n'
+        f'\n// Entry-state profile: {entry_state} (compacted_xrstor={is_compacted})\n'
         f'extern "C" __declspec(dllexport) const char* lifted_entry_state_profile() {{ return "{entry_state}"; }}\n'
         f'extern "C" __declspec(dllexport) std::uint32_t lifted_requires_canonical_entry() {{ return {is_canonical}u; }}\n'
+        f'extern "C" __declspec(dllexport) std::uint32_t lifted_allows_compacted_xrstor() {{ return {is_compacted}u; }}\n'
     )
     source = PRELUDE + profile_block + "\n".join(f"\n{text}" for text, _, _ in lifted) + "\n"
     meta = [(name, entry, count) for name, (_, entry, count) in zip(names, lifted)]
     return source, meta
 
 
-def translate(image, names, *, entry_state="defined"):
+def translate(image, names, *, entry_state="defined", compacted_xrstor=False):
     with pefile.PE(str(image), fast_load=True) as pe:
-        return translate_pe(pe, names, entry_state=entry_state)
+        return translate_pe(pe, names, entry_state=entry_state, compacted_xrstor=compacted_xrstor)
 
 
 if __name__ == "__main__":
@@ -1116,9 +1185,19 @@ if __name__ == "__main__":
         default="defined",
         help="entry-state profile: defined (default, requires prior component definition before xsave) or canonical (opt-in caller-initialized canonical XSAVE state)",
     )
+    parser.add_argument(
+        "--compacted-xrstor",
+        action="store_true",
+        help="opt-in: allow compacted XRSTOR headers (XCOMP_BV[63] set); under defined entry-state, requires SSE RFBM[1] to define MXCSR",
+    )
     args = parser.parse_args()
     try:
-        source, meta = translate(args.image, args.exports.split(","), entry_state=args.entry_state)
+        source, meta = translate(
+            args.image,
+            args.exports.split(","),
+            entry_state=args.entry_state,
+            compacted_xrstor=args.compacted_xrstor,
+        )
         args.output.write_text(source, encoding="utf-8")
         for name, entry, count in meta:
             print(f"{name} at RVA {entry:#x} ({args.entry_state}): {count} instructions")

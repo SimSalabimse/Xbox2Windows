@@ -1,4 +1,5 @@
 """Byte-for-byte controls for logical asset reads and bounded section probes."""
+import contextlib
 import io
 import json
 from pathlib import Path
@@ -12,8 +13,31 @@ import zlib
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from paged_resource import PagedResource, Segment
 from section_probe import inspect as inspect_sections
+from section_probe import main as section_probe_main
 from section_probe import scan_window, sections
-from texture_descriptors import inventory, raw_page_map, zlib_segment
+from texture_descriptors import inventory
+from texture_descriptors import main as texture_descriptors_main
+from texture_descriptors import raw_page_map, zlib_segment
+
+
+def run_cli(main_fn, *args: str | Path) -> subprocess.CompletedProcess[str]:
+    """Invoke a tool CLI entrypoint in-process and capture stdout, stderr, and exit code."""
+    argv = [str(arg) for arg in args]
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    returncode = 0
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        try:
+            returncode = main_fn(argv)
+        except SystemExit as exc:
+            if exc.code is None:
+                returncode = 0
+            elif isinstance(exc.code, int):
+                returncode = exc.code
+            else:
+                stderr.write(f"{exc.code}\n")
+                returncode = 1
+    return subprocess.CompletedProcess(argv, returncode, stdout.getvalue(), stderr.getvalue())
 
 
 class ShortReadStream(io.BytesIO):
@@ -68,7 +92,6 @@ def zlib_page_archive() -> tuple[bytearray, bytes, bytes]:
 
 class ResourceChecks(unittest.TestCase):
     def test_texture_key_matches(self) -> None:
-        tool = Path(__file__).resolve().parents[1] / "tools" / "texture_descriptors.py"
         key = 0xFEDCBA9876543210
         with TemporaryDirectory() as directory:
             first = Path(directory) / "assets.ttpf"
@@ -82,8 +105,7 @@ class ResourceChecks(unittest.TestCase):
                 path.write_bytes(archive)
 
             def lookup(value: str, *paths: Path) -> subprocess.CompletedProcess[str]:
-                return subprocess.run([sys.executable, "-B", tool, "--lookup-key", value, *paths],
-                                      text=True, capture_output=True)
+                return run_cli(texture_descriptors_main, "--lookup-key", value, *paths)
 
             for value, expected in (
                 (hex(key), [(second, 0), (second, 1), (first, 1)]),
@@ -140,13 +162,11 @@ class ResourceChecks(unittest.TestCase):
             descriptor_indices(io.BytesIO(changed), 19)
 
     def test_verified_zlib_segment(self) -> None:
-        tool = Path(__file__).resolve().parents[1] / "tools" / "texture_descriptors.py"
         archive, packed, plain = zlib_page_archive()
         with TemporaryDirectory() as directory:
             path = Path(directory) / "zlib.ttpf"
             path.write_bytes(archive)
-            result = subprocess.run([sys.executable, "-B", tool, path, "--zlib-segment", "0"],
-                                    capture_output=True, text=True)
+            result = run_cli(texture_descriptors_main, path, "--zlib-segment", "0")
         self.assertEqual(result.returncode, 0, result.stderr)
         report = json.loads(result.stdout)
         self.assertEqual(report, {
@@ -215,13 +235,11 @@ class ResourceChecks(unittest.TestCase):
         self.assertEqual(zlib_segment(OneInterval(archive), 0).segment.stored, len(packed))
 
     def test_raw_page_map(self) -> None:
-        tool = Path(__file__).resolve().parents[1] / "tools" / "texture_descriptors.py"
         archive = raw_page_archive()
         with TemporaryDirectory() as directory:
             path = Path(directory) / "raw.ttpf"
             path.write_bytes(archive)
-            result = subprocess.run([sys.executable, "-B", tool, path, "--raw-page-map", "0"],
-                                    capture_output=True, text=True)
+            result = run_cli(texture_descriptors_main, path, "--raw-page-map", "0")
         self.assertEqual(result.returncode, 0, result.stderr)
         mapping = json.loads(result.stdout)
         self.assertEqual(mapping, {"logical_offset": 12288, "file_offset": 8704})
@@ -358,8 +376,8 @@ class ResourceChecks(unittest.TestCase):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "synthetic.ttpf"
             path.write_bytes(descriptor_archive())
-            command = [sys.executable, "-B", tool, path, "--descriptor"]
-            result = subprocess.run([*command, "257"], capture_output=True, text=True)
+            result = subprocess.run([sys.executable, "-B", str(tool), str(path), "--descriptor", "257"],
+                                    capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads(result.stdout), {
                 "descriptor_index": 257, "width": 12, "height": 44,
@@ -367,7 +385,7 @@ class ResourceChecks(unittest.TestCase):
             })
             for index in ("-1", "258"):
                 with self.subTest(index=index):
-                    result = subprocess.run([*command, index], capture_output=True, text=True)
+                    result = run_cli(texture_descriptors_main, path, "--descriptor", index)
                     self.assertEqual(result.returncode, 1, result.stderr)
                     self.assertIn("Descriptor index outside the ETPF table", result.stderr)
                     self.assertEqual(result.stdout, "")
@@ -451,6 +469,18 @@ class ResourceChecks(unittest.TestCase):
                 reader.read(pos, size)
         with self.assertRaises(ValueError):
             reader.read(7, 1, limit=8)
+        # Budgets are inclusive: a 3-byte raw read fits a limit of 3, and the
+        # 93-byte zlib segment decodes under a limit of 93.
+        self.assertEqual(reader.read(99, 3, limit=3), last)
+        self.assertEqual(reader.read(7, 1, limit=93), b"m")
+        with self.assertRaises(ValueError):
+            reader.read(99, 3, limit=2)
+        # A stored (level 0) stream is 93 + 2 + 5 + 4 bytes, so its stored size alone exceeds 93.
+        stored = zlib.compress(middle, 0)
+        stored_reader = PagedResource(io.BytesIO(stored), [Segment(0, len(stored), 93, "zlib")])
+        self.assertEqual(stored_reader.read(0, 1, limit=len(stored)), b"m")
+        with self.assertRaisesRegex(ValueError, "exceeds read budget"):
+            stored_reader.read(0, 1, limit=93)
 
     def test_short_reads_of_intact_segments(self) -> None:
         decoded = b"range data from a synthetic segment"
@@ -474,7 +504,8 @@ class ResourceChecks(unittest.TestCase):
             reader = PagedResource(io.BytesIO(payload), [Segment(0, len(payload), count, "zlib")])
             with self.assertRaisesRegex(ValueError, "Invalid compressed segment or decoded extent"):
                 reader.read(0, 1)
-        for seg in (Segment(0, 1, 2, "raw"), Segment(2, 1, 1, "raw"), Segment(-1, 1, 1, "raw")):
+        for seg in (Segment(0, 1, 2, "raw"), Segment(2, 1, 1, "raw"), Segment(-1, 1, 1, "raw"),
+                    Segment(0, 0, 0, "raw"), Segment(0, 1, 0, "zlib"), Segment(0, 0, 1, "zlib")):
             with self.assertRaises(ValueError):
                 PagedResource(io.BytesIO(b"ab"), [seg])
         reader = PagedResource(io.BytesIO(b"abcdef"), [Segment(0, 2, 2, "raw"),
@@ -491,8 +522,33 @@ class ResourceChecks(unittest.TestCase):
         self.assertEqual(scan_window(bytes(15) + packet, 1, "HEAD", "FOOT"), (1, {"HEAD FOOT": 1}))
         self.assertEqual(scan_window(packet, 0, "OTHER", "FOOT"), (1, {}))
         self.assertEqual(scan_window(packet[:-1], 0, "HEAD", "FOOT"), (0, {}))
-        for data in (doc + b"x", doc[:-1], doc[:4] + bytes(4), doc[:12] + b"\0" * 8):
+        for data in (doc + b"x", doc[:-1], doc[:4] + bytes(4), doc[:12] + b"\0" * 8, b"head" + doc[4:]):
             self.assertFalse(sections(data))
+        self.assertEqual(sections(struct.pack(">4sI4sI", b"A_1Z", 8, b"Z9_0", 8)), ("A_1Z", "Z9_0"))
+        self.assertEqual(scan_window(packet, 0, "HEAD", "TAIL"), (1, {}))
+        # An aligned method byte as the final byte cannot start a stream and is skipped.
+        self.assertEqual(scan_window(packet + bytes(-len(packet) % 16) + b"\x78", 0, "HEAD", "FOOT"),
+                         (1, {"HEAD FOOT": 1}))
+        # CMF 0x08 declares a 256-byte window; 0x0899 is a multiple of 31.
+        compressor = zlib.compressobj(wbits=9)
+        small_window = b"\x08\x99" + (compressor.compress(doc) + compressor.flush())[2:]
+        self.assertEqual(scan_window(small_window, 0, "HEAD", "FOOT"), (1, {"HEAD FOOT": 1}))
+
+    def test_section_window_size_bounds(self) -> None:
+        def table(size: int) -> bytes:
+            return struct.pack(">4sI", b"HEAD", size - 8).ljust(size - 8, b"\0") + struct.pack(">4sI", b"FOOT", 8)
+
+        # Decoded output is limited to 256 KiB inclusive, and the compressed input to
+        # 256 KiB. A stored (level 0) stream adds 6 bytes of header and checksum and
+        # 5 bytes per block of at most 65535 bytes: 26 bytes for 192 KiB, 31 for 256 KiB.
+        for label, packet, expected in (
+            ("decoded at limit", zlib.compress(table(256 << 10)), (1, {"HEAD FOOT": 1})),
+            ("decoded above limit", zlib.compress(table((256 << 10) + 1)), (0, {})),
+            ("stored below limit", zlib.compress(table(192 << 10), 0), (1, {"HEAD FOOT": 1})),
+            ("stored above limit", zlib.compress(table(256 << 10), 0), (0, {})),
+        ):
+            with self.subTest(label=label):
+                self.assertEqual(scan_window(packet, 0, "HEAD", "FOOT"), expected)
 
     def test_section_probe_counts_smaller_zlib_windows(self) -> None:
         doc = struct.pack(">4sI4s4sI", b"HEAD", 12, b"data", b"FOOT", 8)
@@ -519,9 +575,8 @@ class ResourceChecks(unittest.TestCase):
             path = Path(directory) / "synthetic-sections.bin"
             path.write_bytes(zlib.compress(doc))
 
-            def probe(first: str, last: str) -> subprocess.CompletedProcess:
-                return subprocess.run([sys.executable, "-B", str(script), str(path), "--first", first,
-                                       "--last", last], capture_output=True, text=True, encoding="utf-8")
+            def probe(first: str, last: str) -> subprocess.CompletedProcess[str]:
+                return run_cli(section_probe_main, path, "--first", first, "--last", last)
 
             for first, last in (("head", "FOOT"), ("HEAD", "foot"), ("HEA", "FOOT"), ("HEADS", "FOOT"),
                                 ("HÉAD", "FOOT"), ("HEAD", "FÖOT")):
@@ -529,7 +584,8 @@ class ResourceChecks(unittest.TestCase):
                 self.assertEqual(result.returncode, 2, (first, last, result.stdout, result.stderr))
                 self.assertIn("section tag", result.stderr)
                 self.assertNotIn("Traceback", result.stderr)
-            result = probe("HEAD", "FOOT")
+            result = subprocess.run([sys.executable, "-B", str(script), str(path), "--first", "HEAD",
+                                     "--last", "FOOT"], capture_output=True, text=True, encoding="utf-8")
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads(result.stdout)[0]["section_records"], 1)
 

@@ -934,6 +934,7 @@ HRESULT game_save_submit_update(XGameSaveUpdateHandle update) noexcept
 
 // This subset reads an explicit non-empty name list into a caller-owned buffer.
 // It does not implement the null-list enumeration variant from the full GDK API.
+// A null entry in the list is an argument error, as a null list is.
 HRESULT game_save_read_blob_data(XGameSaveContainerHandle container, const char** blob_names,
                                  std::uint32_t* count_of_blobs, std::size_t blobs_size,
                                  XGameSaveBlob* blob_data) noexcept
@@ -942,6 +943,9 @@ HRESULT game_save_read_blob_data(XGameSaveContainerHandle container, const char*
     const std::uint32_t requested = *count_of_blobs;
     *count_of_blobs = 0;
     if (!container || !blob_names || !blob_data || requested == 0) return E_INVALIDARG;
+    for (std::uint32_t i = 0; i < requested; ++i) {
+        if (!blob_names[i]) return E_INVALIDARG;
+    }
     AcquireSRWLockShared(&runtime_state.lock);
     const auto found_container = find_live(runtime_state.containers, container);
     if (!found_container) {

@@ -194,7 +194,33 @@ def level_register(ps, texture_kind):
     return m.groups()
 
 
+def check_address_count():
+    """image_sample_l takes the coordinates and then the level: three address dwords, or four for a
+    volume or a 2D array. Any other count is refused by name rather than sampled with a wrong level.
+
+    The refusal is decided from the operands and modifiers alone, so a bare stage reaches it.
+    """
+    def call(coords):
+        bare = G.Stage.__new__(G.Stage)
+        bare.image(['v5', coords, 's0'], ['dim:SQ_RSRC_IMG_2D', 'dmask:0x1'], 'l')
+
+    for coords, count in (('[v1, v2]', 2), ('[v1, v2, v3, v4]', 4)):
+        try:
+            call(coords)
+        except G.Unsupported as error:
+            assert str(error) == 'image_sample_l with %d address registers' % count, (coords, error)
+        else:
+            raise AssertionError('image_sample_l accepted %d address registers' % count)
+    # A legal count must get past the guard: the bare stage then stops where it needs a pipeline.
+    try:
+        call('[v1, v2, v3]')
+    except G.Unsupported as error:
+        assert 'address registers' not in str(error), error
+    except AttributeError:
+        pass
+
 def controls():
+    check_address_count()
     plain = level_register(stage('plain'), '2d')
     assert plain == ('v0', 'v1', None, 'v2'), plain
     assert 'Texture2D' in stage('plain')
@@ -225,8 +251,8 @@ def controls():
     refused('d16', 'image_sample_l modifier d16')  # half-precision result layout
     refused('r128', 'image_sample_l modifier r128')  # four-dword resource descriptor
     refused('dmask0', 'empty dmask')
-    for name in ('dim1d', 'msaa'):
-        refused(name, 'image dimension SQ_RSRC_IMG_')
+    refused('dim1d', 'unverified 1D image sample address or modifiers')
+    refused('msaa', 'image dimension SQ_RSRC_IMG_')
     for name in RESERVED:
         refused(name, 'image_sample_l modifier reserved')  # bits LLVM ignores must not be silently accepted
     print('refused: offset, compare, gather, cube, 1D, MSAA, unorm, a16, tfe, lwe, d16, r128, dmask 0, reserved bits')

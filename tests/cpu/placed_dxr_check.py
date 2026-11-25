@@ -11,6 +11,18 @@ from mapped_exe_chain_check import mapped_child
 from shim_compute_check import check_lifted_image
 
 
+def check_ray_control(actual, expected):
+    """Every word but the hit distance must match exactly. As in check_dxr_rays, the distance (word 3)
+    must be within 1e-5 of 1, because hardware intersection may round it (the RX 6600 returns 0x3f7fffff)."""
+    if len(actual) != len(expected):
+        check("direct Windows ray control", actual, expected)
+    distance = struct.unpack_from("<f", actual, 12)[0]
+    check("direct Windows ray control", actual[:12] + actual[16:], expected[:12] + expected[16:])
+    if not abs(distance - 1.0) < 1e-5:
+        raise AssertionError(f"direct Windows ray control: hit distance {distance!r} "
+                             f"(0x{struct.unpack_from('<I', actual, 12)[0]:08x}) is not within 1e-5 of 1")
+
+
 def compare(root, adapter, mapper, exe, lifted, provider, io):
     check_lifted_image(exe, lifted)
     mapped = [sys.executable, "-B", __file__, "--map", mapper, exe, provider, io]
@@ -45,7 +57,7 @@ def compare(root, adapter, mapper, exe, lifted, provider, io):
             ])
             placed, direct = run / "placed.bin", run / "direct.bin"
             if valid:
-                check("direct Windows ray control", direct.read_bytes(), expected)
+                check_ray_control(direct.read_bytes(), expected)
                 check("guest-selected addresses", placed.read_bytes(), direct.read_bytes())
             else:
                 check("unpublished on reject", (placed.exists(), direct.exists()), (False, False))

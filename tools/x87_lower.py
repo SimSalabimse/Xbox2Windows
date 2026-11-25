@@ -24,8 +24,10 @@ The profile accepts:
 - FNOP and FNCLEX, which change nothing the profile models (FCLEX decodes as WAIT and FNCLEX), and the 8087/287
   controls FNENI, FNDISI and FNSETPM, which later processors execute as FNOP (FENI and FDISI decode as WAIT and
   FNENI or FNDISI);
-- FFREEP ST(0) on a nonempty stack, which tags ST(0) empty and pops it as FSTP ST(0) does without storing it
-  (FFREE, FFREEP with another register, FINCSTP and FDECSTP stay outside the profile);
+- FFREEP ST(0) on a nonempty stack, which tags ST(0) empty and pops it as FSTP ST(0) does without storing it,
+  and FFREE ST(i) of a register that is already empty (i at least the depth), which changes neither occupancy
+  nor TOP (FFREE of an occupied register, FFREEP with another register, FINCSTP and FDECSTP stay outside the
+  profile);
 A function starts with control word 0x027F, TOP 0, eight empty registers and a clear status word, and
 must return with the stack empty. The stack depth before every instruction is fixed at translation
 time, so each register maps to a C++ slot and no TOP is needed at run time. Translation rejects any x87
@@ -116,7 +118,7 @@ X87_OPS = frozenset({M.FLD, M.FST, M.FSTP, M.FXCH, M.FCHS, M.FABS, M.FSQRT, M.FR
                      M.FCOMIP, M.FUCOMI, M.FUCOMIP, M.FADD, M.FADDP, M.FSUB, M.FSUBP, M.FSUBR, M.FSUBRP, M.FMUL, M.FMULP,
                      M.FDIV, M.FDIVP, M.FDIVR, M.FDIVRP, *IARITHMETIC, M.FNSTCW, M.WAIT, M.FLDCW, M.FCOM,
                      M.FCOMP, M.FCOMPP, M.FUCOM, M.FUCOMP, M.FUCOMPP, M.FNSTSW, M.FTST, M.FICOM, M.FICOMP,
-                     M.FXAM, M.FNOP, M.FNCLEX, M.FPREM, M.FPREM1, M.FNINIT, M.FBLD, M.FBSTP, *LEGACY_CONTROLS, M.FFREEP})
+                     M.FXAM, M.FNOP, M.FNCLEX, M.FPREM, M.FPREM1, M.FNINIT, M.FBLD, M.FBSTP, *LEGACY_CONTROLS, M.FFREEP, M.FFREE})
 # Comparisons into C0, C2 and C3 of the status word; FCOMPP and FUCOMPP pop twice, the other P forms once.
 STATUS_COMPARES = frozenset({M.FCOM, M.FCOMP, M.FCOMPP, M.FUCOM, M.FUCOMP, M.FUCOMPP})
 STATUS_POPS = {M.FCOM: 0, M.FCOMP: 1, M.FCOMPP: 2, M.FUCOM: 0, M.FUCOMP: 1, M.FUCOMPP: 2}
@@ -239,6 +241,10 @@ def _effect(i, depth, checked=None):
         if depth == 0:
             raise ValueError(f"x87 stack underflow at {i.ip:#x}: {i}")
         return depth - 1
+    if op == M.FFREE:  # an occupied register would leave a hole, or keep TOP while the stack shrinks
+        if i.op0_register - R.ST0 < depth:
+            raise ValueError(f"unsupported x87 operand at {i.ip:#x}: {i} frees an occupied register")
+        return depth
     if op == M.FTST:
         if depth == 0:
             raise ValueError(f"x87 stack underflow at {i.ip:#x}: {i}")
@@ -663,6 +669,8 @@ def _statement(i, depth, address, checked, parity, status_word=False):
         return f";  // {LEGACY_CONTROLS[op]}"
     if op == M.FFREEP:  # the pop is the depth change; the freed slot is dead from here on
         return ";  // ffreep st(0)"
+    if op == M.FFREE:  # the register is already empty
+        return f";  // ffree st({i.op0_register - R.ST0})"
     if op == M.FTST:  # ST(0) compared with +0.0
         return f"{{ const int r = x87_compare(x87_slot[{top}], X87Value{{0, 0}}); {COMPARE_SW} }}  // ftst"
     if op in ICOMPARES:

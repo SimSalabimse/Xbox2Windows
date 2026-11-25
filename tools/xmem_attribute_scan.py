@@ -354,7 +354,9 @@ class Scan:
         at = hex(instruction.ip)
         op = instruction.mnemonic
         if op == M.XOR and instruction.op0_kind == K.REGISTER and instruction.op1_kind == K.REGISTER \
-                and instruction.op0_register == instruction.op1_register:
+                and instruction.op0_register == instruction.op1_register \
+                and RegisterExt.size(instruction.op0_register) in (4, 8):
+            # An 8- or 16-bit xor leaves the upper bits in place, so it is not a constant.
             return {"source": "constant", "word": 0, "at": at}
         if op == M.MOV and instruction.op0_kind == K.REGISTER:
             width = RegisterExt.size(instruction.op0_register)

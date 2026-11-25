@@ -1,5 +1,7 @@
 """Specialize a bounded, two-wave gfx1013 mesh entry for desktop D3D12.
 
+The allocation may declare up to 128 vertices and primitives within the PSV0
+output bounds; the compute fallback keeps a single three-vertex triangle.
 Geometry words and dispatch ABI are static inputs. Position and transform buffers
 remain GPU inputs. Only forward control flow decided by static values is accepted.
 """
@@ -578,8 +580,11 @@ def lower(decoded, geometry, limits, vertex_header=None, *, compute_fallback=Fal
     if attributes and attributes.keys() != pos.keys():
         raise ValueError("Incomplete vertex attribute")
     idx = waves[0].indices | waves[1].indices
-    if (nv, np) != (3, 1):
-        raise ValueError("Expected a single three-vertex triangle")
+    # The native mesh shader writes any allocation within the PSV0 bounds. Each of the
+    # 128 threads exports at most one vertex and one primitive, so every allocated
+    # slot must be exported exactly once and nothing outside the allocation may be.
+    if compute_fallback and (nv, np) != (3, 1):
+        raise ValueError("The compute fallback translates only a single three-vertex triangle")
     if (
         not 0 < nv <= limits[0]
         or not 0 < np <= limits[1]
@@ -641,8 +646,41 @@ def lower(decoded, geometry, limits, vertex_header=None, *, compute_fallback=Fal
     return "\n".join(lines) + "\n"
 
 
-def translate(blob, geometry, library, vertex_header=None, *, compute_fallback=False):
+STAGE_NAMES = {
+    0: "pixel",
+    1: "vertex",
+    2: "geometry",
+    3: "hull",
+    4: "domain",
+    5: "compute",
+    6: "library",
+    13: "mesh",
+    14: "amplification",
+}
+
+
+def require_mesh_stage(chunks):
+    """Reject any other stage by name before the mesh profile checks."""
+    psv = chunks[b"PSV0"]
+    program = chunks[b"DXIL"]
+    kind = struct.unpack_from("<H", program, 2)[0] if len(program) >= 4 else None
+    for stage in (psv[28] if len(psv) > 28 else None, kind):
+        if stage == 13:
+            continue
+        if stage == 14:
+            raise ValueError(
+                "Unsupported amplification stage: only the bounded mesh stage is translated"
+            )
+        if stage is not None:
+            name = STAGE_NAMES.get(stage, f"stage {stage}")
+            raise ValueError(
+                f"Unsupported {name} stage: only the bounded mesh stage is translated"
+            )
+
+
+def decode_mesh(blob, library):
     chunks = parts(blob)
+    require_mesh_stage(chunks)
     p = chunks[b"PSV0"]
     if (
         len(p) < 52
@@ -656,15 +694,12 @@ def translate(blob, geometry, library, vertex_header=None, *, compute_fallback=F
     if any(not 0 < n <= 256 for n in limits):
         raise ValueError("Invalid mesh declaration")
     code = container_code(chunks[b"DXIL"], stage=13)
-    return lower(
-        disassemble(
-            code, library, offsets=True, features=b"+wavefrontsize64,-wavefrontsize32"
-        ),
-        geometry,
-        limits,
-        vertex_header,
-        compute_fallback=compute_fallback,
-    )
+    return disassemble(code, library, offsets=True, features=b"+wavefrontsize64,-wavefrontsize32"), limits
+
+
+def translate(blob, geometry, library, vertex_header=None, *, compute_fallback=False):
+    decoded, limits = decode_mesh(blob, library)
+    return lower(decoded, geometry, limits, vertex_header, compute_fallback=compute_fallback)
 
 
 if __name__ == "__main__":

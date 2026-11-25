@@ -108,7 +108,7 @@ def check_scanner_tracks_pixel_aot():
         "v_cvt_off_f32_i4_e32 v12, v13",
         "v_ldexp_f32_e64 v12, v13, s44",
         "v_cubeid_f32_e64 v12, v13, v14, v15",
-        "v_fma_mix_f32 v12, v13, v14, v15 op_sel:[1,1,0]",
+        "v_fma_mix_f32 v12, v13, v14, v15 op_sel_hi:[1,1,0]",
         "v_dot4_i32_i8 v12, v13, v14, v15 clamp",
         "v_med3_i32_e64 v12, v13, v14, v15",
         "v_cmp_lt_u32_e64 s[4:5], v12, v13",
@@ -143,8 +143,9 @@ def check_mesh():
         (root / "mesh.bin").write_bytes(code)
         for decoded, stage_status, pipeline_status, detail in (
                 (enumerate_pcs(PROGRAM), "mesh_lowering_passed", "needs_pso_validation", None),
+                # An empty allocation (0, 0) is refused by the count check.
                 (enumerate_pcs(invalid_alloc), "mesh_lowering_rejected", "blocked",
-                 "Expected a single three-vertex triangle"),
+                 "Conflicting mesh counts, vertices or primitive indices"),
                 ([(0, "s_mov_b32 m0, s99")], "mesh_lowering_rejected", "blocked", "99"),
                 ([], "disassembly_failed", "blocked", "empty instruction stream"),
                 (ValueError("Unknown instruction at byte 4"), "disassembly_failed", "blocked",
@@ -210,6 +211,56 @@ def check_compute():
         assert untested["shaders"]["compute"]["status"] == "compute_scan_untested", untested
         assert untested["status"] == "needs_evidence", untested
     print("PSO compute probe passed (1 recognized, 1 unsupported opcode, 2 disassembly failures, 1 scan failure)")
+
+
+def check_invalid_input():
+    pixel = {"stage": "pixel", "sha256": "a" * 64}
+    manifest = {"shaders": [pixel]}
+
+    def entry(**changes):
+        return dict({"id": "p", "effective_root_signature": "present", "shaders": [pixel]}, **changes)
+
+    valid = report(manifest, {"pipelines": [entry()]}, Path("."))["pipelines"]
+    assert [row["status"] for row in valid] == ["needs_evidence"], valid
+    bad_inputs = (
+        ("duplicate ID", [entry(), entry()], "empty or duplicate pipeline ID 'p'"),
+        ("empty ID", [entry(id="")], "empty or duplicate pipeline ID ''"),
+        ("non-string ID", [entry(id=1)], "empty or duplicate pipeline ID 1"),
+        ("root status", [entry(effective_root_signature="yes")], "invalid root signature status for p"),
+        ("repeated stage", [entry(shaders=[pixel, pixel])], "pipeline p repeats stage pixel"),
+        ("no shaders", [entry(shaders=[])], "pipeline p has no shader references"),
+        ("short digest", [entry(shaders=[dict(pixel, sha256="ab")])],
+         "shader references require a stage and a full native SHA-256"),
+        ("empty stage", [entry(shaders=[dict(pixel, stage="")])],
+         "shader references require a stage and a full native SHA-256"),
+        ("shaders is a dict", [entry(shaders={"pixel": pixel})], "pipeline p shaders must be a list"),
+        ("shaders is an int", [entry(shaders=5)], "pipeline p shaders must be a list"),
+        ("shaders is a string", [entry(shaders="pixel")], "pipeline p shaders must be a list"),
+        ("shader reference is a string", [entry(shaders=["pixel"])],
+         "shader references require a stage and a full native SHA-256"),
+        ("shader reference is an int", [entry(shaders=[5])],
+         "shader references require a stage and a full native SHA-256"),
+        ("pipeline is a string", ["p"], "pipeline entries must be JSON objects"),
+        ("pipeline is a list", [[entry()]], "pipeline entries must be JSON objects"),
+    )
+    for name, pipelines, message in bad_inputs:
+        try:
+            report(manifest, {"pipelines": pipelines}, Path("."))
+        except ValueError as exc:
+            assert str(exc) == message, (name, str(exc))
+        else:
+            raise AssertionError(f"{name}: accepted invalid pipeline input")
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        tool = str(Path(__file__).resolve().parents[1] / "tools" / "pso_readiness.py")
+        (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        for name, pipelines, message in bad_inputs[:1] + bad_inputs[8:9]:
+            (root / "pipelines.json").write_text(json.dumps({"pipelines": pipelines}), encoding="utf-8")
+            completed = subprocess.run([sys.executable, "-B", tool, "manifest.json", "pipelines.json"],
+                                       cwd=root, capture_output=True, text=True)
+            assert completed.returncode == 1 and completed.stdout == "", (name, completed)
+            assert completed.stderr == f"PSO report: {message}\n", (name, completed.stderr)
+    print(f"PSO input validation passed ({len(bad_inputs)} rejected inputs, 2 CLI exits, 1 valid control)")
 
 
 def check():
@@ -292,4 +343,5 @@ def check():
 if __name__ == "__main__":
     check_mesh()
     check_compute()
+    check_invalid_input()
     check()

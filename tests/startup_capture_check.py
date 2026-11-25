@@ -129,6 +129,29 @@ def check_describe():
     assert 'present frame 4 surface Resource@123456' in text
 
 
+def describe_text(*tables):
+    data = b''.join([CALL, res(), view(0, 18, RES_W), view(1, 17, 0, b'')] + list(tables))
+    out = io.StringIO()
+    C.describe(load(data), out)
+    return out.getvalue()
+
+
+def check_describe_shadow_only():
+    # A table that carries only the shadow ids (no token half) still lists its entries.
+    text = describe_text(table(5, 36, 2, 2, 0x3000, HEAP_W, 1, ids=(1, 2)))
+    assert 'table param 2 heap index 1: 2 of 2 entries known' in text
+    assert 'SRV view 0 res=123456 dim3 64x32x1' in text and 'CBV view 1 res=0' in text
+    assert 'token' not in text and 'shadow' not in text
+
+
+def check_describe_one_sided_ids():
+    # Zero in one half means "not recorded there"; the entry is still listed from the other half.
+    text = describe_text(table(5, 36, 2, 2, 0x3000, HEAP_W, 1, ids=(0, 2, 1, 0)))
+    assert 'table param 2 heap index 1: 2 of 2 entries known' in text
+    assert 'SRV view 0 (shadow -1 token 0) res=123456' in text
+    assert 'CBV view 1 (shadow 1 token -1) res=0' in text
+
+
 def check_damaged_files():
     for cut, words in ((len(FILE) - 3, ('PRES', 'truncated')),            # body or header cut short
                        (len(FILE) - 12, ('PRES', 'truncated'))):
@@ -155,6 +178,6 @@ def check_mutated_record():
 
 
 if __name__ == '__main__':
-    for check in (check_records, check_memory, check_describe, check_damaged_files, check_mutated_record):
+    for check in (check_records, check_memory, check_describe, check_describe_shadow_only, check_describe_one_sided_ids, check_damaged_files, check_mutated_record):
         check()
         print('ok', check.__name__)
