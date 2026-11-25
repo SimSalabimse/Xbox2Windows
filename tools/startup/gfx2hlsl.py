@@ -1376,6 +1376,141 @@ def mesh_run(ins, at, what, patterns, env):
 
 MESH_VCC_BRANCHES = ('s_cbranch_vccz', 's_cbranch_vccnz')
 VCC_KEYS = {'vcc', 'vcc_hi'}
+MESH_LOOP_REFUSAL = 'slot 57 mesh: a loop outside the group-memory exchanges is not covered'
+MESH_TRIP_STEPS = ('s_add_u32', 's_add_i32', 's_sub_u32', 's_sub_i32')
+MESH_TRIP_MAX = 64
+
+
+def mesh_inline_u32(tok):
+    """An inline integer or float-bit SOP operand as a u32, or None."""
+    if tok in FLOATS:
+        return fbits(FLOATS[tok]) & 0xffffffff
+    m = re.fullmatch(r'-?(?:0x[0-9a-f]+|\d+)', tok)
+    if not m:
+        return None
+    value = int(tok, 0)
+    return value & 0xffffffff if value >= 0 else (value + (1 << 32)) & 0xffffffff
+
+
+def mesh_trip_count(init, step_name, step_imm, cmp_name, limit, latch_name, cmp_counter_left):
+    """Finite trip count for a scalar counted loop, or None when unbounded / unsupported."""
+    counter = init & 0xffffffff
+    step = step_imm & 0xffffffff
+    signed = step_name.endswith('_i32') or '_i32' in cmp_name
+    take_when_scc = latch_name == 's_cbranch_scc1'
+
+    def as_signed(word):
+        return word - (1 << 32) if word >= (1 << 31) else word
+
+    for trips in range(1, MESH_TRIP_MAX + 1):
+        if step_name.startswith('s_add'):
+            counter = (counter + step) & 0xffffffff
+        else:
+            counter = (counter - step) & 0xffffffff
+        left, right = (counter, limit) if cmp_counter_left else (limit, counter)
+        if signed:
+            left, right = as_signed(left), as_signed(right)
+        if cmp_name.endswith(('_eq_i32', '_eq_u32')):
+            scc = left == right
+        elif cmp_name.endswith(('_lg_i32', '_lg_u32')):
+            scc = left != right
+        elif cmp_name.endswith(('_gt_i32', '_gt_u32')):
+            scc = left > right
+        elif cmp_name.endswith(('_ge_i32', '_ge_u32')):
+            scc = left >= right
+        elif cmp_name.endswith(('_lt_i32', '_lt_u32')):
+            scc = left < right
+        elif cmp_name.endswith(('_le_i32', '_le_u32')):
+            scc = left <= right
+        else:
+            return None
+        if take_when_scc != scc:
+            return trips
+    return None
+
+
+def mesh_constant_trip(ins, header, latch, offsets):
+    """Prove one constant-trip SCC back-edge: (trips,) or None.
+
+    Shape (census "constant pattern", with an exact trip count): s_mov_b32 sN, C immediately before the
+    header; the body changes sN only by s_add/s_sub of a constant; the last body instruction is s_cmp of sN
+    against a constant; the latch is s_cbranch_scc0/scc1 back to the header. No other branch enters or leaves
+    the body, and the body does not write EXEC, touch a barrier, LDS, sendmsg, or export.
+    """
+    if header <= 0 or latch <= header or latch >= len(ins):
+        return None
+    latch_name = ins[latch][2]
+    if latch_name not in ('s_cbranch_scc0', 's_cbranch_scc1'):
+        return None
+    init_name, init_ops, _ = parse(ins[header - 1][3])
+    if init_name != 's_mov_b32' or len(init_ops) != 2 or not re.fullmatch(r's\d+', init_ops[0]):
+        return None
+    init_imm = mesh_inline_u32(init_ops[1])
+    if init_imm is None:
+        return None
+    counter = init_ops[0]
+    counter_n = int(counter[1:])
+    body = ins[header:latch]
+    if not body or not body[-1][2].startswith('s_cmp_'):
+        return None
+    cmp_name, cmp_ops, _ = parse(body[-1][3])
+    if len(cmp_ops) != 2:
+        return None
+    if cmp_ops[0] == counter:
+        cmp_counter_left, limit_tok = True, cmp_ops[1]
+    elif cmp_ops[1] == counter:
+        cmp_counter_left, limit_tok = False, cmp_ops[0]
+    else:
+        return None
+    limit = mesh_inline_u32(limit_tok)
+    if limit is None:
+        return None
+    step = None
+    for off, size, name, asm in body[:-1]:
+        if name.startswith(('s_branch', 's_cbranch', 's_setpc', 's_call', 's_swappc')):
+            return None
+        if name.startswith(('ds_', 'exp')) or name in ('s_barrier', 's_sendmsg', 's_sendmsghalt'):
+            return None
+        _, ops, _ = parse(asm)
+        if writes_exec(name, ops) or name.startswith('v_cmpx') or name == 's_and_saveexec_b64':
+            return None
+        if name.startswith('s_') and re.search(r'\bvcc(_lo|_hi)?\b', asm):
+            return None
+        writes = set()
+        for tok in destinations(name, ops):
+            r = reg_range(tok)
+            if r and r[0] == 's':
+                writes.update(range(r[1], r[2] + 1))
+        if counter_n in writes:
+            if name not in MESH_TRIP_STEPS or len(ops) != 3 or ops[0] != counter:
+                return None
+            if ops[1] == counter and mesh_inline_u32(ops[2]) is not None:
+                imm = mesh_inline_u32(ops[2])
+            elif ops[2] == counter and mesh_inline_u32(ops[1]) is not None:
+                imm = mesh_inline_u32(ops[1])
+            else:
+                return None
+            if step is not None:
+                return None
+            step = (name, imm)
+    if step is None:
+        return None
+    # No other branch may enter the body past the header or leave it before the latch.
+    for i, (off, _, name, asm) in enumerate(ins):
+        if not name.startswith(('s_cbranch', 's_branch')):
+            continue
+        target = int(parse(asm)[1][0].split('_')[1], 16)
+        dest = offsets.get(target)
+        if dest is None:
+            continue
+        if i == latch:
+            continue
+        if header <= i < latch and not (header <= dest <= latch):
+            return None
+        if header < dest <= latch and not (header <= i <= latch):
+            return None
+    trips = mesh_trip_count(init_imm, step[0], step[1], cmp_name, limit, latch_name, cmp_counter_left)
+    return (trips,) if trips is not None else None
 
 
 def mesh_skeleton(ins, vcc_branches, wave_limits):
@@ -1427,6 +1562,8 @@ def mesh_skeleton(ins, vcc_branches, wave_limits):
 
     offsets = {item[0]: i for i, item in enumerate(ins)}
     edges = {}
+    # header index -> (latch index, trip count). Constant-trip loops are unrolled in the walk below.
+    constant_trips = {}
     for lo, hi in ((0, start), (a_end, count_at), (b_end, len(ins))):
         for i in range(lo, hi):
             off, _, name, asm = ins[i]
@@ -1445,12 +1582,18 @@ def mesh_skeleton(ins, vcc_branches, wave_limits):
             if not lo <= dest < hi:
                 raise Unsupported('slot 57 mesh: a branch enters or crosses a group-memory exchange')
             if target <= off:
-                raise Unsupported('slot 57 mesh: a loop outside the group-memory exchanges is not covered')
+                proven = mesh_constant_trip(ins, dest, i, offsets)
+                if proven is None or dest in constant_trips:
+                    raise Unsupported(MESH_LOOP_REFUSAL)
+                constant_trips[dest] = (i, proven[0])
+                continue
             if name not in ('s_branch', 's_cbranch_scc0', 's_cbranch_scc1', 's_cbranch_execz') + MESH_VCC_BRANCHES:
                 raise Unsupported('slot 57 mesh: %s on a wave-wide condition is not covered' % name)
             edges[i] = dest
 
     targets = set(edges.values())
+    if targets & set(constant_trips):
+        raise Unsupported(MESH_LOOP_REFUSAL)
     no_effect = lambda i: ins[i][2].startswith(('s_nop', 's_waitcnt', 's_clause'))
     first_post_count_branch = next((i for i in edges if i >= b_end), None)
     shift_branch = None
@@ -1494,8 +1637,23 @@ def mesh_skeleton(ins, vcc_branches, wave_limits):
     exports = []
     incoming = {}
     falls = True
-    for index in (list(range(first, start)) + [start] + list(range(a_end, count_at)) + [None]
-                  + list(range(b_end, len(ins)))):
+
+    def region_walk(lo, hi):
+        """Instruction indices in [lo, hi), with each proven constant-trip body repeated and its latch dropped."""
+        order, i = [], lo
+        while i < hi:
+            if i in constant_trips:
+                latch, trips = constant_trips[i]
+                for _ in range(trips):
+                    order.extend(range(i, latch))
+                i = latch + 1
+                continue
+            order.append(i)
+            i += 1
+        return order
+
+    for index in (region_walk(first, start) + [start] + region_walk(a_end, count_at) + [None]
+                  + region_walk(b_end, len(ins))):
         if index in targets:
             paths = incoming[index]
             if falls:
@@ -5288,6 +5446,44 @@ class Stage:
             raise Unsupported('v_cvt_i32_f32 with %d operands, expected 2' % len(ops))
         dst = reg_range(ops[0])[1]
         self.set_v(dst, 'uint(int(F(%s)))' % self.u(ops[1]))
+
+    def op_v_pack_b32_f16(self, ops, mods):
+        """D[15:0] = S0.f16, D[31:16] = S1.f16 (AMD RDNA 2 ISA, VOP3 V_PACK_B32_F16).
+
+        op_sel[i] selects the high half of source i (LLVM 15 VOP3Instructions.td: V_PACK_B32_F16 is VOP3_OPSEL).
+        The neg and abs source modifiers act on the sign bit (bit 15) of the selected half, abs first. The halves
+        are copied as bits, like pixel_aot's lowering of the same instruction: no binary16 denormal flush and no
+        NaN quieting is modelled (an assumption, not measured). Register sources only: an inline float constant
+        on a binary16 operand is a binary16 value, not the binary32 word u() would give. A destination op_sel bit
+        and clamp are refused, and so is any modifier other than the one op_sel:[a,b,c] spelling the decoder
+        prints."""
+        sel = [0, 0, 0]
+        for m in mods:
+            match = re.fullmatch(r'op_sel:\[([01]),([01]),([01])\]', m)
+            if not match:
+                raise Unsupported('v_pack_b32_f16 modifier %s' % m)
+            sel = [int(x) for x in match.groups()]
+        dst = reg_range(ops[0]) if ops else None
+        if sel[2] or len(ops) != 3 or not dst or dst[0] != 'v' or dst[1] != dst[2]:
+            raise Unsupported('v_pack_b32_f16 form %s %s' % (', '.join(ops), ' '.join(mods)))
+        halves = []
+        for i, tok in enumerate(ops[1:3]):
+            neg = tok.startswith('-') and not re.match(r'-[\d.]', tok)
+            tok = tok[1:] if neg else tok
+            absolute = tok.startswith('|') and tok.endswith('|')
+            tok = tok[1:-1] if absolute else tok
+            reg = reg_range(tok)
+            if not reg or reg[1] != reg[2] or reg[0] not in ('v', 's'):
+                raise Unsupported('v_pack_b32_f16 source %s' % ops[1 + i])
+            # The high half needs the whole word; the low half reads only bits 15:0, so a register whose high half
+            # is undefined (after an odd-count d16 load) stays readable here.
+            half = '(%s >> 16)' % self.u(tok) if sel[i] else '(%s & 0xffffu)' % self.u(tok, low16_only=True)
+            if absolute:
+                half = '(%s & 0x7fffu)' % half
+            if neg:
+                half = '(%s ^ 0x8000u)' % half
+            halves.append(half)
+        self.set_v(dst[1], '%s | (%s << 16)' % (halves[0], halves[1]))
 
     def op_v_cvt_pk_u8_f32(self, ops, mods):
         # VOP3A opcode 350 of the RDNA 1.0 and RDNA 2 ISA guides:

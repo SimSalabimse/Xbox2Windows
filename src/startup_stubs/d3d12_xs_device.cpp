@@ -5288,6 +5288,24 @@ extern "C" __declspec(dllexport) std::size_t x2w_d3d12_retire_reasons_line(char*
     return retire_reasons_line(out, capacity);
 }
 
+// The census heartbeat line, or an empty string when X2W_D3D12_VIEW_CENSUS is not set.
+std::size_t view_census_line(char* out, std::size_t capacity)
+{
+    if (!out || !capacity) return 0;
+    out[0] = 0;
+    if (!view_census_enabled()) return 0;
+    AcquireSRWLockShared(&note_lock);
+    const std::size_t used = view_census_format(out, capacity, "distinct by slot");
+    ReleaseSRWLockShared(&note_lock);
+    return used;
+}
+
+// Fixture export (startup_view_census): the line the heartbeat logs, now.
+extern "C" __declspec(dllexport) std::size_t x2w_d3d12_view_census_line(char* out, std::size_t capacity)
+{
+    return view_census_line(out, capacity);
+}
+
 // Fixture probe (startup_resource_retire): what still names a resource of the class by its raw desktop pointer, how many
 // resources the open recording of a list moved out of COMMON, and how many it holds. Counts entries only.
 struct RetireProbe {
@@ -6070,6 +6088,10 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             "(region-information proofs %lld, region queries %lld)", views_noted, views_distinct, descriptors_copied,
             static_cast<u64>(heap_infos().size()), static_cast<long long>(placed_buffer_calls),
             static_cast<long long>(placed_buffer_region_info), static_cast<long long>(placed_buffer_queries));
+        {
+            char line[640];
+            if (view_census_line(line, sizeof(line))) log("%s", line);
+        }
         {
             LARGE_INTEGER frequency;
             QueryPerformanceFrequency(&frequency);
