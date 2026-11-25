@@ -9531,6 +9531,17 @@ VGPR source, a different VCC write, or a narrowed EXEC at the branch
 invalidates the proof. The CPU-reference draws cover both outcomes for each
 branch polarity and a VCC-zero branch after a join.
 
+The `startup_mesh57_lane_spill_{warp,hardware}` tests cover the constant-lane
+`v_writelane_b32` / `v_readlane_b32` spill idiom in `translate_mesh57` (#2413 T7).
+A source-built program parks a scalar (and a saved `exec_hi` word) in fixed lanes
+of a spill-only VGPR, reloads them, and uses the colour reload as vertex red.
+Host checks refuse an unwritten slot, a register-selected lane, lane 64, and
+ordinary vector use of the spill VGPR. The draw compares all 1,024 pixels with a
+CPU rasterizer; zeroing the spilled colour word in HLSL must change the image.
+Run `python -B tests/startup_mesh57_lane_spill_check.py` for host refusals, or
+`ctest --preset release --no-tests=error -R '^startup_mesh57_lane_spill' -V`
+for WARP and hardware.
+
 The `startup_mesh57_skeleton_wave_shift_{warp,hardware}` tests cover a single
 `s_lshl_b32` behind a forward EXEC-zero branch after the count exchange. From
 full EXEC a compare selects the threads with index below an unsigned constant.

@@ -192,6 +192,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_waitcnt_depctr_check.py
 ./out/pe-env/bin/python -B tests/startup_mesh57_skeleton_check.py
 ./out/pe-env/bin/python -B tests/startup_mesh57_loop_refusal_check.py
+./out/pe-env/bin/python -B tests/startup_mesh57_lane_spill_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_readfirstlane_uniform_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_loop_constants_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_join_symbols_check.py
