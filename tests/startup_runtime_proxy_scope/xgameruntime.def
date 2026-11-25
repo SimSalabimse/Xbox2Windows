@@ -2,3 +2,4 @@ LIBRARY xgameruntime
 EXPORTS
     QueryApiImpl
     query_calls
+    query_object
