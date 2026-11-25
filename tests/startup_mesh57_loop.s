@@ -57,16 +57,15 @@ s_waitcnt lgkmcnt(0)
 v_readfirstlane_b32 s14, v3
 s_mov_b64 exec, -1
 // Constant-trip loop (4 iterations). Final s40 == 4 writes vertex red = 1.0 into v7.
+// Numeric SOPP offsets (as in startup_mesh57_skeleton.s): -3 retargets the add; +1 skips the red write.
 v_mov_b32 v7, 0
 s_mov_b32 s40, 0
-loop:
 s_add_u32 s40, s40, 1
 s_cmp_lt_u32 s40, 4
-s_cbranch_scc1 loop
+s_cbranch_scc1 -3
 s_cmp_eq_u32 s40, 4
-s_cbranch_scc0 skip_red
+s_cbranch_scc0 1
 v_mov_b32 v7, 1.0
-skip_red:
 v_cmpx_gt_i32 s14, v0
 v_and_b32 v4, 15, v0
 v_lshlrev_b32 v4, 4, v4

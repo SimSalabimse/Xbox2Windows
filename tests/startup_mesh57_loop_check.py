@@ -153,7 +153,7 @@ def rasterise(points, colours, indices, verts, prims):
 def binary(mc):
     text = (HERE / 'startup_mesh57_loop.s').read_text()
     expect('constant-trip fixture words match llvm-mc', assemble(mc, text), MESH)
-    mutant_text = text.replace('s_cbranch_scc1 loop\n', 's_nop 0\n')
+    mutant_text = text.replace('s_cbranch_scc1 -3\n', 's_nop 0\n')
     expect('once-through mutant words match llvm-mc', assemble(mc, mutant_text), ONCE)
 
 
