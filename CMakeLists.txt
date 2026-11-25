@@ -408,7 +408,7 @@ endforeach()
 # A package may ship an older MSVCP140.dll that the loader picks from the application directory;
 # link the shims statically so they never use its runtime (constexpr std::mutex layout).
 target_link_libraries(startup_stub_xg_xs PRIVATE d3d12 dxguid)
-target_link_libraries(startup_stub_gameinput PRIVATE user32)
+target_link_libraries(startup_stub_gameinput PRIVATE user32 psapi)
 target_link_libraries(startup_stub_xapu PRIVATE winmm)
 # The DirectStorage heartbeat reports this process's peak commit (#1199).
 target_link_libraries(startup_stub_xcrdapi PRIVATE psapi)
@@ -644,7 +644,7 @@ set_tests_properties(startup_storage_worker_start PROPERTIES TIMEOUT 60)
 target_compile_features(startup_stub_consumer PRIVATE cxx_std_17)
 target_include_directories(startup_stub_consumer PRIVATE src)
 target_sources(startup_stub_consumer PRIVATE src/startup_stubs/runtime_proxy.cpp)
-target_link_libraries(startup_stub_consumer PRIVATE startup_stub_chad startup_stub_xg_xs xmem_shim d3d12_xs_shim)
+target_link_libraries(startup_stub_consumer PRIVATE startup_stub_chad startup_stub_xg_xs xmem_shim d3d12_xs_shim psapi)
 # APU heap stand-in: ApuFree reuse, coalescing, refused requests and concurrent callers (docs/startup-runtime.md).
 add_executable(startup_acphal_apu_free tests/startup_acphal_apu_free.cpp)
 target_compile_features(startup_acphal_apu_free PRIVATE cxx_std_17)
@@ -763,10 +763,21 @@ target_compile_features(startup_gamesave_read_async PRIVATE cxx_std_17)
 add_executable(startup_runtime_local tests/startup_runtime_local.cpp)
 target_include_directories(startup_runtime_local PRIVATE src)
 target_compile_features(startup_runtime_local PRIVATE cxx_std_17)
+if (WIN32)
+    target_link_libraries(startup_runtime_local PRIVATE psapi)
+endif()
 add_test(NAME startup_runtime_local COMMAND startup_runtime_local)
 # Control: with the local runtime switch left off, the local answers must be missing.
 add_test(NAME startup_runtime_local_control COMMAND startup_runtime_local --control)
 set_tests_properties(startup_runtime_local_control PROPERTIES PASS_REGULAR_EXPRESSION "FAIL: ")
+# Which PE imports the runtime proxy rewrites (GetProcAddress any module; QueryApiImpl only from
+# xgameruntime.dll). Pure walk of a synthetic PE32+ image; the name-only mutate must FAIL.
+add_executable(startup_runtime_gpa_patch tests/startup_runtime_gpa_patch_check.cpp)
+target_include_directories(startup_runtime_gpa_patch PRIVATE src)
+target_compile_features(startup_runtime_gpa_patch PRIVATE cxx_std_17)
+add_test(NAME startup_runtime_gpa_patch COMMAND startup_runtime_gpa_patch)
+add_test(NAME startup_runtime_gpa_patch_name_only_control COMMAND startup_runtime_gpa_patch --mutate name-only)
+set_tests_properties(startup_runtime_gpa_patch_name_only_control PROPERTIES PASS_REGULAR_EXPRESSION "FAIL: ")
 
 # Input for the launcher containment check (docs/startup-runtime.md): writes known bytes to both
 # streams and the trap log, reports a known exit code, or holds memory, spawns a child or stays

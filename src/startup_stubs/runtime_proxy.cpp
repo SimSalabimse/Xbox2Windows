@@ -2,14 +2,17 @@
 //
 // The title's static runtime library loads the system xgameruntime.dll and asks it for API objects
 // with QueryApiImpl(provider GUID, interface GUID, &object). With X2W_RUNTIME_PROXY=1 this file (built
-// into the GameInput stand-in, which the title imports) patches the title's import of GetProcAddress
-// so that the lookup of "QueryApiImpl" returns a wrapper. The wrapper hands out proxy objects whose
-// methods log their first calls ("x2w-runtime") and forward to the real object.
+// into the GameInput stand-in, which the title imports) patches GetProcAddress imports — and any
+// direct xgameruntime.dll!QueryApiImpl import — in every loaded module (not only the main EXE), so
+// the lookup of "QueryApiImpl" returns a wrapper. Modules that load later are patched through
+// LdrRegisterDllNotification. The wrapper hands out proxy objects whose methods log their first
+// calls ("x2w-runtime") and forward to the real object.
 //
 // X2W_FAKE_USER=1 additionally answers the user API for one local user (see fake_user below)
 // and, while the proxy is on, XStoreCreateContext for that user (see area_call).
 #include "startup_stubs/api_trace.h"
 #include "startup_stubs/local_log.h"
+#include "startup_stubs/runtime_gpa_patch.h"
 #include "startup_stubs/save_blob_pack.h"
 #include "startup_stubs/save_store.h"
 #include "startup_stubs/storage_root.h"
@@ -25,6 +28,8 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#include <psapi.h>
 
 namespace {
 using u64 = std::uint64_t;
@@ -404,32 +409,120 @@ FARPROC WINAPI hooked_get_proc_address(HMODULE module, LPCSTR name)
     return real;
 }
 
-// Replaces the main module's import of GetProcAddress (by name) with the hook.
-void patch_imports()
+HMODULE proxy_module;  // this DLL; its own GetProcAddress IAT must stay real or the hook recurses
+
+// Rewrite one module's GetProcAddress IAT slots and any xgameruntime.dll!QueryApiImpl import.
+int patch_module(HMODULE module)
 {
-    auto* base = reinterpret_cast<unsigned char*>(GetModuleHandleW(nullptr));
+    if (!module) return 0;
+    auto* base = reinterpret_cast<unsigned char*>(module);
     const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
     const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
-    const auto& directory = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-    if (!directory.VirtualAddress) return;
+    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return 0;
+    const auto image_size = static_cast<std::size_t>(nt->OptionalHeader.SizeOfImage);
+    const bool self = module == proxy_module;
     int patched = 0;
-    for (auto* import = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(base + directory.VirtualAddress); import->Name; ++import) {
-        if (!import->OriginalFirstThunk) continue;
-        auto* names = reinterpret_cast<const IMAGE_THUNK_DATA64*>(base + import->OriginalFirstThunk);
-        auto* slots = reinterpret_cast<IMAGE_THUNK_DATA64*>(base + import->FirstThunk);
-        for (; names->u1.AddressOfData; ++names, ++slots) {
-            if (names->u1.Ordinal & IMAGE_ORDINAL_FLAG64) continue;
-            const auto* by_name = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(base + names->u1.AddressOfData);
-            if (std::strcmp(by_name->Name, "GetProcAddress") != 0) continue;
-            DWORD old = 0;
-            if (VirtualProtect(&slots->u1.Function, 8, PAGE_READWRITE, &old)) {
-                slots->u1.Function = reinterpret_cast<ULONGLONG>(&hooked_get_proc_address);
-                VirtualProtect(&slots->u1.Function, 8, old, &old);
+    x2w_runtime_patch::visit_imports(base, image_size, [&](const x2w_runtime_patch::Hit& hit) {
+        // Never rewrite this DLL's GetProcAddress: hooked_get_proc_address calls it for the real lookup.
+        if (self && hit.kind == x2w_runtime_patch::Kind::get_proc_address) return;
+        auto* slot = reinterpret_cast<ULONGLONG*>(base + hit.first_thunk_rva);
+        DWORD old = 0;
+        if (!VirtualProtect(slot, 8, PAGE_READWRITE, &old)) return;
+        if (hit.kind == x2w_runtime_patch::Kind::get_proc_address) {
+            if (*slot != reinterpret_cast<ULONGLONG>(&hooked_get_proc_address)) {
+                *slot = reinterpret_cast<ULONGLONG>(&hooked_get_proc_address);
+                ++patched;
+            }
+        } else if (hit.kind == x2w_runtime_patch::Kind::query_api_impl) {
+            // Direct import of QueryApiImpl: remember the real export once, then point at the proxy.
+            if (*slot && *slot != reinterpret_cast<ULONGLONG>(&proxy_query)) {
+                if (!real_query) real_query = reinterpret_cast<QueryApi>(*slot);
+                *slot = reinterpret_cast<ULONGLONG>(&proxy_query);
                 ++patched;
             }
         }
+        VirtualProtect(slot, 8, old, &old);
+    });
+    return patched;
+}
+
+using LdrDllNotification = void(CALLBACK*)(ULONG reason, const void* data, void* context);
+using LdrRegisterDllNotificationFn = LONG(NTAPI*)(ULONG flags, LdrDllNotification callback, void* context, void** cookie);
+constexpr ULONG ldr_dll_notification_reason_loaded = 1;
+// Layout matches ntdll's LDR_DLL_NOTIFICATION_DATA / UNICODE_STRING without winternl.h.
+struct LdrUnicodeString {
+    USHORT length;
+    USHORT maximum_length;
+    PWSTR buffer;
+};
+struct LdrDllNotificationData {
+    ULONG flags;
+    const LdrUnicodeString* full_dll_name;
+    const LdrUnicodeString* base_dll_name;
+    void* dll_base;
+    ULONG size_of_image;
+};
+
+void CALLBACK dll_loaded(ULONG reason, const void* data, void*)
+{
+    if (reason != ldr_dll_notification_reason_loaded || !data) return;
+    const auto* note = static_cast<const LdrDllNotificationData*>(data);
+    if (!note->dll_base) return;
+    const int n = patch_module(static_cast<HMODULE>(note->dll_base));
+    if (n > 0) {
+        char name[64] = "?";
+        if (note->base_dll_name && note->base_dll_name->buffer && note->base_dll_name->length) {
+            const int chars = note->base_dll_name->length / 2;
+            const int keep = chars < 60 ? chars : 60;
+            for (int i = 0; i < keep; ++i) {
+                const wchar_t c = note->base_dll_name->buffer[i];
+                name[i] = (c > 0 && c < 128) ? static_cast<char>(c) : '?';
+            }
+            name[keep] = 0;
+        }
+        x2w_local::logf("x2w-runtime proxy: %d import(s) patched in loaded module %s", n, name);
     }
-    x2w_local::logf("x2w-runtime proxy: %d GetProcAddress import(s) of the main module patched", patched);
+}
+
+void patch_all_loaded_modules()
+{
+    HMODULE modules[512];
+    DWORD needed = 0;
+    if (!EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &needed) || !needed) return;
+    const unsigned count = needed / sizeof(HMODULE);
+    int modules_patched = 0, slots = 0;
+    for (unsigned i = 0; i < count && i < 512; ++i) {
+        const int n = patch_module(modules[i]);
+        if (n > 0) {
+            ++modules_patched;
+            slots += n;
+        }
+    }
+    x2w_local::logf("x2w-runtime proxy: %d import(s) in %u of %u loaded module(s) patched", slots, modules_patched, count);
+}
+
+// Patch the main module immediately (safe under the loader lock), then every already-loaded module
+// and every later load — so a helper DLL that calls GetProcAddress(QueryApiImpl) is covered.
+void patch_imports()
+{
+    const int main_slots = patch_module(GetModuleHandleW(nullptr));
+    x2w_local::logf("x2w-runtime proxy: %d import(s) of the main module patched", main_slots);
+    static void* dll_cookie = nullptr;
+    static const LdrRegisterDllNotificationFn register_dll = [] {
+        const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        return ntdll ? reinterpret_cast<LdrRegisterDllNotificationFn>(GetProcAddress(ntdll, "LdrRegisterDllNotification"))
+                     : nullptr;
+    }();
+    if (register_dll && !dll_cookie) {
+        const LONG status = register_dll(0, &dll_loaded, nullptr, &dll_cookie);
+        if (status != 0) x2w_local::logf("x2w-runtime proxy: LdrRegisterDllNotification failed 0x%08lx", static_cast<unsigned long>(status));
+    }
+    // EnumProcessModules takes the loader lock; run it once the attach notification has returned.
+    CreateThread(nullptr, 0, [](void*) -> DWORD {
+        patch_all_loaded_modules();
+        return 0;
+    }, nullptr, 0, nullptr);
 }
 
 // ---- the local user -------------------------------------------------------------------------
@@ -1227,9 +1320,10 @@ void* storage_object()
 
 int x2w_store_method3_check() { return store_method3_check(); }
 
-BOOL WINAPI DllMain(HINSTANCE, DWORD reason, void*)
+BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, void*)
 {
     if (reason == DLL_PROCESS_ATTACH && x2w_local::env_on("X2W_RUNTIME_PROXY")) {
+        proxy_module = self;
         fill_slots(std::make_index_sequence<max_slots>{});
         patch_imports();
         // Heartbeat: every 10 s, the runtime methods called since the last report and how often, so
