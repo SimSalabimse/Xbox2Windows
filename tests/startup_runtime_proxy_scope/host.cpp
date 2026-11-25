@@ -82,6 +82,9 @@ int main()
     unsigned char decoy_prologue[16] = {};
     if (decoy_query) std::memcpy(decoy_prologue, reinterpret_cast<const void*>(decoy_query), sizeof(decoy_prologue));
 
+    // Negative precondition: trampoline has nothing to patch until xgameruntime.dll is mapped.
+    check("xgameruntime not loaded before fixture maps it", GetModuleHandleW(L"xgameruntime.dll") == nullptr);
+
     const HMODULE xgr = load_beside(dir, L"xgameruntime.dll");
     check("load fake xgameruntime", xgr != nullptr);
     const FARPROC xgr_query = xgr ? GetProcAddress(xgr, "QueryApiImpl") : nullptr;

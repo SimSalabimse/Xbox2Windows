@@ -11,8 +11,10 @@
 // xgameruntime.dll is loaded, the worker also installs an absolute-JMP trampoline at the
 // QueryApiImpl export so a pointer cached before attach still enters the proxy (IAT/GPA rewrites do
 // not touch already-held function pointers). Unrelated modules that export the same name are not
-// patched. The wrapper hands out proxy objects whose methods log their first calls ("x2w-runtime")
-// and forward to the real object.
+// patched. While the DLL is missing, the worker logs rate-limited "trampoline pending" lines and a
+// one-shot "never loaded after 30s attach window" so silence is not ambiguous; VirtualAlloc /
+// VirtualProtect failures log "aborted". The wrapper hands out proxy objects whose methods log their
+// first calls ("x2w-runtime") and forward to the real object.
 //
 // X2W_FAKE_USER=1 additionally answers the user API for one local user (see fake_user below)
 // and, while the proxy is on, XStoreCreateContext for that user (see area_call).
@@ -65,6 +67,9 @@ std::atomic<QueryApi> real_query{nullptr};
 // Live xgameruntime!QueryApiImpl address (patched in place). Null until the trampoline installs.
 std::atomic<void*> query_export_site{nullptr};
 std::atomic<bool> query_export_trampoline_done{false};
+// Set when GetModuleHandle / Ldr load notice sees xgameruntime.dll (even if trampoline later aborts).
+std::atomic<bool> xgr_module_seen{false};
+volatile LONG trampoline_pending_logs;
 
 bool keep_forward_target(FARPROC target) noexcept
 {
@@ -497,9 +502,27 @@ bool module_is_exe_or_package_helper(HMODULE module) noexcept
     return true;
 }
 
+// Rate-limited so a missing xgameruntime.dll is visible without flooding stderr (first + ~every 5 s
+// when the worker scans every 25 ms).
+void log_trampoline_pending(const char* reason) noexcept
+{
+    const LONG n = InterlockedIncrement(&trampoline_pending_logs);
+    if (n == 1 || n % 200 == 0)
+        x2w_local::logf("x2w-runtime QueryApiImpl export trampoline pending: %s", reason ? reason : "?");
+}
+
+void log_trampoline_abort(const char* reason, DWORD err) noexcept
+{
+    static LONG logged;
+    if (x2w_local::first_calls(logged, 1))
+        x2w_local::logf("x2w-runtime QueryApiImpl export trampoline aborted: %s (err %lu)", reason ? reason : "?",
+                        static_cast<unsigned long>(err));
+}
+
 // Install an absolute-JMP at xgameruntime!QueryApiImpl so pre-attach cached pointers enter the
 // proxy. Builds a stolen-prologue stub for real_query. Idempotent; refuses unknown prologues and
 // never patches a non-xgameruntime module. Runs outside DllMain (worker / GPA path after attach).
+// Silent early returns are avoided: not-loaded stays pending (logged); hard failures abort with a line.
 bool install_query_export_trampoline() noexcept
 {
     static SRWLOCK lock = SRWLOCK_INIT;
@@ -515,10 +538,25 @@ bool install_query_export_trampoline() noexcept
         return query_export_site.load(std::memory_order_relaxed) != nullptr;
     }
     const HMODULE runtime = GetModuleHandleW(L"xgameruntime.dll");
-    if (!runtime || !module_is_xgameruntime(runtime)) return false;
+    if (!runtime) {
+        log_trampoline_pending("xgameruntime.dll not loaded yet");
+        return false;
+    }
+    if (!module_is_xgameruntime(runtime)) {
+        log_trampoline_pending("GetModuleHandle(xgameruntime.dll) was not that basename");
+        return false;
+    }
+    xgr_module_seen.store(true, std::memory_order_release);
     // Unpatched GetProcAddress: this stand-in's own IAT is left alone.
     const FARPROC export_fn = GetProcAddress(runtime, "QueryApiImpl");
-    if (!export_fn || export_fn == reinterpret_cast<FARPROC>(&proxy_query)) return false;
+    if (!export_fn) {
+        static LONG logged;
+        if (x2w_local::first_calls(logged, 1))
+            x2w_local::logf("x2w-runtime QueryApiImpl export trampoline refused: QueryApiImpl export missing");
+        query_export_trampoline_done.store(true, std::memory_order_release);
+        return false;
+    }
+    if (export_fn == reinterpret_cast<FARPROC>(&proxy_query)) return false;
     auto* site = reinterpret_cast<unsigned char*>(export_fn);
     if (x2w_runtime_patch::is_abs_jmp_to(site, reinterpret_cast<const void*>(&proxy_query))) {
         query_export_site.store(site, std::memory_order_release);
@@ -527,8 +565,13 @@ bool install_query_export_trampoline() noexcept
     }
     HMODULE owner = nullptr;
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, reinterpret_cast<LPCWSTR>(site), &owner) ||
-        !module_is_xgameruntime(owner))
+        !module_is_xgameruntime(owner)) {
+        static LONG logged;
+        if (x2w_local::first_calls(logged, 1))
+            x2w_local::logf("x2w-runtime QueryApiImpl export trampoline refused: export site not in xgameruntime.dll");
+        query_export_trampoline_done.store(true, std::memory_order_release);
         return false;
+    }
     const unsigned stolen = x2w_runtime_patch::stolen_bytes_for_abs_jmp(site, 32);
     if (!stolen) {
         static LONG logged;
@@ -541,6 +584,7 @@ bool install_query_export_trampoline() noexcept
     auto* stub = static_cast<unsigned char*>(
         VirtualAlloc(nullptr, stolen + x2w_runtime_patch::abs_jmp_bytes, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
     if (!stub) {
+        log_trampoline_abort("VirtualAlloc for stolen-prologue stub failed", GetLastError());
         query_export_trampoline_done.store(true, std::memory_order_release);
         return false;
     }
@@ -551,8 +595,10 @@ bool install_query_export_trampoline() noexcept
     real_query.store(reinterpret_cast<QueryApi>(stub), std::memory_order_release);
     DWORD old = 0;
     if (!VirtualProtect(site, stolen, PAGE_EXECUTE_READWRITE, &old)) {
+        const DWORD err = GetLastError();
         VirtualFree(stub, 0, MEM_RELEASE);
         real_query.store(reinterpret_cast<QueryApi>(export_fn), std::memory_order_release);
+        log_trampoline_abort("VirtualProtect on QueryApiImpl export failed", err);
         query_export_trampoline_done.store(true, std::memory_order_release);
         return false;
     }
@@ -679,10 +725,56 @@ constexpr ULONG ldr_dll_notification_reason_loaded = 1;
 std::atomic<bool> rescan_package_modules{false};
 static_assert(std::atomic<bool>::is_always_lock_free);
 
-void CALLBACK dll_loaded(ULONG reason, const void*, void*)
+bool wide_basename_is_xgameruntime(const wchar_t* name, USHORT bytes) noexcept
 {
-    if (reason == ldr_dll_notification_reason_loaded)
-        rescan_package_modules.store(true, std::memory_order_release);
+    if (!name || bytes < sizeof(L"xgameruntime.dll") - sizeof(wchar_t)) return false;
+    static constexpr wchar_t expect[] = L"xgameruntime.dll";
+    const USHORT chars = static_cast<USHORT>(bytes / sizeof(wchar_t));
+    // Match the final path component (BaseDllName is usually bare; FullDllName may include dirs).
+    USHORT start = 0;
+    for (USHORT i = 0; i < chars; ++i)
+        if (name[i] == L'\\' || name[i] == L'/') start = static_cast<USHORT>(i + 1);
+    const USHORT len = static_cast<USHORT>(chars - start);
+    constexpr USHORT expect_len = static_cast<USHORT>((sizeof(expect) / sizeof(expect[0])) - 1);
+    if (len != expect_len) return false;
+    for (USHORT i = 0; i < expect_len; ++i) {
+        wchar_t c = name[start + i];
+        if (c >= L'A' && c <= L'Z') c = static_cast<wchar_t>(c - L'A' + L'a');
+        if (c != expect[i]) return false;
+    }
+    return true;
+}
+
+void note_xgr_load_if_named(const void* notification_data) noexcept
+{
+    // LDR_DLL_LOADED_NOTIFICATION_DATA (ntdll): Flags, FullDllName, BaseDllName, DllBase, SizeOfImage.
+    struct UnicodeString {
+        USHORT Length;
+        USHORT MaximumLength;
+        wchar_t* Buffer;
+    };
+    struct Loaded {
+        ULONG Flags;
+        const UnicodeString* FullDllName;
+        const UnicodeString* BaseDllName;
+        void* DllBase;
+        ULONG SizeOfImage;
+    };
+    if (!notification_data) return;
+    const auto* loaded = static_cast<const Loaded*>(notification_data);
+    const UnicodeString* base = loaded->BaseDllName ? loaded->BaseDllName : loaded->FullDllName;
+    if (!base || !base->Buffer || !wide_basename_is_xgameruntime(base->Buffer, base->Length)) return;
+    if (xgr_module_seen.exchange(true, std::memory_order_acq_rel)) return;
+    static LONG logged;
+    if (x2w_local::first_calls(logged, 1))
+        x2w_local::logf("x2w-runtime QueryApiImpl: xgameruntime.dll load noticed (Ldr)");
+}
+
+void CALLBACK dll_loaded(ULONG reason, const void* data, void*)
+{
+    if (reason != ldr_dll_notification_reason_loaded) return;
+    note_xgr_load_if_named(data);
+    rescan_package_modules.store(true, std::memory_order_release);
 }
 
 void patch_package_modules()
@@ -746,11 +838,26 @@ void patch_imports()
     }
     if (HANDLE worker = CreateThread(nullptr, 0, [](void*) -> DWORD {
         // Outside DllMain and the pre-link notification. Clear the request before each scan so
-        // loads that arrive during the scan are picked up on the next pass.
+        // loads that arrive during the scan are picked up on the next pass. After a 30 s attach
+        // window, one line says whether xgameruntime.dll ever appeared (ce75: silence was ambiguous).
         rescan_package_modules.store(true, std::memory_order_release);
+        const DWORD attach_start = GetTickCount();
+        bool logged_attach_window = false;
         for (;;) {
             if (rescan_package_modules.exchange(false, std::memory_order_acq_rel))
                 patch_package_modules();
+            if (!logged_attach_window && !query_export_trampoline_done.load(std::memory_order_acquire) &&
+                GetTickCount() - attach_start >= 30000u) {
+                logged_attach_window = true;
+                if (!xgr_module_seen.load(std::memory_order_acquire) && !GetModuleHandleW(L"xgameruntime.dll"))
+                    x2w_local::logf(
+                        "x2w-runtime QueryApiImpl export trampoline: xgameruntime.dll never loaded after 30s "
+                        "attach window");
+                else if (!query_export_trampoline_done.load(std::memory_order_acquire))
+                    x2w_local::logf(
+                        "x2w-runtime QueryApiImpl export trampoline: still incomplete after 30s attach window "
+                        "(xgameruntime seen)");
+            }
             Sleep(25);
         }
     }, nullptr, 0, nullptr)) {
