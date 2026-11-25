@@ -503,11 +503,12 @@ bool module_is_exe_or_package_helper(HMODULE module) noexcept
 bool install_query_export_trampoline() noexcept
 {
     static SRWLOCK lock = SRWLOCK_INIT;
-    AcquireSRWLockExclusive(&lock);
-    const auto unlock = [](SRWLOCK* l) { ReleaseSRWLockExclusive(l); };
-    struct Guard {
+    struct SrwExclusive {
         SRWLOCK* l;
-        ~Guard() { unlock(l); }
+        explicit SrwExclusive(SRWLOCK* lock) noexcept : l(lock) { AcquireSRWLockExclusive(l); }
+        ~SrwExclusive() { ReleaseSRWLockExclusive(l); }
+        SrwExclusive(const SrwExclusive&) = delete;
+        SrwExclusive& operator=(const SrwExclusive&) = delete;
     } guard{&lock};
 
     if (query_export_trampoline_done.load(std::memory_order_relaxed)) {
