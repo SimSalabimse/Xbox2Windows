@@ -7,8 +7,11 @@
 // (package helpers). Dynamic QueryApiImpl is wrapped only when the provider module's basename is
 // xgameruntime.dll. The pre-link load notification only requests another scan. A worker scans
 // and rewrites linked modules outside the notification, keeping each module live while it is patched.
-// Enabled proxies remain loaded until process exit. Delay-import IAT slots are not
-// rewritten. The wrapper hands out proxy objects whose methods log their first calls ("x2w-runtime")
+// Enabled proxies remain loaded until process exit. Delay-import IAT slots are not rewritten. When
+// xgameruntime.dll is loaded, the worker also installs an absolute-JMP trampoline at the
+// QueryApiImpl export so a pointer cached before attach still enters the proxy (IAT/GPA rewrites do
+// not touch already-held function pointers). Unrelated modules that export the same name are not
+// patched. The wrapper hands out proxy objects whose methods log their first calls ("x2w-runtime")
 // and forward to the real object.
 //
 // X2W_FAKE_USER=1 additionally answers the user API for one local user (see fake_user below)
@@ -56,8 +59,12 @@ SRWLOCK proxy_lock = SRWLOCK_INIT;
 void* slot_table[max_slots];
 
 using QueryApi = HRESULT(__stdcall*)(const GUID*, const GUID*, void**);
-// Written from the GPA hook and the post-link scan; first non-null wins.
+// Written from the GPA hook and the post-link scan; first non-null wins. After the export trampoline
+// installs, this points at the stolen-prologue stub rather than the live export site.
 std::atomic<QueryApi> real_query{nullptr};
+// Live xgameruntime!QueryApiImpl address (patched in place). Null until the trampoline installs.
+std::atomic<void*> query_export_site{nullptr};
+std::atomic<bool> query_export_trampoline_done{false};
 
 bool keep_forward_target(FARPROC target) noexcept
 {
@@ -73,7 +80,13 @@ bool keep_forward_target(FARPROC target) noexcept
 bool remember_real_query(QueryApi query) noexcept
 {
     QueryApi expected = real_query.load(std::memory_order_acquire);
-    if (expected) return expected == query;
+    if (expected) {
+        if (expected == query) return true;
+        // After the export trampoline, callers may still pass the live export site; accept it so
+        // GPA/IAT paths keep returning the proxy wrapper.
+        const void* site = query_export_site.load(std::memory_order_acquire);
+        return site && reinterpret_cast<void*>(query) == site;
+    }
     if (!keep_forward_target(reinterpret_cast<FARPROC>(query))) return false;
     return real_query.compare_exchange_strong(expected, query, std::memory_order_acq_rel) || expected == query;
 }
@@ -484,6 +497,75 @@ bool module_is_exe_or_package_helper(HMODULE module) noexcept
     return true;
 }
 
+// Install an absolute-JMP at xgameruntime!QueryApiImpl so pre-attach cached pointers enter the
+// proxy. Builds a stolen-prologue stub for real_query. Idempotent; refuses unknown prologues and
+// never patches a non-xgameruntime module. Runs outside DllMain (worker / GPA path after attach).
+bool install_query_export_trampoline() noexcept
+{
+    static SRWLOCK lock = SRWLOCK_INIT;
+    AcquireSRWLockExclusive(&lock);
+    const auto unlock = [](SRWLOCK* l) { ReleaseSRWLockExclusive(l); };
+    struct Guard {
+        SRWLOCK* l;
+        ~Guard() { unlock(l); }
+    } guard{&lock};
+
+    if (query_export_trampoline_done.load(std::memory_order_relaxed)) {
+        return query_export_site.load(std::memory_order_relaxed) != nullptr;
+    }
+    const HMODULE runtime = GetModuleHandleW(L"xgameruntime.dll");
+    if (!runtime || !module_is_xgameruntime(runtime)) return false;
+    // Unpatched GetProcAddress: this stand-in's own IAT is left alone.
+    const FARPROC export_fn = GetProcAddress(runtime, "QueryApiImpl");
+    if (!export_fn || export_fn == reinterpret_cast<FARPROC>(&proxy_query)) return false;
+    auto* site = reinterpret_cast<unsigned char*>(export_fn);
+    if (x2w_runtime_patch::is_abs_jmp_to(site, reinterpret_cast<const void*>(&proxy_query))) {
+        query_export_site.store(site, std::memory_order_release);
+        query_export_trampoline_done.store(true, std::memory_order_release);
+        return true;
+    }
+    HMODULE owner = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, reinterpret_cast<LPCWSTR>(site), &owner) ||
+        !module_is_xgameruntime(owner))
+        return false;
+    const unsigned stolen = x2w_runtime_patch::stolen_bytes_for_abs_jmp(site, 32);
+    if (!stolen) {
+        static LONG logged;
+        if (x2w_local::first_calls(logged, 1))
+            x2w_local::logf("x2w-runtime QueryApiImpl export trampoline refused: cannot size prologue at %p",
+                            static_cast<void*>(site));
+        query_export_trampoline_done.store(true, std::memory_order_release);
+        return false;
+    }
+    auto* stub = static_cast<unsigned char*>(
+        VirtualAlloc(nullptr, stolen + x2w_runtime_patch::abs_jmp_bytes, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (!stub) {
+        query_export_trampoline_done.store(true, std::memory_order_release);
+        return false;
+    }
+    std::memcpy(stub, site, stolen);
+    x2w_runtime_patch::write_abs_jmp(stub + stolen, site + stolen);
+    // Prefer the stub as real_query before patching live bytes so proxy_query never re-enters the site.
+    remember_real_query(reinterpret_cast<QueryApi>(export_fn));
+    real_query.store(reinterpret_cast<QueryApi>(stub), std::memory_order_release);
+    DWORD old = 0;
+    if (!VirtualProtect(site, stolen, PAGE_EXECUTE_READWRITE, &old)) {
+        VirtualFree(stub, 0, MEM_RELEASE);
+        real_query.store(reinterpret_cast<QueryApi>(export_fn), std::memory_order_release);
+        query_export_trampoline_done.store(true, std::memory_order_release);
+        return false;
+    }
+    x2w_runtime_patch::write_abs_jmp(site, reinterpret_cast<const void*>(&proxy_query));
+    for (unsigned i = x2w_runtime_patch::abs_jmp_bytes; i < stolen; ++i) site[i] = 0x90;
+    VirtualProtect(site, stolen, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), site, stolen);
+    query_export_site.store(site, std::memory_order_release);
+    query_export_trampoline_done.store(true, std::memory_order_release);
+    x2w_local::logf("x2w-runtime QueryApiImpl export trampoline installed at %p -> proxy (stub %p, stolen %u)",
+                    static_cast<void*>(site), static_cast<void*>(stub), stolen);
+    return true;
+}
+
 FARPROC WINAPI hooked_get_proc_address(HMODULE module, LPCSTR name)
 {
     const FARPROC real = GetProcAddress(module, name);
@@ -491,9 +573,11 @@ FARPROC WINAPI hooked_get_proc_address(HMODULE module, LPCSTR name)
         static LONG logged;
         if (x2w_local::first_calls(logged, 40)) x2w_local::logf("x2w-runtime GetProcAddress(%p, \"%s\") -> %p", static_cast<void*>(module), name, static_cast<void*>(real));
         // Wrap gaming-runtime exports only when the provider module is xgameruntime.dll.
-        if (module_is_xgameruntime(module) && std::strcmp(name, "QueryApiImpl") == 0 &&
-            remember_real_query(reinterpret_cast<QueryApi>(real)))
-            return reinterpret_cast<FARPROC>(&proxy_query);
+        if (module_is_xgameruntime(module) && std::strcmp(name, "QueryApiImpl") == 0) {
+            remember_real_query(reinterpret_cast<QueryApi>(real));
+            install_query_export_trampoline();
+            if (load_real_query()) return reinterpret_cast<FARPROC>(&proxy_query);
+        }
         if (runtime_local() && fake_user() && module_is_xgameruntime(module)) {
             static constexpr InitApi wrappers[3] = {&proxy_init<0>, &proxy_init<1>, &proxy_init<2>};
             for (int k = 0; k < 3; ++k) {
@@ -602,6 +686,8 @@ void CALLBACK dll_loaded(ULONG reason, const void*, void*)
 
 void patch_package_modules()
 {
+    // Pre-attach GPA caches: trampoline the export once xgameruntime.dll is loaded (IAT alone cannot).
+    install_query_export_trampoline();
     std::vector<HMODULE> modules(512);
     DWORD needed = 0;
     if (!EnumProcessModules(GetCurrentProcess(), modules.data(), static_cast<DWORD>(modules.size() * sizeof(HMODULE)), &needed) || !needed)

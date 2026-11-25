@@ -3,8 +3,9 @@
 // Which PE imports the stand-in notices on the EXE / package-helper import tables: GetProcAddress and
 // a direct xgameruntime.dll!QueryApiImpl on the regular import table, delay-import hits with
 // delay_import set (without treating the delay IAT as a real export), and ordinal thunks ignored.
-// A synthetic PE32+ image is walked; the mutated control classifies by import name alone (accepting
-// QueryApiImpl from other.dll) and must fail. No Windows loader and no game files.
+// Also checks absolute-JMP export trampoline helpers (prologue sizing). A synthetic PE32+ image is
+// walked; the mutated control classifies by import name alone (accepting QueryApiImpl from other.dll)
+// and must fail. No Windows loader and no game files.
 #include "startup_stubs/runtime_gpa_patch.h"
 
 #include <cstdint>
@@ -123,6 +124,25 @@ int main(int argc, char** argv)
     check("QueryApiImpl case dll", patch::classify("XGameRuntime.DLL", "QueryApiImpl", &kind) && kind == patch::Kind::query_api_impl);
     check("QueryApiImpl other dll refused", !patch::classify("other.dll", "QueryApiImpl", &kind));
     check("unrelated refused", !patch::classify("xgameruntime.dll", "SomethingElse", &kind));
+
+    // Export trampoline helpers: absolute JMP bytes and prologue sizing (no Windows loader).
+    unsigned char patch_buf[16] = {};
+    void* const proxy_addr = reinterpret_cast<void*>(static_cast<std::uintptr_t>(0x7FF0ABCD0000ull));
+    patch::write_abs_jmp(patch_buf, proxy_addr);
+    check("abs jmp encodes target", patch::is_abs_jmp_to(patch_buf, proxy_addr));
+    check("abs jmp rejects other target",
+          !patch::is_abs_jmp_to(patch_buf, reinterpret_cast<void*>(static_cast<std::uintptr_t>(0x1))));
+    // mov [rsp+8], rbx; mov [rsp+10h], rsi; push rdi; sub rsp, 20h  — 15 whole bytes (>= 14).
+    const unsigned char msvc_prologue[] = {
+        0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x90};
+    check("MSVC-like prologue steals 15", patch::stolen_bytes_for_abs_jmp(msvc_prologue, sizeof(msvc_prologue)) == 15);
+    const unsigned char relative_call[] = {0xE8, 0x00, 0x00, 0x00, 0x00, 0x90, 0x90, 0x90,
+                                           0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
+    check("relative call prologue refused", patch::stolen_bytes_for_abs_jmp(relative_call, sizeof(relative_call)) == 0);
+    // Negative: a rip-relative mov must not be stolen into a relocated stub.
+    const unsigned char rip_relative[] = {0x48, 0x8B, 0x05, 0x00, 0x00, 0x00, 0x00, 0x90,
+                                          0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
+    check("rip-relative prologue refused", patch::stolen_bytes_for_abs_jmp(rip_relative, sizeof(rip_relative)) == 0);
 
     auto image = build_image();
     int gpa = 0, query = 0, delay_hits = 0, regular_hits = 0;

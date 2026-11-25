@@ -8,6 +8,10 @@
 // delay-load thunk until first use, so treating it as GetProcAddress or QueryApiImpl is wrong.
 // Ordinal imports are ignored. Pure walk helpers — no Windows calls — so a source-built control can
 // check them.
+//
+// Also: absolute-JMP export trampoline helpers for a QueryApiImpl pointer resolved before the proxy
+// attaches. IAT/GPA rewrites do not touch already-held function pointers; patching the export body
+// so those calls enter the proxy does. Only xgameruntime.dll is in scope (see the stand-in).
 #pragma once
 
 #include <cstddef>
@@ -47,6 +51,148 @@ inline bool import_is_get_proc_address(const char* name) noexcept
 inline bool import_is_query_api_impl(const char* name) noexcept
 {
     return name && std::strcmp(name, "QueryApiImpl") == 0;
+}
+
+// x64 absolute indirect jump: FF 25 00 00 00 00 + 8-byte absolute address (14 bytes).
+constexpr unsigned abs_jmp_bytes = 14;
+
+inline void write_abs_jmp(unsigned char* at, const void* target) noexcept
+{
+    at[0] = 0xFF;
+    at[1] = 0x25;
+    at[2] = at[3] = at[4] = at[5] = 0;
+    const auto addr = reinterpret_cast<std::uint64_t>(target);
+    for (int i = 0; i < 8; ++i) at[6 + i] = static_cast<unsigned char>((addr >> (8 * i)) & 0xff);
+}
+
+inline const void* abs_jmp_target(const unsigned char* at) noexcept
+{
+    if (!at || at[0] != 0xFF || at[1] != 0x25 || at[2] || at[3] || at[4] || at[5]) return nullptr;
+    std::uint64_t addr = 0;
+    for (int i = 0; i < 8; ++i) addr |= static_cast<std::uint64_t>(at[6 + i]) << (8 * i);
+    return reinterpret_cast<const void*>(addr);
+}
+
+inline bool is_abs_jmp_to(const unsigned char* at, const void* target) noexcept
+{
+    return abs_jmp_target(at) == target;
+}
+
+// Length of one x64 instruction starting at `p`, or 0 when unknown / unsafe to relocate into a
+// trampoline stub (relative call/jmp, rip-relative that would break, or incomplete buffer).
+// Covers the MSVC x64 prologues seen on QueryApiImpl fixtures and typical gaming-runtime exports.
+inline unsigned x64_insn_len(const unsigned char* p, unsigned max_bytes) noexcept
+{
+    if (!p || max_bytes == 0) return 0;
+    unsigned i = 0;
+    bool operand66 = false;
+    // Legacy prefixes + REX.
+    while (i < max_bytes) {
+        const unsigned char b = p[i];
+        if (b == 0x66) {
+            operand66 = true;
+            ++i;
+            continue;
+        }
+        if (b == 0xF2 || b == 0xF3 || b == 0x64 || b == 0x65 || b == 0x67 || b == 0x2E || b == 0x3E) {
+            ++i;
+            continue;
+        }
+        break;
+    }
+    bool rex_w = false;
+    if (i < max_bytes && (p[i] & 0xF0) == 0x40) {
+        rex_w = (p[i] & 0x08) != 0;
+        ++i;
+    }
+    if (i >= max_bytes) return 0;
+    const unsigned char op = p[i++];
+    auto modrm_len = [&](unsigned at) -> unsigned {
+        if (at >= max_bytes) return 0;
+        const unsigned char modrm = p[at];
+        const unsigned mod = modrm >> 6;
+        const unsigned rm = modrm & 7;
+        unsigned n = 1;
+        if (mod != 3 && rm == 4) {  // SIB
+            if (at + n >= max_bytes) return 0;
+            ++n;
+        }
+        if (mod == 1) {
+            if (at + n >= max_bytes) return 0;
+            ++n;
+        } else if (mod == 2 || (mod == 0 && rm == 5) || (mod == 0 && rm == 4 && at + 1 < max_bytes && (p[at + 1] & 7) == 5)) {
+            // disp32, or [rip+disp32], or [sib with base=5]
+            if (at + n + 3 >= max_bytes) return 0;
+            n += 4;
+        }
+        return n;
+    };
+    // push/pop r64
+    if (op >= 0x50 && op <= 0x5F) return i;
+    // nop / int3 / ret — single byte; ret is fine as a whole instruction but useless for a hook site.
+    if (op == 0x90 || op == 0xCC || op == 0xC3) return i;
+    // imm pushes
+    if (op == 0x6A) return (i < max_bytes) ? i + 1 : 0;
+    if (op == 0x68) return (i + 3 < max_bytes) ? i + 4 : 0;
+    // mov r64, imm64 / mov r32, imm32
+    if (op >= 0xB8 && op <= 0xBF) {
+        const unsigned imm = rex_w ? 8u : (operand66 ? 2u : 4u);
+        return (i + imm - 1 < max_bytes) ? i + imm : 0;
+    }
+    if (op >= 0xB0 && op <= 0xB7) return (i < max_bytes) ? i + 1 : 0;
+    // Relative call/jmp: refuse (would need relocation in the stub).
+    if (op == 0xE8 || op == 0xE9 || op == 0xEB) return 0;
+    // ALU / mov / lea / test with ModRM
+    if (op == 0x01 || op == 0x03 || op == 0x09 || op == 0x0B || op == 0x11 || op == 0x13 || op == 0x19 || op == 0x1B ||
+        op == 0x21 || op == 0x23 || op == 0x29 || op == 0x2B || op == 0x31 || op == 0x33 || op == 0x39 || op == 0x3B ||
+        op == 0x85 || op == 0x87 || op == 0x88 || op == 0x89 || op == 0x8A || op == 0x8B || op == 0x8D) {
+        // rip-relative (mod=0, rm=5) breaks when relocated into the stub.
+        if (i < max_bytes && (p[i] & 0xC7) == 0x05) return 0;
+        const unsigned m = modrm_len(i);
+        return m ? i + m : 0;
+    }
+    // imm8 / imm32 groups: 80-83 / C6 / C7
+    if (op == 0x80 || op == 0x82 || op == 0x83 || op == 0xC6) {
+        if (i < max_bytes && (p[i] & 0xC7) == 0x05) return 0;
+        const unsigned m = modrm_len(i);
+        if (!m || i + m >= max_bytes) return 0;
+        return i + m + 1;
+    }
+    if (op == 0x81 || op == 0xC7) {
+        if (i < max_bytes && (p[i] & 0xC7) == 0x05) return 0;
+        const unsigned m = modrm_len(i);
+        const unsigned imm = operand66 ? 2u : 4u;
+        if (!m || i + m + imm - 1 >= max_bytes) return 0;
+        return i + m + imm;
+    }
+    // sub/add/xor/cmp r/m, imm already covered. 0F multi-byte: only short nops.
+    if (op == 0x0F) {
+        if (i >= max_bytes) return 0;
+        const unsigned char op2 = p[i++];
+        if (op2 == 0x1F) {  // nop r/m
+            const unsigned m = modrm_len(i);
+            return m ? i + m : 0;
+        }
+        return 0;
+    }
+    // FF /0-/6: refuse call/jmp forms; allow /0-/6 only for inc/dec that are rare in prologues.
+    if (op == 0xFF) return 0;
+    return 0;
+}
+
+// How many whole prologue bytes to steal so an abs_jmp_bytes patch fits, or 0 if the prologue cannot
+// be sized safely. Fills any leftover bytes in the live patch with NOPs at the call site.
+inline unsigned stolen_bytes_for_abs_jmp(const unsigned char* code, unsigned max_scan) noexcept
+{
+    if (!code || max_scan < abs_jmp_bytes) return 0;
+    unsigned total = 0;
+    while (total < abs_jmp_bytes) {
+        const unsigned n = x64_insn_len(code + total, max_scan - total);
+        if (!n) return 0;
+        total += n;
+        if (total > max_scan) return 0;
+    }
+    return total;
 }
 
 // Decide whether one named import of `dll_name` should be noticed. Ordinal imports are ignored.
