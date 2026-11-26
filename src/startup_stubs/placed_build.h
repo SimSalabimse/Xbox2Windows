@@ -3,7 +3,8 @@
 #include <d3d12.h>
 
 namespace x2w_startup {
-// Takes ownership of one reference to the desktop device chosen by the caller.
+// Takes ownership of one reference to the desktop device chosen by the caller. *wrapped is null
+// when the wrapper cannot be allocated; the reference is released then.
 void attach_device(ID3D12Device* device, void** wrapped);
 
 // Internal desktop build preparation. The caller retains the registered resources

@@ -175,8 +175,16 @@ check('chain in the entry block accepted', got[:3] == ['v7 = U(float(s3));', 'v7
 # (tests/startup_gfx2hlsl_readfirstlane_recompute_check.py covers that rule).
 got = run(MOVE, 's_cbranch_scc0 label_0010', READ, 's_endpgm', 's_endpgm')
 check('read after the first terminator recomputed', got[:2] == ['v7 = s2;', 's9 = s2;'], repr(got))
-# Since #1755 the float lowering itself refuses an op_sel it does not model, before the read.
-EARLIER = {'op_sel overwrite': 'modifier op_sel:[0,0]'}
+# These instructions refuse before v_readfirstlane_b32 is reached.
+EARLIER = {
+    'op_sel overwrite': 'modifier op_sel:[0,0]',
+    'mask from uniform compare': 'v_mov_b32 data operand s2 is a lane mask',
+    'vcc': 'v_mov_b32 data operand vcc_lo is a lane mask',
+    'exec': 'v_mov_b32 data operand exec_lo is a lane mask',
+    'compare into SGPR': 'v_mov_b32 data operand s2 is a lane mask',
+    'saved exec': 'v_mov_b32 data operand s2 is a lane mask',
+    'mask in the entry block': 'v_mov_b32 data operand s2 is a lane mask',
+}
 for label, instructions in REFUSED:
     got = run(*instructions)
     check(f'{label} refused', got == EARLIER.get(label, REFUSAL), repr(got))

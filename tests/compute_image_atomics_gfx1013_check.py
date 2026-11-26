@@ -1,10 +1,11 @@
-"""Check gfx1013 image_atomic_add, umax and cmpswap on a 2D R32_UINT UAV.
+"""Check gfx1013 image_atomic_add, umin, umax and cmpswap on a 2D R32_UINT UAV (M200-01 A).
 
-gfx1013 takes the gfx1030 image atomic lowering for these three operations. The cases are the
+gfx1013 takes the gfx1030 image atomic lowering for these four operations. The cases are the
 gfx1030 ones (tests/compute_store_check.py, mimg_atomic_cases) with the gfx1013 profile: the
 controls pin identical HLSL, the gfx1013 refusals and, with --binary, the gfx1013 machine words;
 --draw dispatches them on an adapter and compares every texel of a three-level texture with an
-independent reference, including mutants that must mismatch.
+independent reference, including mutants that must mismatch. The minmax operand is 0x80000011 so
+unsigned umin/umax ordering differs from signed smin/smax on several texels.
 """
 import argparse
 import os
@@ -20,11 +21,12 @@ from compute_store_check import (MIMG_ATOMIC_COMPARE, MIMG_ATOMIC_EXCHANGE_FLAG,
                                  mimg_atomic_cases, mimg_atomic_reference, rejects, store_container, variant)
 
 HERE = Path(__file__).resolve().parent
-ACCEPTED = ("add", "umax", "cmpswap")
-SUITES = {"add": "integer", "umax": "minmax", "cmpswap": "exchange"}
-FLAGS = {"add": MIMG_ATOMIC_UINT_FLAG, "umax": MIMG_ATOMIC_MINMAX_FLAGS["u"], "cmpswap": MIMG_ATOMIC_EXCHANGE_FLAG}
+ACCEPTED = ("add", "umin", "umax", "cmpswap")
+SUITES = {"add": "integer", "umin": "minmax", "umax": "minmax", "cmpswap": "exchange"}
+FLAGS = {"add": MIMG_ATOMIC_UINT_FLAG, "umin": MIMG_ATOMIC_MINMAX_FLAGS["u"],
+         "umax": MIMG_ATOMIC_MINMAX_FLAGS["u"], "cmpswap": MIMG_ATOMIC_EXCHANGE_FLAG}
 # Every other integer image atomic the shared lowering knows, refused on gfx1013.
-REFUSED_UINT = ("sub", "and", "or", "xor", "umin", "swap", "inc", "dec")
+REFUSED_UINT = ("sub", "and", "or", "xor", "swap", "inc", "dec")
 
 
 def cases():
@@ -34,7 +36,7 @@ def cases():
         for name, contended, lines, binding in mimg_atomic_cases(suite=SUITES[op]):
             if name.removesuffix("_contended") == op:
                 found.append((name, op, contended, lines, binding | {"cpu": "gfx1013"}))
-    assert [name for name, *_ in found] == ["add", "add_contended", "umax", "cmpswap"], found
+    assert [name for name, *_ in found] == ["add", "add_contended", "umin", "umax", "cmpswap"], found
     return found
 
 
@@ -52,23 +54,31 @@ def controls():
         sources[name] = source
     value = f"{MIMG_ATOMIC_VALUE:#010x}u"
     assert f"InterlockedAdd(outputData[uint2(" in sources["add"] and f", {value});" in sources["add"]
+    assert "InterlockedMin(outputData[uint2(" in sources["umin"] and f", {value});" in sources["umin"]
+    assert "asint(" not in sources["umin"], "umin must stay unsigned"
     assert "InterlockedMax(outputData[uint2(" in sources["umax"] and f", {value});" in sources["umax"]
     assert "asint(" not in sources["umax"], "umax must stay unsigned"
     assert (f", {MIMG_ATOMIC_COMPARE:#010x}u, {MIMG_ATOMIC_REPLACEMENT:#010x}u);" in sources["cmpswap"]
             and sources["cmpswap"].count("InterlockedCompareStore(") == 1), sources["cmpswap"]
+    # High-bit unsigned ordering: the minmax operand has bit 31 set, so umin and smin differ.
+    assert MIMG_ATOMIC_VALUE >= 0x80000000
+    _, umin_exp = mimg_atomic_reference("umin", False, 1)
+    _, smin_exp = mimg_atomic_reference("smin", False, 1)
+    assert umin_exp != smin_exp and sum(a != b for a, b in zip(umin_exp, smin_exp)) >= 1
+    print("umin high-bit ordering differs from smin on the reference texture", flush=True)
 
     name, op, _, lines, binding = cases()[0]
     instruction = next(line for line in lines if line.startswith("image_atomic_"))
     for other in REFUSED_UINT:
-        rejects("gfx1013 image atomics require add, umax or cmpswap", lowered,
+        rejects("gfx1013 image atomics require add, umin, umax or cmpswap", lowered,
                 variant(lines, ("image_atomic_add", f"image_atomic_{other}")), binding)
     # Signed and float formats are refused on gfx1013 before any instruction is read.
-    umax_lines, umax_binding = cases()[2][3], cases()[2][4]
+    umin_lines, umin_binding = next((lines, binding) for name, op, _, lines, binding in cases() if op == "umin")
     for change in ({"image_format": "R32_SINT"}, {"image_format": "R32_FLOAT", "image_float_domain": "finite-normal"},
                    {"image_uav_mip": 1}):
-        rejects("Invalid image UAV binding", lowered, umax_lines, umax_binding | change)
-    smin = variant(umax_lines, ("image_atomic_umax", "image_atomic_smin"))
-    rejects("Invalid image UAV binding", lowered, smin, umax_binding | {"image_format": "R32_SINT"})
+        rejects("Invalid image UAV binding", lowered, umin_lines, umin_binding | change)
+    smin = variant(umin_lines, ("image_atomic_umin", "image_atomic_smin"))
+    rejects("Invalid image UAV binding", lowered, smin, umin_binding | {"image_format": "R32_SINT"})
     for changed, diagnostic in (
         (instruction + "\n" + instruction, "Unsupported image atomic target or binding"),
         (instruction.replace("IMG_2D", "IMG_2D_ARRAY"), "Unsupported compute instruction"),
@@ -87,10 +97,10 @@ def controls():
     return sources
 
 
-# The two MIMG dwords of each atomic as LLVM 15 encodes them for gfx1013: opcode 17 (add), 23 (umax)
-# or 16 (cmpswap) in bits 24:18, dmask in 11:8, unorm in bit 12, dim 1 (2D) in bits 5:3.
+# The two MIMG dwords of each atomic as LLVM 15 encodes them for gfx1013: opcode 17 (add), 21 (umin),
+# 23 (umax) or 16 (cmpswap) in bits 24:18, dmask in 11:8, unorm in bit 12, dim 1 (2D) in bits 5:3.
 ATOMIC_WORDS = {"add": "080144f0080e0600", "add_contended": "081144f0080e0600",
-                "umax": "08015cf0080e0600", "cmpswap": "081340f0080e0600"}
+                "umin": "080154f0080e0600", "umax": "08015cf0080e0600", "cmpswap": "081340f0080e0600"}
 
 
 def binary(directory, assembler, objcopy, library, sources):
@@ -120,6 +130,9 @@ def mutants(op, source):
     if op == "add":
         assert source.count(f", {value});") == 1
         return "subtracts instead of adds", source.replace(f", {value});", f", (0u - {value}));"), ("sub", None)
+    if op == "umin":
+        assert source.count("InterlockedMin(") == 1
+        return "maximum instead of minimum", source.replace("InterlockedMin(", "InterlockedMax("), ("umax", None)
     if op == "umax":
         assert source.count("InterlockedMax(") == 1
         return "minimum instead of maximum", source.replace("InterlockedMax(", "InterlockedMin("), ("umin", None)

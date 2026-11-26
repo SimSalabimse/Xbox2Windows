@@ -21,12 +21,12 @@ struct ViewAt {
 };
 static_assert(offsetof(ViewAt, address) == 0x28 && sizeof(ViewAt) == 0x40);
 
-bool bind_view_table(void* guest, void* list, Word& cpu)
+bool bind_view_table(void* guest, void* list, Word& cpu, UINT count = 1, Word address = 0, Word bytes = 0)
 {
     struct Extended {
         D3D12_DESCRIPTOR_HEAP_DESC desc;
         Word address, bytes;
-    } heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE}, 0, 0};
+    } heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, count, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE}, address, bytes};
     void* heap = nullptr;
     if (FAILED(static_cast<HRESULT>(invoke(guest, 14, ptr(&heap_desc), ptr(&__uuidof(ID3D12DescriptorHeap)), ptr(&heap))))) return false;
     cpu = invoke(heap, 9);
@@ -58,7 +58,16 @@ int draw_address_srvs(ID3D12Device* desktop, void* guest, void* list)
                                                0, ptr(&__uuidof(ID3D12Resource)), ptr(&placed[i]))))) return 41;
     }
     Word cpu = 0;
-    if (!bind_view_table(guest, list, cpu)) return 42;
+    const bool joined_table = GetEnvironmentVariableW(L"X2W_TEST_JOINED_TABLE", nullptr, 0) != 0;
+    const Word stride = joined_table ? invoke(guest, 15, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) : 0;
+    static std::vector<unsigned char> title_table;  // The bound heap retains this backing memory.
+    if (joined_table) {
+        if (stride < 32) return 42;
+        title_table.resize(2 * stride);
+    }
+    if (!bind_view_table(guest, list, cpu, joined_table ? 2 : 1, joined_table ? ptr(title_table.data()) : 0,
+                         joined_table ? title_table.size() : 0)) return 42;
+    if (joined_table && cpu != ptr(title_table.data())) return 42;
     ViewAt v{};
     v.view.Format = DXGI_FORMAT_R8_UNORM;
     v.view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -69,6 +78,20 @@ int draw_address_srvs(ID3D12Device* desktop, void* guest, void* list)
         invoke(list, 22, 1, ptr(&strip));
         invoke(list, 12, 3, 1);
     };
+    if (joined_table) {
+        for (UINT swap = 0; swap < 2; ++swap) {
+            for (UINT i = 0; i < 2; ++i)
+                invoke(guest, 18, ptr(placed[i ^ swap]), ptr(&v.view), cpu + i * stride);
+            // The shader uses packed 32-byte records. Publish both views at native
+            // slot boundaries, then pack the second token in the guest-owned table.
+            std::memmove(title_table.data() + 32, title_table.data() + stride, 32);
+            for (UINT key = 0; key < 4; ++key) {
+                invoke(list, 40, 1, 1, ptr(&key), 0);
+                draw(static_cast<LONG>(swap * 4 + key));
+            }
+        }
+        return 0;
+    }
     const auto publish = [&](const D3D12_RESOURCE_DESC& resource_desc, Word address) {
         v.address = address;
         invoke(guest, 70, ptr(&resource_desc), ptr(&v), cpu);
@@ -533,6 +556,16 @@ int draw_address_buffer_srvs(ID3D12Device* desktop, void* guest, void* list)
     invoke(guest, 70, ptr(&desc), ptr(&raw), cpu);
     draw(5);
     draw(6);
+
+    // An unplaced buffer in an allocation above the 256 MiB limit is not wrapped as an existing heap; its
+    // upload copy must still publish the bytes at the address.
+    static auto* const large = static_cast<std::uint32_t*>(
+        VirtualAlloc(nullptr, (256ull << 20) + 65536, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (!large) return 53;
+    large[4] = 77;
+    raw.address = ptr(large);
+    raw.view.Buffer.FirstElement = 4;
+    invoke(guest, 70, ptr(&desc), ptr(&raw), cpu);
     draw(7);
     return 0;
 }

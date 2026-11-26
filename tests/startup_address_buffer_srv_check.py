@@ -50,13 +50,13 @@ def check(directory, consumer, backend):
     )
     if actual is None:
         return 77
-    values = (17, 63, 141, 141, 99, 17, 17, 17)
+    values = (17, 63, 141, 141, 99, 17, 17, 77)
     row = b"".join(bytes((v, 0, 0, 255)) for v in values)
     expected = row * 4
     if actual != expected:
         raise AssertionError(f"actual {actual.hex()} expected {expected.hex()}")
     check_refusal_lines(trap_log.read_text(errors="replace"))
-    print(f"{backend}: buffer memory SRV (raw base, raw interior, unplaced buffer, structured, refused unaligned, refused acceleration structure view) exact")
+    print(f"{backend}: buffer memory SRV (raw base, raw interior, unplaced buffer, structured, refused unaligned, refused acceleration structure view, unplaced buffer in a large allocation copied) exact")
     return 0
 
 

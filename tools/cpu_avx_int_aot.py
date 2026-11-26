@@ -40,6 +40,9 @@ excluding the 28 forms carved out to cpu_vex_aot.py (PR #325)):
   - 256-bit (VEX.L=1, AVX2, register operands only) pack with saturation: vpacksswb, vpackssdw,
     vpackusdw. Each 128-bit lane is computed independently (128-bit vpackuswb stays with
     cpu_vex_aot.py).
+  - 256-bit (VEX.L=1, AVX2, register operands only) cross-lane extend: vpmovsxbw/bd/bq/wd/wq/dq,
+    vpmovzxbw/bd/bq/wd/wq/dq (XMM low 128 bits -> YMM 256 bits; upper source bits ignored).
+  - 256-bit (VEX.L=1, AVX2, register operands only) in-lane unpack: vpunpckldq/hdq/lqdq/hqdq.
 
 Transport/ABI glue: vmovdqu (128/256-bit flat load, store and register copy),
 flat 32/64-bit GPR load/store mov for scratch GPRs, and terminal ret.
@@ -95,6 +98,7 @@ WIDE_BINARY_HELPERS = {
         "vphaddw", "vphaddd", "vphaddsw", "vphsubw", "vphsubd", "vphsubsw",
         "vpmuldq", "vpmuludq", "vpmulhrsw", "vpsadbw",
         "vpacksswb", "vpackssdw", "vpackusdw",
+        "vpunpckldq", "vpunpckhdq", "vpunpcklqdq", "vpunpckhqdq",
     )
 }
 WIDE_BINARY_CODES = {
@@ -112,6 +116,7 @@ WIDE_BINARY_CODES = {
         "VPHADDW", "VPHADDD", "VPHADDSW", "VPHSUBW", "VPHSUBD", "VPHSUBSW",
         "VPMULDQ", "VPMULUDQ", "VPMULHRSW", "VPSADBW",
         "VPACKSSWB", "VPACKSSDW", "VPACKUSDW",
+        "VPUNPCKLDQ", "VPUNPCKHDQ", "VPUNPCKLQDQ", "VPUNPCKHQDQ",
     )
 }
 # 256-bit one-source forms: the 128-bit helper runs on each half. vpshufhw/vpshuflw use the
@@ -127,6 +132,28 @@ WIDE_UNARY_CODES = {
 }
 WIDE_UNARY_IMM_CODES = {
     getattr(Code, f"VEX_{name}_YMM_YMMM256_IMM8") for name in ("VPSHUFHW", "VPSHUFLW")
+}
+# 256-bit cross-lane sign/zero-extend moves (XMM low 128 bits -> YMM 256 bits).
+WIDE_EXTEND_HELPERS = {
+    getattr(M, name.upper()): f"op_{name}_ymm"
+    for name in (
+        "vpmovsxbw", "vpmovsxbd", "vpmovsxbq", "vpmovsxwd", "vpmovsxwq", "vpmovsxdq",
+        "vpmovzxbw", "vpmovzxbd", "vpmovzxbq", "vpmovzxwd", "vpmovzxwq", "vpmovzxdq",
+    )
+}
+WIDE_EXTEND_CODES = {
+    Code.VEX_VPMOVSXBW_YMM_XMMM128,
+    Code.VEX_VPMOVSXBD_YMM_XMMM64,
+    Code.VEX_VPMOVSXBQ_YMM_XMMM32,
+    Code.VEX_VPMOVSXWD_YMM_XMMM128,
+    Code.VEX_VPMOVSXWQ_YMM_XMMM64,
+    Code.VEX_VPMOVSXDQ_YMM_XMMM128,
+    Code.VEX_VPMOVZXBW_YMM_XMMM128,
+    Code.VEX_VPMOVZXBD_YMM_XMMM64,
+    Code.VEX_VPMOVZXBQ_YMM_XMMM32,
+    Code.VEX_VPMOVZXWD_YMM_XMMM128,
+    Code.VEX_VPMOVZXWQ_YMM_XMMM64,
+    Code.VEX_VPMOVZXDQ_YMM_XMMM128,
 }
 
 # Unary: dst = helper(src)
@@ -379,7 +406,7 @@ ALLOWED_CODES = {
 }
 
 
-ALLOWED_CODES |= WIDE_BINARY_CODES | WIDE_UNARY_CODES | WIDE_UNARY_IMM_CODES
+ALLOWED_CODES |= WIDE_BINARY_CODES | WIDE_UNARY_CODES | WIDE_UNARY_IMM_CODES | WIDE_EXTEND_CODES
 
 
 PRELUDE = """#include <cstdint>
@@ -1092,68 +1119,91 @@ static Vec256 op_vpsignd(const Vec256& a, const Vec256& b) {
 
 // --- Sign-extend and zero-extend moves ---
 
-static Vec256 op_vpmovsxbw(const Vec256& a) {
+static Vec256 extend_bw(const Vec256& a, unsigned count, bool sign_ext) {
     Vec256 out{};
-    for (unsigned i = 0; i < 8u; ++i) set_lane16(out, i, static_cast<std::uint16_t>(static_cast<std::int16_t>(s8(lane8(a, i)))));
+    for (unsigned i = 0; i < count; ++i) {
+        const std::uint8_t u = lane8(a, i);
+        set_lane16(out, i, sign_ext ? static_cast<std::uint16_t>(static_cast<std::int16_t>(s8(u)))
+                                    : static_cast<std::uint16_t>(u));
+    }
     return out;
 }
 
-static Vec256 op_vpmovsxbd(const Vec256& a) {
+static Vec256 extend_bd(const Vec256& a, unsigned count, bool sign_ext) {
     Vec256 out{};
-    for (unsigned i = 0; i < 4u; ++i) set_lane32(out, i, static_cast<std::uint32_t>(static_cast<std::int32_t>(s8(lane8(a, i)))));
+    for (unsigned i = 0; i < count; ++i) {
+        const std::uint8_t u = lane8(a, i);
+        set_lane32(out, i, sign_ext ? static_cast<std::uint32_t>(static_cast<std::int32_t>(s8(u)))
+                                    : static_cast<std::uint32_t>(u));
+    }
     return out;
 }
 
-static Vec256 op_vpmovsxbq(const Vec256& a) {
-    return {{static_cast<std::uint64_t>(static_cast<std::int64_t>(s8(lane8(a, 0u)))),
-             static_cast<std::uint64_t>(static_cast<std::int64_t>(s8(lane8(a, 1u)))), 0ull, 0ull}};
-}
-
-static Vec256 op_vpmovsxwd(const Vec256& a) {
+static Vec256 extend_bq(const Vec256& a, unsigned count, bool sign_ext) {
     Vec256 out{};
-    for (unsigned i = 0; i < 4u; ++i) set_lane32(out, i, static_cast<std::uint32_t>(static_cast<std::int32_t>(s16(lane16(a, i)))));
+    for (unsigned i = 0; i < count; ++i) {
+        const std::uint8_t u = lane8(a, i);
+        out.q[i] = sign_ext ? static_cast<std::uint64_t>(static_cast<std::int64_t>(s8(u)))
+                            : static_cast<std::uint64_t>(u);
+    }
     return out;
 }
 
-static Vec256 op_vpmovsxwq(const Vec256& a) {
-    return {{static_cast<std::uint64_t>(static_cast<std::int64_t>(s16(lane16(a, 0u)))),
-             static_cast<std::uint64_t>(static_cast<std::int64_t>(s16(lane16(a, 1u)))), 0ull, 0ull}};
-}
-
-static Vec256 op_vpmovsxdq(const Vec256& a) {
-    return {{static_cast<std::uint64_t>(static_cast<std::int64_t>(s32(lane32(a, 0u)))),
-             static_cast<std::uint64_t>(static_cast<std::int64_t>(s32(lane32(a, 1u)))), 0ull, 0ull}};
-}
-
-static Vec256 op_vpmovzxbw(const Vec256& a) {
+static Vec256 extend_wd(const Vec256& a, unsigned count, bool sign_ext) {
     Vec256 out{};
-    for (unsigned i = 0; i < 8u; ++i) set_lane16(out, i, lane8(a, i));
+    for (unsigned i = 0; i < count; ++i) {
+        const std::uint16_t u = lane16(a, i);
+        set_lane32(out, i, sign_ext ? static_cast<std::uint32_t>(static_cast<std::int32_t>(s16(u)))
+                                    : static_cast<std::uint32_t>(u));
+    }
     return out;
 }
 
-static Vec256 op_vpmovzxbd(const Vec256& a) {
+static Vec256 extend_wq(const Vec256& a, unsigned count, bool sign_ext) {
     Vec256 out{};
-    for (unsigned i = 0; i < 4u; ++i) set_lane32(out, i, lane8(a, i));
+    for (unsigned i = 0; i < count; ++i) {
+        const std::uint16_t u = lane16(a, i);
+        out.q[i] = sign_ext ? static_cast<std::uint64_t>(static_cast<std::int64_t>(s16(u)))
+                            : static_cast<std::uint64_t>(u);
+    }
     return out;
 }
 
-static Vec256 op_vpmovzxbq(const Vec256& a) {
-    return {{lane8(a, 0u), lane8(a, 1u), 0ull, 0ull}};
-}
-
-static Vec256 op_vpmovzxwd(const Vec256& a) {
+static Vec256 extend_dq(const Vec256& a, unsigned count, bool sign_ext) {
     Vec256 out{};
-    for (unsigned i = 0; i < 4u; ++i) set_lane32(out, i, lane16(a, i));
+    for (unsigned i = 0; i < count; ++i) {
+        const std::uint32_t u = lane32(a, i);
+        out.q[i] = sign_ext ? static_cast<std::uint64_t>(static_cast<std::int64_t>(s32(u)))
+                            : static_cast<std::uint64_t>(u);
+    }
     return out;
 }
 
-static Vec256 op_vpmovzxwq(const Vec256& a) {
-    return {{lane16(a, 0u), lane16(a, 1u), 0ull, 0ull}};
-}
+static Vec256 op_vpmovsxbw(const Vec256& a) { return extend_bw(a, 8u, true); }
+static Vec256 op_vpmovsxbd(const Vec256& a) { return extend_bd(a, 4u, true); }
+static Vec256 op_vpmovsxbq(const Vec256& a) { return extend_bq(a, 2u, true); }
+static Vec256 op_vpmovsxwd(const Vec256& a) { return extend_wd(a, 4u, true); }
+static Vec256 op_vpmovsxwq(const Vec256& a) { return extend_wq(a, 2u, true); }
+static Vec256 op_vpmovsxdq(const Vec256& a) { return extend_dq(a, 2u, true); }
+static Vec256 op_vpmovzxbw(const Vec256& a) { return extend_bw(a, 8u, false); }
+static Vec256 op_vpmovzxbd(const Vec256& a) { return extend_bd(a, 4u, false); }
+static Vec256 op_vpmovzxbq(const Vec256& a) { return extend_bq(a, 2u, false); }
+static Vec256 op_vpmovzxwd(const Vec256& a) { return extend_wd(a, 4u, false); }
+static Vec256 op_vpmovzxwq(const Vec256& a) { return extend_wq(a, 2u, false); }
+static Vec256 op_vpmovzxdq(const Vec256& a) { return extend_dq(a, 2u, false); }
 
-static Vec256 op_vpmovzxdq(const Vec256& a) {
-    return {{lane32(a, 0u), lane32(a, 1u), 0ull, 0ull}};
-}
+static Vec256 op_vpmovsxbw_ymm(const Vec256& a) { return extend_bw(a, 16u, true); }
+static Vec256 op_vpmovsxbd_ymm(const Vec256& a) { return extend_bd(a, 8u, true); }
+static Vec256 op_vpmovsxbq_ymm(const Vec256& a) { return extend_bq(a, 4u, true); }
+static Vec256 op_vpmovsxwd_ymm(const Vec256& a) { return extend_wd(a, 8u, true); }
+static Vec256 op_vpmovsxwq_ymm(const Vec256& a) { return extend_wq(a, 4u, true); }
+static Vec256 op_vpmovsxdq_ymm(const Vec256& a) { return extend_dq(a, 4u, true); }
+static Vec256 op_vpmovzxbw_ymm(const Vec256& a) { return extend_bw(a, 16u, false); }
+static Vec256 op_vpmovzxbd_ymm(const Vec256& a) { return extend_bd(a, 8u, false); }
+static Vec256 op_vpmovzxbq_ymm(const Vec256& a) { return extend_bq(a, 4u, false); }
+static Vec256 op_vpmovzxwd_ymm(const Vec256& a) { return extend_wd(a, 8u, false); }
+static Vec256 op_vpmovzxwq_ymm(const Vec256& a) { return extend_wq(a, 4u, false); }
+static Vec256 op_vpmovzxdq_ymm(const Vec256& a) { return extend_dq(a, 4u, false); }
 
 // --- Unpack / interleave ---
 
@@ -1379,7 +1429,8 @@ def lift_code(name, start, raw):
         wide_unary = ins.code in WIDE_UNARY_CODES
         wide_unary_imm = ins.code in WIDE_UNARY_IMM_CODES
         wide_binary = ins.code in WIDE_BINARY_CODES
-        wide_any = wide_unary or wide_unary_imm or wide_binary
+        wide_extend = ins.code in WIDE_EXTEND_CODES
+        wide_any = wide_unary or wide_unary_imm or wide_binary or wide_extend
         if (mnemonic in AVX_INT_128_ONLY_MNEMONICS and not wide_any
                 and op_code.encoding == EncodingKind.VEX and op_code.l == 1):
             raise ValueError(f"unsupported VEX.256 (L=1) packed-integer encoding at RVA {ins.ip:#x}: {ins}")
@@ -1444,6 +1495,11 @@ def lift_code(name, start, raw):
             imm = ins.immediate8 & 0xff
             statements.append(
                 f"{dst} = wide128_unary_imm({WIDE_UNARY_IMM_HELPERS[mnemonic]}, {src}, {imm:#x}u);")
+            defined_vec.add(dst_idx)
+        elif wide_extend:
+            src, _ = read_vec(1, ins)
+            dst_idx, dst, _ = write_vec(0, ins, allow_ymm=True)
+            statements.append(f"{dst} = {WIDE_EXTEND_HELPERS[mnemonic]}({src});")
             defined_vec.add(dst_idx)
         elif mnemonic in UNARY_HELPERS:
             src, _ = read_vec(1, ins)

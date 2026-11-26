@@ -80,7 +80,7 @@ class ShaderCacheRekeyCliTests(unittest.TestCase):
                 rc, stdout, stderr = _run_main([str(src), str(dst_argv)])
             self.assertEqual(rc, 0, stderr)
             self.assertEqual(stderr, "")
-            self.assertIn("m57 0, m86 1", stdout)
+            self.assertIn("not re-keyed (own key strings): m86 1", stdout)
             expected_names = sorted([
                 f"req_{keys['g']:016x}.a",
                 f"req_{keys['g']:016x}.b",
@@ -116,7 +116,7 @@ class ShaderCacheRekeyCliTests(unittest.TestCase):
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertEqual(proc.stderr, "")
-            self.assertIn("m57 0, m86 1", proc.stdout)
+            self.assertIn("not re-keyed (own key strings): m86 1", proc.stdout)
             self.assertEqual(sorted(p.name for p in dst_sub.iterdir()), expected_names)
 
     def test_usage_and_path_guards(self):

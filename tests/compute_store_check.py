@@ -7805,16 +7805,16 @@ def mimg_atomic_controls(*, suite="integer"):
     msaa = "image_msaa_load v[14:17], v[8:10], s[24:31] dmask:0xf dim:SQ_RSRC_IMG_2D_MSAA unorm"
     rejects("requires an unguarded R32_UINT MSAA binding", aot.lower,
             variant(lines, (instruction, msaa)), MIMG_STORE_GROUP, **binding)
-    # gfx1013 shares this lowering for add, umax and cmpswap on R32_UINT only
+    # gfx1013 shares this lowering for add, umin, umax and cmpswap on R32_UINT only
     # (tests/compute_image_atomics_gfx1013_check.py); every other op and format stays refused there.
     for op, (case, case_binding) in cases.items():
         gfx1013 = case_binding | {"cpu": "gfx1013"}
         if case_binding["image_format"] != "R32_UINT":
             rejects("Invalid image UAV binding", aot.lower, case, MIMG_STORE_GROUP, **gfx1013)
-        elif op.removesuffix("_contended") in ("add", "umax", "cmpswap"):
+        elif op.removesuffix("_contended") in ("add", "umin", "umax", "cmpswap"):
             assert aot.lower(case, MIMG_STORE_GROUP, **gfx1013) == aot.lower(case, MIMG_STORE_GROUP, **case_binding)
         else:
-            rejects("gfx1013 image atomics require add, umax or cmpswap", aot.lower, case, MIMG_STORE_GROUP, **gfx1013)
+            rejects("gfx1013 image atomics require add, umin, umax or cmpswap", aot.lower, case, MIMG_STORE_GROUP, **gfx1013)
     for case, case_binding in cases.values():
         wrong_format = "R32_UINT" if case_binding["image_format"] == "R32_SINT" else "R32_SINT"
         rejects("Unsupported image atomic target or binding", aot.lower, case, MIMG_STORE_GROUP,

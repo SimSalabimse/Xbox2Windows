@@ -5,6 +5,8 @@ Usage:
     python tests/cpu/x87_scale.py emit <dll> <cpp> [control]   translate (and optionally mutate) the fixture
     python tests/cpu/x87_scale.py check <harness> <native> <lifted> [controls...]
 
+CTest runs the check-* parts as separate cases in parallel; `check` runs every part serially for a direct run.
+
 The exports, harness and guards follow tests/cpu/x87_add.py, and the other steps use the format of
 tests/cpu/x87_moves.py. emit checks that every decoded x87 instruction is the form its sequence names.
 The model scales with Fraction arithmetic and is independent of tools/x87_soft.h.
@@ -257,36 +259,40 @@ def cases():
 
 # ---- Check -----------------------------------------------------------------------------------------
 
-def check(harness_path, native_path, lifted_path, *control_paths):
-    expected = [(name, data, reference(name, data)) for name, data in cases()]
-    for label, path in (("native", native_path), ("lifted", lifted_path)):
-        run = base.Runner(harness_path, path)
-        bad = 0
-        for name, data, want in expected:
-            got, state = run(name, data)
-            if not base.entry_state_ok(state):
-                raise AssertionError(f"{label} {name} left state {state:#014x}; the profile requires control "
-                                     "0x027f and an empty stack at TOP 0")
-            if got != want:
-                if bad < 3:
-                    print(f"{label} mismatch: {name}(input {data[:48].hex()})\n  got      {got[:48].hex()}\n"
-                          f"  expected {want[:48].hex()}")
-                bad += 1
-        if bad:
-            raise AssertionError(f"{label}: {bad}/{len(expected)} mismatches")
-    print(f"{len(expected)} cases over {len(SEQUENCES)} exports (output block and guards) matched the reference "
-          "in native and translated DLLs; each export returned with control 0x027f and an empty stack")
+def build_expected():
+    return [(name, data, reference(name, data)) for name, data in cases()]
+
+
+def check_target(label, harness_path, path, expected):
+    """Every case, then the x87_call caller-state check, against one DLL (native or translated)."""
+    run = base.Runner(harness_path, path)
+    bad = 0
+    for name, data, want in expected:
+        got, state = run(name, data)
+        if not base.entry_state_ok(state):
+            raise AssertionError(f"{label} {name} left state {state:#014x}; the profile requires control "
+                                 "0x027f and an empty stack at TOP 0")
+        if got != want:
+            if bad < 3:
+                print(f"{label} mismatch: {name}(input {data[:48].hex()})\n  got      {got[:48].hex()}\n"
+                      f"  expected {want[:48].hex()}")
+            bad += 1
+    if bad:
+        raise AssertionError(f"{label}: {bad}/{len(expected)} mismatches")
+    print(f"{label}: {len(expected)} cases over {len(SEQUENCES)} exports (output block and guards) matched the "
+          "reference; each export returned with control 0x027f and an empty stack")
     print(f"processor: {platform.processor()}")
     first = {}
     for name, data, want in expected:
         first.setdefault(name, (data, want))
-    for label, path in (("native", native_path), ("lifted", lifted_path)):
-        run = base.Runner(harness_path, path)
-        failed = [name for name, (data, want) in first.items() if not base.preserved(run, "x87_call", name, data, want)]
-        if failed:
-            raise AssertionError(f"x87_call lost a live caller value or control word around {label} {failed}")
-    print(f"x87_call kept a live caller ST(0) value and control word around all {len(first)} native and "
-          "translated exports")
+    run = base.Runner(harness_path, path)
+    failed = [name for name, (data, want) in first.items() if not base.preserved(run, "x87_call", name, data, want)]
+    if failed:
+        raise AssertionError(f"x87_call lost a live caller value or control word around {label} {failed}")
+    print(f"x87_call kept a live caller ST(0) value and control word around all {len(first)} {label} exports")
+
+
+def check_controls(harness_path, expected, control_paths):
     for path in control_paths:
         control = Path(path).stem.rsplit("_", 1)[-1]
         run = base.Runner(harness_path, path)
@@ -294,6 +300,13 @@ def check(harness_path, native_path, lifted_path, *control_paths):
         print(f"control {control}: {bad}/{len(expected)} mismatches")
         if not bad:
             raise AssertionError(f"control {control} matched every case")
+
+
+def check(harness_path, native_path, lifted_path, *control_paths):
+    expected = build_expected()
+    check_target("native", harness_path, native_path, expected)
+    check_target("lifted", harness_path, lifted_path, expected)
+    check_controls(harness_path, expected, control_paths)
     check_rejections()
 
 
@@ -324,12 +337,22 @@ def check_rejections():
 
 
 if __name__ == "__main__":
-    mode, first, second, *rest = sys.argv[1:]
+    mode, *args = sys.argv[1:]  # check-rejections takes no paths
+    first, second = (args + [None, None])[:2]
+    rest = args[2:]
     if mode == "asm":
         write_asm(first, second)
     elif mode == "emit":
         emit(Path(first), Path(second), *rest)
     elif mode == "check":
         check(first, second, *rest)
+    elif mode == "check-rejections":  # no fixture needed
+        check_rejections()
+    elif mode == "check-native":  # args: harness, native DLL
+        check_target("native", first, second, build_expected())
+    elif mode == "check-lifted":  # args: harness, lifted DLL
+        check_target("lifted", first, second, build_expected())
+    elif mode == "check-controls":  # args: harness, unused, then the control DLLs
+        check_controls(first, build_expected(), rest)
     else:
         raise ValueError(mode)
