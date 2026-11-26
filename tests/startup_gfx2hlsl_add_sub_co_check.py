@@ -8,8 +8,8 @@ when S1 > S0; V_SUBREV_CO_U32 swaps S0 and S1. These forms are VOP3b only and ta
 
 The emitted lines are evaluated with the restricted evaluator of startup_gfx2hlsl_bit_alu_check on a grid of edge
 values and compared with Python references written from the ISA description, for an SGPR and a VCC carry-out. Also
-checked: the carry-out SGPR becomes a lane mask that is not a uniform source, a readfirstlane of a copy of it is
-refused, inactive lanes keep D and get a 0 carry when exec is not known, a destination that overlaps a source reads
+checked: the carry-out SGPR becomes a lane mask that is refused as vector move data, inactive lanes keep D
+and get a 0 carry when exec is not known, a destination that overlaps a source reads
 the source first, and clamp, a wrong operand count and an EXEC carry-out are refused. Negative control: a borrow
 written as S0 > S1 differs from the reference on the grid.
 """
@@ -117,15 +117,15 @@ def main():
                     count += 1
             check('%s matches the ISA reference on the grid' % text, bad is None, bad)
 
-    # The carry-out is per lane: a readfirstlane of a VGPR copied from it must not be proven uniform.
+    # The carry-out holds only this lane's bit and cannot be moved as a data word.
     s, text, _ = translate(vop3b(0x30f, 2, 18, V4, V3))
     try:
         s.one('v_mov_b32', 'v_mov_b32 v5, s18')
-        s.one('v_readfirstlane_b32', 'v_readfirstlane_b32 s20, v5')
     except G.Unsupported as error:
-        check('%s: readfirstlane of a copy of the carry-out is refused' % text, 'uniform' in str(error), str(error))
+        check('%s: moving the carry-out as data is refused' % text,
+              str(error) == 'v_mov_b32 data operand s18 is a lane mask', str(error))
     else:
-        check('%s: readfirstlane of a copy of the carry-out is refused' % text, False, s.lines)
+        check('%s: moving the carry-out as data is refused' % text, False, s.lines)
     # D of varying sources is not proven uniform either.
     s, text, _ = translate(vop3b(0x30f, 2, 18, V4, V3))
     try:

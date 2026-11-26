@@ -5,6 +5,7 @@
 // --mutate first-32: expect a resolved FirstElement above 4 Gi elements to be cut to 32 bits.
 // --mutate unplaced-extent: expect page span calculation crossing a 64 KiB boundary to return a single page.
 // --mutate unplaced-covers: expect a buffer range past the end of the cached page to be accepted as covered.
+// --mutate unplaced-heap-limit: expect a 2 GiB allocation to be wrapped as an existing heap for an unplaced buffer.
 // Each mutated run is a negative control and must fail.
 #include "startup_stubs/memory_srv_buffer.h"
 
@@ -84,10 +85,11 @@ int main(int argc, char** argv)
     if (argc == 3 && std::strcmp(argv[1], "--mutate") == 0 &&
         (std::strcmp(argv[2], "height") == 0 || std::strcmp(argv[2], "exact-fit") == 0 ||
          std::strcmp(argv[2], "first-32") == 0 ||
-         std::strcmp(argv[2], "unplaced-extent") == 0 || std::strcmp(argv[2], "unplaced-covers") == 0)) {
+         std::strcmp(argv[2], "unplaced-extent") == 0 || std::strcmp(argv[2], "unplaced-covers") == 0 ||
+         std::strcmp(argv[2], "unplaced-heap-limit") == 0)) {
         mutation = argv[2];
     } else if (argc != 1) {
-        std::printf("usage: startup_memory_srv_buffer_check [--mutate height|exact-fit|first-32|unplaced-extent|unplaced-covers]\n");
+        std::printf("usage: startup_memory_srv_buffer_check [--mutate height|exact-fit|first-32|unplaced-extent|unplaced-covers|unplaced-heap-limit]\n");
         return 2;
     }
     const auto buf = buffer_desc(1024);
@@ -300,6 +302,15 @@ int main(int argc, char** argv)
     check("unplaced covers before start", !x2w_startup::unplaced_buffer_covers(0x10000, 65536, 0x0fff0, 32));
     check("unplaced covers zero cached span", !x2w_startup::unplaced_buffer_covers(0x10000, 0, 0x10000, 48));
     check("unplaced covers zero requested span", !x2w_startup::unplaced_buffer_covers(0x10000, 65536, 0x10000, 0));
+
+    // Existing-heap wrap of the allocation holding an unplaced buffer: up to the 256 MiB span limit only.
+    check("unplaced heap 64 KiB allocation", x2w_startup::unplaced_existing_heap_allowed(65536));
+    check("unplaced heap 256 MiB allocation", x2w_startup::unplaced_existing_heap_allowed(256ull << 20));
+    check("unplaced heap 256 MiB + 64 KiB allocation",
+          !x2w_startup::unplaced_existing_heap_allowed((256ull << 20) + 65536));
+    check("unplaced heap 2 GiB allocation",
+          x2w_startup::unplaced_existing_heap_allowed(2ull << 30) == mutated("unplaced-heap-limit"));
+    check("unplaced heap unknown allocation size", !x2w_startup::unplaced_existing_heap_allowed(0));
 
     if (failures) return 1;
     std::printf("slot 70 buffer memory SRV validation: all checks passed\n");

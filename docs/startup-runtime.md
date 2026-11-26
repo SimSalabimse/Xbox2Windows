@@ -1105,7 +1105,7 @@ Archive each run's logs together with a copy of `shader_cache/`, and leave the c
 
 When the translator handles more, the next `--pending` pass retries the waiting requests from the same cache. This holds only while the pipeline key is unchanged. The key hashes a translation revision string (`x2w-startup-shader-N`, in `pipeline_key` in `gfx2hlsl.py` and in the runtime). After a revision change the runtime asks for new keys, and the old requests stay in the cache.
 
-**Re-key the old requests after a revision change.** The new cache is cold, so a run would have to request every pipeline again. `tools/startup/shader_cache_rekey.py` copies the graphics, RTV variant and slot 67 compute requests of the old cache under the keys of the current revision, computed with `pipeline_key` and `compute_key` of the `gfx2hlsl.py` next to it. Stop the title and any `--pending` loop first; nothing else may write the cache. Then:
+**Re-key the old requests after a revision change.** The new cache is cold, so a run would have to request every pipeline again. `tools/startup/shader_cache_rekey.py` copies graphics, RTV variant, slot 67 compute and slot 57 mesh requests under their current keys. It uses `pipeline_key`, `compute_key` and `mesh57_key` from the adjacent `gfx2hlsl.py` and updates each RTV variant with its new graphics key. Stop the title and any `--pending` loop first; nothing else may write the cache. Then:
 
 ```powershell
 .\out\pe-env\Scripts\python.exe -B tools\startup\shader_cache_rekey.py out\startup\shader_cache out\startup\shader_cache_rekeyed
@@ -1113,11 +1113,11 @@ When the translator handles more, the next `--pending` pass retries the waiting 
 robocopy out\startup\shader_cache_rekeyed out\startup\shader_cache /XC /XN /XO
 ```
 
-1. The re-key step only reads the old cache and writes request files (`req_*`) only, never results or `.fail`. A file already in the new directory is left as it is, so a second run writes nothing. It reads every request before it writes: if a part is missing or unreadable, or an RTV variant is malformed or names a base that is not in the cache, it prints how many, writes nothing and exits with 1. Slot 57 and slot 86 mesh requests have their own key strings and are not re-keyed. `X2W_TRANSLATE_JOBS` sets the number of hashing processes.
+1. The re-key step reads the old cache and writes only request files (`req_*`). A file already in the new directory is left as it is, so a second run writes nothing. It reads every request before it writes. If a part is missing or unreadable, or an RTV variant is malformed or names a base that is not in the cache, it prints how many, writes nothing and exits with 1. A slot 57 request requires `.ps57`, `.root` and the `.m57` ready marker. The `.ps57` file is empty when there is no pixel stage. Slot 86 mesh requests are only counted. `X2W_TRANSLATE_JOBS` sets the number of hashing processes.
 2. `--pending` translates the re-keyed requests offline, as it does for a running title's cache.
 3. The `robocopy` switches skip every file that already exists in the cache, so results the runtime or a later pass wrote are kept. A `robocopy` exit code below 8 means success: 1 is set when files were copied, and 2 is set because the cache holds files that the new directory does not. A code of 8 or more is a failure. On Linux, run the same steps with `./out/pe-env/bin/python` and merge with `cp -rn out/startup/shader_cache_rekeyed/. out/startup/shader_cache/`, which also keeps existing files.
 
-`tests/startup_shader_cache_rekey_check.py` checks the tool on synthetic requests only: the names match the current keys, a newer revision gives other names, a second run and a current cache change nothing, and an incomplete request or an RTV variant without its base writes nothing. Re-keying recovers the requests, not the translations: some re-keyed pipelines can still fail to translate, which is separate from the cache key. Nothing here shows that a title runs.
+`tests/startup_shader_cache_rekey_check.py` checks the tool on synthetic requests only: the names match the current keys, a newer graphics and compute revision gives other names for those requests, a second run and a current cache change nothing, and an incomplete request or an RTV variant without its base writes nothing. Re-keying recovers the requests, not the translations: some re-keyed pipelines can still fail to translate, which is separate from the cache key. Nothing here shows that a title runs.
 
 When `fxc` is available, a request that later translates loses its `.fail`. In manifest-only mode (`X2W_FXC` empty) the old `.fail` stays, so on a kept cache the `.fail` categories in `triage.md` can include pipelines that now have a `.txt`. That table counts category tokens over all `.fail` files, up to `--max-items`.
 
@@ -1349,6 +1349,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_D3D12_RELEASE_RETIRED=1` | opt-in, effective with `X2W_D3D12_RENDER=1` only (the list handlers that record holds exist only there): frees the desktop object of a released committed 2D texture of one narrow class once no recorded list, submission or release-time fence refers to it ([details](#d3d12-resource-budget)). Unset, nothing changes |
 | `X2W_D3D12_RELEASE_RETIRED_VIEWS=1` | opt-in, effective only together with `X2W_D3D12_RELEASE_RETIRED=1`: a released class texture that only tracked slot-18 descriptor slots keep alive (the title never overwrites them) is freed once those slots are replaced by null descriptors ([details](#d3d12-resource-budget)). Unset, nothing changes |
 | `X2W_D3D12_RETIRE_REASONS=1` | diagnostic only, effective with `X2W_D3D12_RELEASE_RETIRED=1` and `X2W_D3D12_BUDGET=1`: adds one `x2w-retire held:` line to the heartbeat that counts final-released resources whose desktop object is still alive, by reason ([details](#d3d12-resource-budget)). Unset, nothing is recorded |
+| `X2W_D3D12_VIEW_CENSUS=1` | diagnostic only: counts new distinct view records by device slot (a heartbeat line), and logs the record vector capacity and hash bucket count before either grows ([details](#d3d12-view-census)). Unset, nothing is counted or logged |
 | `X2W_DRAW_NULL_IDENTITY=1` | null descriptors read as identity values instead of zero |
 | `X2W_DEPTH_STATE=1` | translated draws of slot 57 pipelines take their depth-stencil state and stencil reference from state block A instead of the desktop default (depth and stencil off); a refused block keeps the default. Off by default, then nothing changes: see [Shortcuts that are known to be wrong](#shortcuts-that-are-known-to-be-wrong) |
 | `X2W_PRESENT_SIGNATURE_EVERY=<n>` | in render mode, samples a coarse signature of the presented picture every `n` presents from the start, without a script request (`0` off). Unset, sampling starts, every 4 presents, only once a script with a `wait` asks for it: see [Waiting for the presented picture](#waiting-for-the-presented-picture) |
@@ -1533,6 +1534,48 @@ title memory) still records its upload. The fixture-only exports `x2w_d3d12_reti
 FALSE without the switch, like `x2w_d3d12_budget_snapshot`. `startup_resource_retire_off_*`
 runs the same steps without the switch. The hardware cases report 77 without a
 physical adapter, and the debug-layer cases report 77 where the debug layer is not installed.
+
+## D3D12 view census
+
+The stand-in keeps one record per distinct view: slot, resource, counter,
+description bytes and whether the desktop view was created. Records are not
+removed. `X2W_D3D12_VIEW_CENSUS=1` shows which slot adds them. It changes no
+record, id or descriptor binding.
+
+The heartbeat adds a line:
+
+`x2w-view-census distinct by slot: cbv= srv= uav= rtv= dsv= sampler= records= capacity= ids= buckets= grows-records= grows-ids= missed=`
+
+- `cbv` to `sampler`: new records from device slots 17 to 22.
+- `records`, `capacity`: size and capacity of the record vector.
+- `ids`, `buckets`: size and bucket count of the hash map from content to id.
+
+Before an insertion that is expected to grow either container, the same fields
+are logged as `x2w-view-census before growth of <records|ids|records and ids>`,
+with the slot of the new record. The values are those before the growth. The line
+is written before the allocation, so it is in the log when that allocation fails,
+also when no further heartbeat follows. The growth is predicted: from the
+vector's capacity, and for the map from the MSVC rehash rule (the new size over
+the bucket count exceeds the maximum load factor). `missed` counts capacity or
+bucket changes that no line announced.
+
+The census counts distinct byte contents, not distinct views. It does not say
+why two records differ (for example a changing address, or description bytes
+that the view type does not use), and it does not measure the size of the
+containers in bytes or reduce it.
+
+`startup_view_census_<warp|hardware>` calls slots 17, 18 and 22 of the device.
+A repeated descriptor must add no record and grow nothing. A stream of 200,000
+distinct constant buffer views, 3,000 buffer SRVs and 100 samplers must be
+counted by slot, with one log line per announced growth. Both streams run under
+a job commit limit 256 MiB above the commit held after setup. `off` checks that
+nothing is reported without the switch; in `vary` the repeated stream changes
+every call, and the fixture must fail. Slots 19 to 21 are not exercised.
+
+```powershell
+cmake --build --preset dev --target startup_view_census
+ctest --preset dev --no-tests=error -R "^startup_view_census" -V
+```
 
 ## Input script
 
@@ -2822,6 +2865,20 @@ freed slots are reused in address order so that pages reused together share a vi
 `VirtualQuery` on a page of a shared view reports the view's base as the allocation base and the
 bytes from the queried page to the end of the view, not one page. A placed buffer on such memory
 is not affected: section-backed pages already took the committed, not-aliased path.
+
+## Committed resources (device slot 76)
+
+Device slot 76 (Xbox order, +0x260) takes the seven arguments of desktop `CreateCommittedResource`:
+heap properties, heap flags, desc, initial state, clear value, riid and ppv. Measured: a console
+package module (an upscaler) creates its resources through it. The stand-in shares the
+committed-resource path of slot 127 (the `CreateCommittedResource3` order, with protected session and
+castable formats, which slot 76 does not pass): the same initial-state choice per heap, the same
+clear-value retry and title memory, and a log line naming the slot. Run
+`ctest --preset dev --no-tests=error -R '^startup_committed_slot76_(warp|control)$'`
+(`tests/startup_committed_slot76_check.cpp`): a render target with a clear value and buffers on the
+default, upload and readback heaps, passed with initial state 0xffffffff as a title passes them, must
+be created and leave the device alive. The control asks for a 2D texture on an upload heap and must
+return `E_INVALIDARG` with no resource and leave the device alive. The control also requires all four valid creations to pass. `startup_committed_slot76_hardware` runs the creation checks on a physical GPU.
 
 - `ctest --preset release --no-tests=error -R '^xmem_shim_(mapped_pages|page_runs)$' -V` runs the
   earlier contract check and `tests/xmem_page_runs_check.py`: a batch across two sections with

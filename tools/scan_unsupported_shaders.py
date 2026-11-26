@@ -482,11 +482,15 @@ KNOWN_RDNA2_BASE_OPCODES |= (
     }
 )
 
+OPCODE_ENCODING_SUFFIX = re.compile(r"_(?:e32|e64|sdwa|dpp.*)$")
+CROSS_LANE_VALU_OPCODES = {"v_permlane16_b32", "v_permlanex16_b32"}
+CROSS_LANE_VALU_CATEGORY = "VALU (Cross-lane)"
+
 
 def is_opcode_recognized(opcode: str) -> bool:
     """Check if opcode belongs to recognized AMD RDNA 2 ISA instructions."""
     clean = opcode.strip().lower()
-    base = re.sub(r"_(?:e32|e64|sdwa|dpp.*)$", "", clean)
+    base = OPCODE_ENCODING_SUFFIX.sub("", clean)
     if base in KNOWN_RDNA2_BASE_OPCODES or clean in KNOWN_RDNA2_BASE_OPCODES:
         return True
     if base.startswith(("v_cmp_", "v_cmpx_")) or clean.startswith(("v_cmp_", "v_cmpx_")):
@@ -501,6 +505,8 @@ def is_opcode_recognized(opcode: str) -> bool:
 def classify_isa_category(opcode: str) -> str:
     """Classify instruction into RDNA 2 ISA category according to the AMD manual."""
     op = opcode.lower()
+    if OPCODE_ENCODING_SUFFIX.sub("", op.strip()) in CROSS_LANE_VALU_OPCODES:
+        return CROSS_LANE_VALU_CATEGORY
     if op.startswith("v_interp"):
         return "VINTRP (Parameter Interpolation)"
     if op.startswith("v_"):
@@ -899,6 +905,8 @@ def make_progress_bar(percentage: float, width: int = 24, unicode_blocks: bool =
 def get_implementation_target(opcode: str, category: str) -> str:
     """Identify target file and subsystem in Xbox2Windows for an opcode."""
     op = opcode.lower()
+    if category == CROSS_LANE_VALU_CATEGORY:
+        return "`tools/pixel_aot.py` (Wave lane layout, active lanes and bound control)"
     if "VALU" in category or "Vector ALU" in category:
         if any(x in op for x in ["_f32", "_f16", "_i32", "_u32"]):
             return "`tools/pixel_aot.py` (ALU dictionary / table)"

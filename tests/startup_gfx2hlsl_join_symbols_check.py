@@ -274,13 +274,18 @@ def cmp_ne(sdst, v):  # v_cmp_ne_i32_e64 sdst, 0, v
     return struct.pack('<II', 0xd4000000 | 0x85 << 16 | sdst, 128 | (256 + v) << 9)
 
 
-def exec_join(at_target, branch=EXECZ, fall=None, before=b'', read='1002007e'):
+def select_mask(mask):
+    # v_cndmask_b32_e64 v0, 0, 1, mask
+    return struct.pack('<II', 0xd5010000, 128 | (129 << 9) | (mask << 18))
+
+
+def exec_join(at_target, branch=EXECZ, fall=None, before=b'', read=select_mask(16)):
     """s[16:23] = a descriptor; exec &= (v1 != 0); branch over `fall` (default: s16 = lane mask v0 != 0) to
-    `at_target`; then `read` (default: v0 = s16) and the export. `before` goes in front of the branch."""
+    `at_target`; then `read` (default: select on s16 into v0) and the export. `before` goes in front of the branch."""
     fall = cmp_ne(16, 0) if fall is None else fall
     return (bytes.fromhex('04040cf4000000fa' '8002007e' '8002027e') + cmp_ne(30, 1) + sop2(S_AND_B64, EXEC, EXEC, 30)
             + before + struct.pack('<I', 0xbf800000 | branch << 16 | len(fall) // 4) + fall + at_target
-            + bytes.fromhex(read + EXPORT_WORDS))
+            + read + bytes.fromhex(EXPORT_WORDS))
 
 
 def exec_join_hlsl(*args, **kwargs):
@@ -306,15 +311,16 @@ def check_exec_join():
     assert [asm for *_, asm in G.decode(exec_join(and_s16))] == [
         's_load_dwordx8 s[16:23], s[8:9], 0x0', 'v_mov_b32_e32 v0, 0', 'v_mov_b32_e32 v1, 0',
         'v_cmp_ne_i32_e64 s30, 0, v1', 's_and_b64 exec, exec, s[30:31]', 's_cbranch_execz label_0x28',
-        'v_cmp_ne_i32_e64 s16, 0, v0', 's_and_b64 s[16:17], s[16:17], exec', 'v_mov_b32_e32 v0, s16',
+        'v_cmp_ne_i32_e64 s16, 0, v0', 's_and_b64 s[16:17], s[16:17], exec', 'v_cndmask_b32_e64 v0, 0, 1, s16',
         'exp mrt0 v0, v0, v0, v0 done vm', 's_endpgm'], G.decode(exec_join(and_s16))
     # Accepted: the mask ANDed with exec at the target (either operand order), and ORed with its complement.
     hlsl = exec_join_hlsl(and_s16)
     assert "        pc = ((exec & 1) == 0) ? 2 : 1;" in hlsl and '        s16 = (s16 & exec) & 1;' in hlsl, hlsl
+    exec_join_refused('v_mov_b32 data operand s16 is a lane mask', and_s16, read=bytes.fromhex('1002007e'))
     swapped, orn2 = exec_join_hlsl(sop2(S_AND_B64, 16, EXEC, 16)), exec_join_hlsl(sop2(S_ORN2_B64, 16, 16, EXEC))
     assert '        s16 = (exec & s16) & 1;' in swapped and '        s16 = (s16 | ~exec) & 1;' in orn2
     # exec as the destination: the same statement, and the lane stays off on the skipping edge.
-    assert '        exec = (s16 & exec) & 1;' in exec_join_hlsl(sop2(S_AND_B64, EXEC, 16, EXEC), read='8002007e')
+    assert '        exec = (s16 & exec) & 1;' in exec_join_hlsl(sop2(S_AND_B64, EXEC, 16, EXEC), read=bytes.fromhex('8002007e'))
     # The emitted right-hand sides with exec bit 0, the only case in which the variable s16 may not hold the
     # register: every word of s16 gives 0 for the AND and 1 for the OR with the complement.
     def rhs(text):
@@ -324,7 +330,7 @@ def check_exec_join():
         for text, want in ((hlsl, 0), (swapped, 0), (orn2, 1)):
             assert eval(rhs(text), {'s16': word, 'exec': 0}) == want, (rhs(text), word)
     # Another destination: the result is read, and the source stays joined for the read after it.
-    assert '        s32 = (s16 & exec) & 1;' in exec_join_hlsl(sop2(S_AND_B64, 32, 16, EXEC), read='2002007e')  # v0 = s32
+    assert '        s32 = (s16 & exec) & 1;' in exec_join_hlsl(sop2(S_AND_B64, 32, 16, EXEC), read=select_mask(32))
     exec_join_refused(JOINED_S16, sop2(S_AND_B64, 32, 16, EXEC))
     # Refused, each for one missing piece of the argument:
     # the skipping branch is not s_cbranch_execz, so exec says nothing about the edge;
@@ -340,7 +346,7 @@ def check_exec_join():
         exec_join_refused(JOINED_S16, sop2(op, 16, src0, src1))
     # the fall-through leaves a constant, not a plain run-time number (s_mov_b32 s16, 3);
     exec_join_refused(JOINED_S16, and_s16, fall=bytes.fromhex('830390be'))
-    # a plain read at the target;
+    # a read at the target without an absorbing operation;
     exec_join_refused(JOINED_S16, b'')
     # the branch into the target is backward (L: and; s_cbranch_execz L), only forward edges are absorbed;
     backward = and_s16 + sopp(EXECZ, -2)

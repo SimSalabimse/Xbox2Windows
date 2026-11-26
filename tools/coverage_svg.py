@@ -104,7 +104,23 @@ def group(name, counts, x, y, w, h):
     return "".join(parts) + "</svg>", labelled
 
 
+def _validate_counts(covered, total, scope: str) -> None:
+    if (
+        isinstance(covered, bool)
+        or not isinstance(covered, int)
+        or isinstance(total, bool)
+        or not isinstance(total, int)
+    ):
+        raise TypeError(f"{scope} counts must be integers")
+    if total < 0 or covered < 0:
+        raise ValueError(f"{scope} counts must be non-negative")
+    if covered > total:
+        raise ValueError(f"{scope} covered count ({covered}) must not exceed total ({total})")
+
+
 def render(m, source):
+    if not isinstance(source, str) or not source.strip():
+        raise ValueError("--source must not be empty")
     if not isinstance(m, dict):
         raise TypeError("coverage root must be a JSON object")
     rows = [text(20, 34, "Instruction-form coverage", 20, bold=True), text(20, 56, NOTE, 12, MUTED),
@@ -119,6 +135,7 @@ def render(m, source):
         groups = r["groups"]
         if not isinstance(blocked, list) or not isinstance(groups, dict):
             raise TypeError(f"{key} entry has invalid blocked_by_skip or groups")
+        _validate_counts(r["covered"], r["total"], key)
         held = {}
         for form in blocked:
             if not isinstance(form, str):
@@ -137,8 +154,7 @@ def render(m, source):
                 raise TypeError(f"{key}.{g} must be a JSON object")
             total = v["total"]
             covered = v["covered"]
-            if total < 0 or covered < 0:
-                raise ValueError(f"{key}.{g} counts must be non-negative")
+            _validate_counts(covered, total, f"{key}.{g}")
             if total > 0:
                 items.append((g, total))
         items.sort(key=lambda kv: -kv[1])
@@ -180,6 +196,35 @@ def _write_atomic(path: Path, content: str) -> None:
         raise
 
 
+def _same_path(left: Path, right: Path) -> bool:
+    if left == right:
+        return True
+    if left.exists() and right.exists() and left.samefile(right):
+        return True
+    try:
+        return left.resolve() == right.resolve()
+    except OSError:
+        return False
+
+
+def _validate_paths(coverage: Path, output: Path) -> None:
+    if not coverage.exists():
+        raise FileNotFoundError(f"coverage file not found: {coverage}")
+    if coverage.is_dir():
+        raise IsADirectoryError(f"coverage path is a directory: {coverage}")
+    if not coverage.is_file():
+        raise ValueError(f"coverage path must be a regular file: {coverage}")
+    if output.is_symlink():
+        raise ValueError(f"output path must not be a symbolic link: {output}")
+    if output.exists() and output.is_dir():
+        raise IsADirectoryError(f"output path is an existing directory: {output}")
+    for parent in output.parents:
+        if (parent.exists() or parent.is_symlink()) and not parent.is_dir():
+            raise ValueError(f"output parent path is not a directory: {parent}")
+    if _same_path(output, coverage):
+        raise ValueError(f"output path must not match input path: {output}")
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("coverage", type=Path, help="JSON written by form_coverage.py --json")
@@ -187,10 +232,9 @@ def main(argv=None) -> int:
     parser.add_argument("--source", required=True, help="commit, OS build and adapter of the measured run")
     args = parser.parse_args(argv)
     try:
-        coverage_path = args.coverage.resolve()
-        output_path = args.output.resolve()
-        if output_path == coverage_path:
-            raise ValueError(f"output path must not match input path: {args.output}")
+        if not args.source.strip():
+            raise ValueError("--source must not be empty")
+        _validate_paths(args.coverage, args.output)
         svg = render(json.loads(args.coverage.read_text(encoding="utf-8")), args.source)
         _write_atomic(args.output, svg)
     except (OSError, ValueError, KeyError, TypeError) as exc:

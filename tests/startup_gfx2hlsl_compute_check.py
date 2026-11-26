@@ -34,6 +34,10 @@ reads the read buffer at that index and stores to its own destination:
 - case G reads two independently offset LDS dwords with the address in the first destination VGPR.
 - cases L-uint and L-unorm use the same formatted load with native descriptor stride and word 3 supplied by the
   harness. The descriptor selects unaligned UINT16 pairs or an UNORM8 field and permutes the outputs.
+- cases O-dword and O-shift store in the `off` form (no VGPR address), so every lane of a group writes the same
+  address. O-dword: 8 lanes per group store key ^ group ID at byte 4 * group + 8 (SGPR soffset plus immediate).
+  O-shift: 32 lanes per group store (group ID, the (key, stride) pair shifted right by 4, 0) as four words at
+  byte 16 * group, the shape of a 64-bit shift of a scalar pair.
 
 The dispatch runs on a plain D3D12 device (the stand-in has no slot-67 path yet). The root signature is the runner's:
 root SRV t0 (read buffer), root UAV u0 (writable buffer) and 16 root constants at b0, which match the translation's
@@ -412,6 +416,7 @@ CASES = {
 
 # Single instructions the controls splice into case A before its store, recorded from llvm-mc 15.
 STORE_A = WORDS_A.index(bytes.fromhex('001070e004050480'))
+SCC_LANE_SELECT = 'v_cndmask_b32_e64 v5, 0, 1, s20'
 SPLICE = {
     's_cmp_lt_u32 s7, 4': '07840abf',
     's_and_b32 s13, s13, 0xc000ffff': '0dff0d87ffff00c0',
@@ -422,7 +427,7 @@ SPLICE = {
     's_cmov_b32 s20, 1': '810594be',
     's_cmov_b64 s[20:21], s[4:5]': '040694be',
     's_cmovk_i32 s20, 3': '030014b1',
-    's_cbranch_scc0 1': '010084bf',
+    's_cbranch_scc0 2': '020084bf',
     's_cbranch_scc1 1': '010085bf',
     's_cbranch_vccz 1': '010086bf',
     'v_mov_b32 v3, 0': '8002067e',
@@ -441,6 +446,7 @@ SPLICE = {
     's_add_u32 s20, s7, 1': '07811480',
     's_or_b32 exec_lo, exec_lo, s0': '7e007e88',
     'v_mov_b32 v5, s20': '14020a7e',
+    SCC_LANE_SELECT: '050001d580025100',
     's_mov_b32 s21, exec_lo': '7e0395be',
     's_mov_b32 exec_lo, vcc_lo': '6a03febe',
     's_mov_b32 exec_lo, s21': '1503febe',
@@ -482,11 +488,22 @@ SPLICE = {
     's_mov_b32 s19, s31': '1f0393be',
     's_mov_b32 s17, s29': '1d0391be',
     's_cbranch_scc1 2': '020085bf',
+    'buffer_store_dword v5, off, s[16:19], 0': '000070e000050480',
+    'buffer_store_dword v5, off, s[16:19], s20 offset:8': '080070e000050414',
+    'buffer_store_dwordx2 v[5:6], off, s[16:19], 0': '000074e000050480',
+    'v_lshrrev_b64 v[5:6], 4, s[20:21]': '050000d784280000',
+    'v_lshrrev_b64 v[5:6], 4, v[3:4]': '050000d784060200',
+    's_cbranch_execz 4': '040088bf',
 }
 
 
 def splice(*lines, at=STORE_A):
     return WORDS_A[:at] + b''.join(bytes.fromhex(SPLICE[line]) for line in lines) + WORDS_A[at:]
+
+
+def replace_store(*lines):
+    """Case A with its store replaced by `lines` (the last one is the new store)."""
+    return WORDS_A[:STORE_A] + b''.join(bytes.fromhex(SPLICE[line]) for line in lines) + WORDS_A[STORE_A + 8:]
 
 
 # Case I is case A with the store descriptor's stride field cleared before the store (expected words as case A).
@@ -507,6 +524,33 @@ CASES['I-raw'] = (SOURCE_A.replace('buffer_store_dword', '\n'.join((*RAW_CONVERS
 # fresh 24-thread group. Ignoring FF1 leaves a different word at every i > 0.
 CASES['A-ff1'] = ('s_ff1_i32_b32 s5, exec_lo\n' + SOURCE_A,
                   bytes.fromhex('7e1385be') + WORDS_A, *CASES['A'][2:])
+
+# `off` stores: the words are hand-assembled from the RDNA 2 SOP1/SOP2/VOP1/VOP3/MUBUF field layouts (the binary
+# mode reassembles them with llvm-mc); check_hand_words decodes them with the repository disassembler.
+OFF_PROLOGUE = 's_mov_b32 s10, s6\ns_mov_b32 s11, 0\ns_load_dwordx8 s[12:19], s[10:11], 0x0\ns_waitcnt lgkmcnt(0)\n'
+OFF_PROLOGUE_WORDS = '06038abe' '80038bbe' '05030cf4000000fa' '7fc08cbf'
+SOURCE_O_DWORD = OFF_PROLOGUE + """\
+s_lshl_b32 s20, s7, 2
+s_xor_b32 s21, s4, s7
+v_mov_b32 v5, s21
+buffer_store_dword v5, off, s[16:19], s20 offset:8
+s_endpgm
+"""
+WORDS_O_DWORD = bytes.fromhex(OFF_PROLOGUE_WORDS + '0782148f' '04071589' '15020a7e' '080070e000050414' '000081bf')
+SOURCE_O_SHIFT = OFF_PROLOGUE + """\
+s_mov_b32 s20, s4
+s_mov_b32 s21, s5
+s_lshl_b32 s22, s7, 4
+v_lshrrev_b64 v[5:6], 4, s[20:21]
+v_mov_b32 v4, s7
+v_mov_b32 v7, 0
+buffer_store_dwordx4 v[4:7], off, s[16:19], s22
+s_endpgm
+"""
+WORDS_O_SHIFT = bytes.fromhex(OFF_PROLOGUE_WORDS + '040394be' '050395be' '0784168f' '050000d784280000' '0702087e'
+                              '80020e7e' '000078e000040416' '000081bf')
+CASES['O-dword'] = (SOURCE_O_DWORD, WORDS_O_DWORD, USER7 | TGID_X | tidig(1), (8, 1, 1), (4, 1, 1))
+CASES['O-shift'] = (SOURCE_O_SHIFT, WORDS_O_SHIFT, USER7 | TGID_X | tidig(1), (32, 1, 1), (4, 1, 1))
 
 
 def root_blob(constants=2, table_range=False):
@@ -544,6 +588,15 @@ def expected(name):
     if name in ('I', 'I-raw'):
         return expected('A')
     out = [SENTINEL] * WORDS
+    if name == 'O-dword':
+        for group in range(4):
+            out[2 + group] = KEY ^ group
+        return out
+    if name == 'O-shift':
+        pair = (STRIDE << 32 | KEY) >> 4
+        for group in range(4):
+            out[4 * group:4 * group + 4] = [group, pair & MASK, pair >> 32, 0]
+        return out
     _, _, _, local, groups = CASES[name]
     if name in L_WORD3:
         data = formatted_input()
@@ -694,11 +747,10 @@ def check_mbcnt():
 
 def check_descriptor_scc():
     # Case A loads the input descriptor into s[12:15] and stores through s[16:19].
-    # Put the condition into the stored value, or let the branch skip the move.
+    # Read s20's lane bit into the stored value. The SCC branches skip both dwords of the lane select.
     compare = 's_cmp_lt_u32 s7, 4'
     mask = 's_and_b32 s13, s13, 0xc000ffff'
     select = 's_cselect_b32 s20, 1, 0'
-    move = 'v_mov_b32 v5, s20'
 
     def pipeline(*lines):
         return translate('A', code=splice(*lines))
@@ -707,20 +759,20 @@ def check_descriptor_scc():
         refused('scc from descriptor data', lambda: pipeline(*lines))
 
     for reader in (select, 's_cselect_b64 s[20:21], 1, 0', 's_cmov_b32 s20, 1', 's_cmov_b64 s[20:21], s[4:5]',
-                   's_cmovk_i32 s20, 3', 's_cbranch_scc0 1', 's_cbranch_scc1 1'):
-        rejected(compare, mask, reader, move)
-        assert 'uav 0 table 1 16' in pipeline(mask, compare, reader, move).manifest()
-    rejected(compare, 's_add_u32 s13, s13, 1', select, move)
-    assert 's20 = scc ?' in pipeline(compare, 's_mov_b32 s13, s13', select, move).hlsl_cs()
-    assert 's20 = scc ?' in pipeline(mask, 's_and_b32 s22, s7, 1', select, move).hlsl_cs()
-    assert 's20 = scc ?' in pipeline(mask, 's_and_saveexec_b32 s0, vcc_lo', select, move).hlsl_cs()
+                   's_cmovk_i32 s20, 3', 's_cbranch_scc0 2', 's_cbranch_scc1 2'):
+        rejected(compare, mask, reader, SCC_LANE_SELECT)
+        assert 'uav 0 table 1 16' in pipeline(mask, compare, reader, SCC_LANE_SELECT).manifest()
+    rejected(compare, 's_add_u32 s13, s13, 1', select, SCC_LANE_SELECT)
+    assert 's20 = scc ?' in pipeline(compare, 's_mov_b32 s13, s13', select, SCC_LANE_SELECT).hlsl_cs()
+    assert 's20 = scc ?' in pipeline(mask, 's_and_b32 s22, s7, 1', select, SCC_LANE_SELECT).hlsl_cs()
+    assert 's20 = scc ?' in pipeline(mask, 's_and_saveexec_b32 s0, vcc_lo', select, SCC_LANE_SELECT).hlsl_cs()
 
     # A conditional edge can bypass the fresh comparison. A back edge can carry
     # the descriptor-derived flag to a read that comes first in program order.
-    rejected(mask, 's_cbranch_vccz 1', compare, select, move)
+    rejected(mask, 's_cbranch_vccz 1', compare, select, SCC_LANE_SELECT)
     rejected(compare, 'v_mov_b32 v3, 0', select, mask, 'v_add_nc_u32 v3, 1, v3',
-             'v_cmp_gt_u32 vcc_lo, 2, v3', 's_cbranch_vccnz 65530', move)
-    assert 's20 = scc ?' in pipeline(compare, 's_branch 2', mask, select, move).hlsl_cs()
+             'v_cmp_gt_u32 vcc_lo, 2, v3', 's_cbranch_vccnz 65530', SCC_LANE_SELECT)
+    assert 's20 = scc ?' in pipeline(compare, 's_branch 2', mask, select, SCC_LANE_SELECT).hlsl_cs()
 
 
 def check_lds():
@@ -870,6 +922,62 @@ def check_formatted_pointer_copy():
     assert switch in translate('L-uint', code=skip_one + bytes.fromhex('000080bf') + copy + high + target + load + tail).hlsl_cs()
 
 
+def check_hand_words():
+    """Hand-assembled words decode, with the repository disassembler, to the source line they stand for."""
+    def decoded(words, at=0):
+        n, _, text, _ = G.D.decode_instruction(words, at)
+        return n, text.replace('_e32 ', ' ')
+    for line in ('buffer_store_dword v5, off, s[16:19], 0', 'buffer_store_dword v5, off, s[16:19], s20 offset:8',
+                 'buffer_store_dwordx2 v[5:6], off, s[16:19], 0', 'v_lshrrev_b64 v[5:6], 4, s[20:21]',
+                 'v_lshrrev_b64 v[5:6], 4, v[3:4]'):
+        assert decoded(bytes.fromhex(SPLICE[line]))[1] == line, (line, decoded(bytes.fromhex(SPLICE[line])))
+    # A branch decodes to its target: 4 bytes past the branch plus 4 bytes per dword of the simm16.
+    assert decoded(bytes.fromhex(SPLICE['s_cbranch_execz 4']))[1] == 's_cbranch_execz label_0x14'
+    for name in ('O-dword', 'O-shift'):
+        source, words = CASES[name][:2]
+        at, texts = 0, []
+        while at < len(words):
+            n, text = decoded(words, at)
+            texts.append(text)
+            at += n
+        assert texts == source.splitlines(), (name, texts)
+
+
+def check_off_stores():
+    """The `off` store (MUBUF offen = idxen = 0): every lane writes the same address, accepted with uniform data."""
+    def lines(*code):
+        return translate('A', code=replace_store(*code)).hlsl_cs().splitlines()
+    hlsl = lines('v_mov_b32 v5, s20', 'buffer_store_dword v5, off, s[16:19], 0')
+    at = hlsl.index('    a = (0) & 0xfffffffcu;')
+    assert hlsl[at + 1] == '    u0.Store(a, v5);', hlsl[at:at + 2]
+    hlsl = lines('v_mov_b32 v5, s20', 'buffer_store_dword v5, off, s[16:19], s20 offset:8')
+    at = hlsl.index('    a = (s20 + 8) & 0xfffffffcu;')
+    assert hlsl[at + 1] == '    u0.Store(a, v5);', hlsl[at:at + 2]
+    # A 64-bit shift of scalar sources is uniform in both halves.
+    hlsl = lines('v_lshrrev_b64 v[5:6], 4, s[20:21]', 'buffer_store_dwordx2 v[5:6], off, s[16:19], 0')
+    at = hlsl.index('    a = (0) & 0xfffffffcu;')
+    assert hlsl[at + 1] == '    u0.Store2(a, uint2(v5, v6));', hlsl[at:at + 2]
+    # Past the entry block (inside a guard that skips per lane) the recomputable expression carries the proof.
+    guard = ['v_cmp_gt_u32 vcc_lo, 1, v0', 's_and_saveexec_b32 s0, vcc_lo']
+    hlsl = lines(*guard, 's_cbranch_execz 3', 'v_mov_b32 v5, s20', 'buffer_store_dword v5, off, s[16:19], 0',
+                 's_or_b32 exec_lo, exec_lo, s0')
+    assert 'if (exec & 1) u0.Store(a, v5);' in [line.strip() for line in hlsl], hlsl
+    hlsl = lines(*guard, 's_cbranch_execz 4', 'v_lshrrev_b64 v[5:6], 4, s[20:21]',
+                 'buffer_store_dwordx2 v[5:6], off, s[16:19], 0', 's_or_b32 exec_lo, exec_lo, s0')
+    assert 'if (exec & 1) u0.Store2(a, uint2(v5, v6));' in [line.strip() for line in hlsl], hlsl
+    # The saveexec between the definition and the store ends the proof (conservative: these lanes are a subset).
+    refused('buffer store off with data not proven wave-uniform', lambda: lines(
+        'v_mov_b32 v5, s20', *guard, 's_cbranch_execz 3', 's_waitcnt lgkmcnt(0)',
+        'buffer_store_dword v5, off, s[16:19], 0', 's_or_b32 exec_lo, exec_lo, s0'))
+    # Negative controls: per-lane data (a shift of the thread index; the per-lane load), and uniform data written
+    # before an EXEC change, where the entry-block proof no longer knows which lanes store.
+    for code in (('v_lshrrev_b64 v[5:6], 4, v[3:4]', 'buffer_store_dwordx2 v[5:6], off, s[16:19], 0'),
+                 ('buffer_store_dword v5, off, s[16:19], 0',),
+                 ('v_mov_b32 v5, s20', 'v_cmp_gt_u32 vcc_lo, 3, v0', 's_mov_b32 exec_lo, vcc_lo',
+                  'buffer_store_dword v5, off, s[16:19], 0')):
+        refused('buffer store off with data not proven wave-uniform', lambda code=code: lines(*code))
+
+
 def check_controls():
     ff1 = bytes.fromhex('7e1385be')
     end = bytes.fromhex('000081bf')
@@ -922,7 +1030,7 @@ def check_controls():
     refused('numeric use of s7', lambda: translate('A', rsrc2=(8 << 1) | tidig(3)).hlsl_cs())
     # Store forms outside this slice (the store is the dword at +0x60 of WORDS_A: offen, soffset 0x80, s[16:19]).
     store = '001070e004050480'
-    for word, fragment in (('000070e004050480', 'offen address form'),     # off: no offen
+    for word, fragment in (('000070e004050480', 'not proven wave-uniform'),  # off: one address, per-lane data
                            ('002070e004050480', 'modifier idxen'),         # idxen, no offen
                            ('005070e004050480', 'modifier glc'),           # glc offen
                            ('001070e004050380', 'used for a load and a store')):  # store through the read descriptor
@@ -935,6 +1043,11 @@ def check_controls():
             assert str(reason) == text, str(reason)
         else:
             raise AssertionError('graphics store accepted')
+    check_hand_words()
+    check_off_stores()
+    for name in ('O-dword', 'O-shift'):
+        hlsl = translate(name).hlsl_cs().splitlines()
+        assert any('u0.Store' in line for line in hlsl), (name, hlsl)
     # A register soffset is added to the address.
     hlsl = translate('A', code=patch(WORDS_A, store, '001070e004050414')).hlsl_cs()
     assert '    a = (v4 + s20 + 0) & 0xfffffffcu;' in hlsl.splitlines(), hlsl

@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 RUN_PS1 = Path(__file__).resolve().parent.parent / "tools" / "startup" / "run.ps1"
@@ -295,6 +296,41 @@ def mutants_of(script):
     return {name: None if mutant == lines else "\n".join(mutant) + "\n" for name, mutant in mutants.items()}
 
 
+def shell_failures(shell, script, tmp):
+    """Every failure for one shell (None: the text-only checks), in a fixed order."""
+    failures = []
+    name = Path(shell).stem.lower() if shell else "text"
+    bad = run_problems(shell, script, tmp, False)
+    failures += [f"{name}: {item}" for item in bad]
+    if bad:
+        return failures
+    for label, mutant in mutants_of(script).items():
+        if mutant is None or not run_problems(shell, mutant, tmp, True):
+            failures.append(f"{name}: mutant '{label}' was not detected")
+    if shell:
+        # Expire the live fixture tree after HasExited has been read. The launcher's
+        # own taskkill then hits the missing PID and writes native stderr.
+        kill = f"& {STOP} 2>&1 | Out-Null"
+        expire = kill + '\nif (-not $translator.WaitForExit(5000)) { throw "fixture watcher still alive" }\n'
+        race = script.replace(kill, expire + kill)
+        if race == script:
+            failures.append(f"{name}: could not exercise the watcher exit during cleanup")
+        else:
+            failures += [f"{name}: watcher exit during cleanup: {item}"
+                         for item in run_case(shell, race, 7, tmp, translate=True)]
+        stopless = "\n".join(line for line in script.splitlines() if STOP not in line) + "\n"
+        parent_only = script.replace(STOP, "Stop-Process -Id $translator.Id -Force")
+        for mutant, who in ((stopless, "translator"), (parent_only, "translator's child process")):
+            problems = run_case(shell, mutant, 7, tmp, translate=True)
+            if f"-Translate: the {who} was still running after run.ps1 exited" not in problems:
+                failures.append(f"{name}: expected a surviving {who}, got {problems}")
+    else:
+        for removed in (' -and -not $translator.HasExited', '$ErrorActionPreference = "Continue"', '/T '):
+            if not text_problems(script.replace(removed, '')):
+                failures.append(f"text: removing {removed.strip()} escaped the cleanup check")
+    return failures
+
+
 def main():
     if sys.argv[1:] not in ([], ["--text-only"]):
         sys.exit("usage: startup_run_ps1_check.py [--text-only]")
@@ -311,36 +347,11 @@ def main():
             mode = "text only: no PowerShell found"
     failures = []
     with tempfile.TemporaryDirectory() as tmp:
-        for shell in shells or [None]:
-            name = Path(shell).stem.lower() if shell else "text"
-            bad = run_problems(shell, script, tmp, False)
-            failures += [f"{name}: {item}" for item in bad]
-            if bad:
-                continue
-            for label, mutant in mutants_of(script).items():
-                if mutant is None or not run_problems(shell, mutant, tmp, True):
-                    failures.append(f"{name}: mutant '{label}' was not detected")
-            if shell:
-                # Expire the live fixture tree after HasExited has been read. The launcher's
-                # own taskkill then hits the missing PID and writes native stderr.
-                kill = f"& {STOP} 2>&1 | Out-Null"
-                expire = kill + '\nif (-not $translator.WaitForExit(5000)) { throw "fixture watcher still alive" }\n'
-                race = script.replace(kill, expire + kill)
-                if race == script:
-                    failures.append(f"{name}: could not exercise the watcher exit during cleanup")
-                else:
-                    failures += [f"{name}: watcher exit during cleanup: {item}"
-                                 for item in run_case(shell, race, 7, tmp, translate=True)]
-                stopless = "\n".join(line for line in script.splitlines() if STOP not in line) + "\n"
-                parent_only = script.replace(STOP, "Stop-Process -Id $translator.Id -Force")
-                for mutant, who in ((stopless, "translator"), (parent_only, "translator's child process")):
-                    problems = run_case(shell, mutant, 7, tmp, translate=True)
-                    if f"-Translate: the {who} was still running after run.ps1 exited" not in problems:
-                        failures.append(f"{name}: expected a surviving {who}, got {problems}")
-            else:
-                for removed in (' -and -not $translator.HasExited', '$ErrorActionPreference = "Continue"', '/T '):
-                    if not text_problems(script.replace(removed, '')):
-                        failures.append(f"text: removing {removed.strip()} escaped the cleanup check")
+        # Each shell works in its own scratch dirs, so PowerShell 5.1 and 7 run side by side.
+        with ThreadPoolExecutor(max_workers=len(shells) or 1) as pool:
+            jobs = [pool.submit(shell_failures, shell, script, tmp) for shell in shells or [None]]
+            for job in jobs:
+                failures += job.result()
     for item in failures:
         print("FAIL", item)
     print(f"startup run.ps1 exit code: {len(failures)} failed ({mode})")
