@@ -5537,7 +5537,12 @@ class Stage:
         return None
 
     def op_s_ff1_i32_b64(self, ops, mods):
-        """Find first set bit across a 64-bit SGPR pair; SCC unchanged (#2022 Item F)."""
+        """Find first set bit of a 64-bit immediate; SCC unchanged (#2022 Item F).
+
+        A 32-bit SOP1 literal or inline constant zero-extends to 64 bits (high word 0).
+        Live SGPR-pair sources are refused here: that register-pair lowering is owned by
+        open #2072 (`s_ff1_i32_b64` among the scalar bit-scan forms).
+        """
         if mods or len(ops) != 2:
             raise Unsupported('s_ff1_i32_b64 with %d operands, expected 2 unmodified' % len(ops))
         dst = reg_range(ops[0])
@@ -5545,33 +5550,17 @@ class Stage:
             raise Unsupported('s_ff1_i32_b64 destination %s' % ops[0])
         if self.is_lane_mask(ops[0]) or dst[1] in self.masks:
             raise Unsupported('s_ff1_i32_b64 on a lane mask')
-        src = reg_range(ops[1])
-        if not src or src[0] != 's' or src[2] != src[1] + 1 or src[1] % 2 or src[2] > 105:
-            raise Unsupported('s_ff1_i32_b64 source %s' % ops[1])
-        if self.is_lane_mask(ops[1]) or src[1] in self.masks or (src[1] + 1) in self.masks:
-            raise Unsupported('s_ff1_i32_b64 on a lane mask')
-        for half in (src[1], src[1] + 1):
-            sym = self.sym.get(half)
-            if sym and sym[0] not in ('const', 'ud', 'fixed_buffer_word'):
-                raise Unsupported('s_ff1_i32_b64 on %s data' % sym[0])
-        lo_sym = self.sym.get(src[1])
-        hi_sym = self.sym.get(src[1] + 1)
-        if (lo_sym and lo_sym[0] == 'const' and hi_sym and hi_sym[0] == 'const'):
-            lo_v, hi_v = lo_sym[1] & 0xffffffff, hi_sym[1] & 0xffffffff
-            if lo_v:
-                folded = (lo_v & -lo_v).bit_length() - 1
-            elif hi_v:
-                folded = 32 + ((hi_v & -hi_v).bit_length() - 1)
-            else:
-                folded = 0xffffffff
+        imm = re.fullmatch(r'-?(0x[0-9a-fA-F]+|\d+)', ops[1])
+        if imm:
+            # Encoding: one 32-bit literal/inline; the ISA zero-extends it (hi = 0).
+            value = int(ops[1], 0) & 0xffffffff
+            folded = 0xffffffff if value == 0 else (value & -value).bit_length() - 1
             self.set_s(dst[1], '0x%08xu' % folded, ('const', folded))
             return None
-        lo, hi = self.S(src[1]), self.S(src[1] + 1)
-        # Scan the low word first; only then the high word at offset 32 (pixel_aot / Mesa).
-        expr = ('(%s != 0u ? firstbitlow(%s) : (%s != 0u ? 32u + firstbitlow(%s) : 0xffffffffu))'
-                % (lo, lo, hi, hi))
-        self.set_s(dst[1], expr)
-        return None
+        src = reg_range(ops[1])
+        if src and src[0] == 's' and src[2] == src[1] + 1:
+            raise Unsupported('s_ff1_i32_b64 of an SGPR pair (register-pair form is in open #2072)')
+        raise Unsupported('s_ff1_i32_b64 source %s' % ops[1])
 
     # ---- slot 57 mesh stage: instructions mesh_skeleton() puts in place of the group-memory exchanges ----
     def op_x2w_mesh_lane0(self, ops, mods):

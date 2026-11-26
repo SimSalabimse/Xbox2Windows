@@ -7993,14 +7993,20 @@ one. Only the low five bits of the index are used. EXEC, VCC and SGPRs tracked
 as lane masks are refused because their per-lane projections lose the other
 bits. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_s_bitcmp$' -V`.
 
-**Scalar find-first-one.** Startup translation lowers `s_ff1_i32_b32` and
-`s_ff1_i32_b64` of a general scalar to `firstbitlow` (and a lo-then-hi scan for
-the 64-bit form), matching `pixel_aot` / Mesa. The compute-entry special case
-on `exec_lo` still folds to lane 0. SCC is unchanged. Lane masks and
-descriptor-bearing sources are refused. Run
+**Scalar find-first-one.** Startup translation lowers `s_ff1_i32_b32` of a
+general scalar to `firstbitlow` (0xffffffff when the word is zero), matching
+`pixel_aot` / Mesa. The compute-entry special case on `exec_lo` still folds to
+lane 0. SCC is unchanged. Lane masks and descriptor-bearing sources are
+refused. `s_ff1_i32_b64` of a live SGPR pair is owned by open
+[#2072](https://github.com/R0Y00/Xbox2Windows/pull/2072); this slice only
+accepts a 32-bit SOP1 literal/inline, which the ISA zero-extends (high word 0),
+and folds it. Run
 `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_s_ff1$' -V`
-(or `python3 -B tests/startup_gfx2hlsl_s_ff1_check.py`). The fixture is
-CPU-only; Windows WARP/hardware draws are left for an independent retest.
+(or `python3 -B tests/startup_gfx2hlsl_s_ff1_check.py`). The `_dispatch_warp`
+/ `_dispatch_hardware` variants compile the translated `firstbitlow` into a
+compute shader and compare UAV readback for inputs 0, 1, 0x80000000 and
+0x00010000 (and the zero-extended b64 immediates) against the same reference:
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_s_ff1_dispatch_warp$' -V`.
 [Refs #2022](https://github.com/R0Y00/Xbox2Windows/issues/2022) Item F.
 
 **Scalar immediate comparisons.** The startup translator sign-extends the
