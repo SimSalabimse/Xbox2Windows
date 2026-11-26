@@ -140,6 +140,39 @@ GROUP_END = MESH.index('05000006') + 1
 PRIMITIVE_EXPORT = MESH.index('f8000941')
 
 
+def count_entry_red(*extra_words):
+    wait = MESH.index('bf8c3f70')
+    return MESH[:COUNT] + [
+        '7e0e0280',  # v_mov_b32_e32 v7, 0
+        'befe04c1',  # s_mov_b64 exec, -1
+        '7da8000d',  # v_cmpx_gt_u32_e32 s13, v0 (the proven thread index)
+        branch(0xbf88, COUNT + 3, COUNT + 5 + len(extra_words)),  # s_cbranch_execz to the first count barrier
+        '7e0e02f2',  # v_mov_b32_e32 v7, 1.0
+    ] + list(extra_words) + MESH[COUNT:wait + 1] + [
+        '7e280307',  # v_mov_b32_e32 v20, v7
+    ] + MESH[wait + 1:]
+
+
+COUNT_ENTRY = count_entry_red()
+COUNT_ENTRY_LT = mutate('7da8000d', '7da2000d', mesh=COUNT_ENTRY)
+# v_mov_b32_e32 v8, 4 before the reset, then v_cmpx_lt_u32_e32 v8, v0.
+COUNT_ENTRY_VGPRS = mutate('7da8000d', '7da20108', mesh=COUNT_ENTRY)
+COUNT_ENTRY_VGPRS = COUNT_ENTRY_VGPRS[:COUNT + 1] + ['7e100284'] + COUNT_ENTRY_VGPRS[COUNT + 1:]
+DEAD_SCALAR = '87288080'  # s_and_b32 s40, 0, 0
+COUNT_ENTRY_SCALAR = count_entry_red(DEAD_SCALAR)
+COUNT_ENTRY_CASES = (
+    ('EXEC-zero branch to the count exchange after GT', COUNT_ENTRY, lambda lane: 255 if lane < 4 else 0),
+    ('EXEC-zero branch to the count exchange after LT', COUNT_ENTRY_LT, lambda lane: 255 if lane > 4 else 0),
+    ('EXEC-zero branch to the count exchange after LT with two VGPRs', COUNT_ENTRY_VGPRS,
+     lambda lane: 255 if lane > 4 else 0),
+    ('EXEC compare with a defined VGPR other than the thread index',
+     mutate('7da8000d', '7da80e0d', mesh=COUNT_ENTRY), lambda lane: 255),  # s13 > v7 (4 > 0)
+    ('EXEC-zero branch to the count exchange over dead scalar ALU', COUNT_ENTRY_SCALAR,
+     lambda lane: 255 if lane < 4 else 0),
+)
+EXCHANGE_BRANCH_REFUSAL = 'slot 57 mesh: a branch enters or crosses a group-memory exchange'
+
+
 def joined_vertex_masks():
     pos = MESH.index('f80008cf')
     # Move the vertex narrowing after the loads so the join cannot make any export operands stale.
@@ -190,6 +223,36 @@ REFUSALS = (
     ('a branch into the count exchange',
      MESH[:COUNT] + [branch(0xbf82, COUNT, COUNT + 2)] + MESH[COUNT:],
      'slot 57 mesh: a branch enters or crosses a group-memory exchange'),
+    ('an EXEC compare with an undefined first VGPR operand',
+     mutate('7da20108', '7da20101', mesh=COUNT_ENTRY_VGPRS), EXCHANGE_BRANCH_REFUSAL),
+    ('an EXEC compare with an unmodelled entry VGPR',
+     mutate('7da8000d', '7da8020d', mesh=COUNT_ENTRY), EXCHANGE_BRANCH_REFUSAL),
+    ('no EXEC reset before the compare',
+     mutate('befe04c1', 'bf800000', 1, mesh=COUNT_ENTRY), EXCHANGE_BRANCH_REFUSAL),
+    ('an EXEC-nonzero branch to the count exchange',
+     mutate('bf880001', 'bf890001', mesh=COUNT_ENTRY), EXCHANGE_BRANCH_REFUSAL),
+    ('an EXEC write in the skipped block',
+     mutate('7e0e02f2', 'befe04c1', mesh=COUNT_ENTRY), EXCHANGE_BRANCH_REFUSAL),
+    # Replace v_mov_b32 v20, v7 after the count exchange with v_mov_b32 v20, s40.
+    ('scalar ALU in the count-entry block with a live SGPR',
+     mutate('7e280307', '7e280228', mesh=COUNT_ENTRY_SCALAR), EXCHANGE_BRANCH_REFUSAL),
+    ('scalar ALU writing VCC in the count-entry block',
+     count_entry_red('876a8080'), EXCHANGE_BRANCH_REFUSAL),  # s_and_b32 vcc_lo, 0, 0
+    ('a scalar load in the count-entry block',
+     count_entry_red('f4000a05', 'fa000000'), EXCHANGE_BRANCH_REFUSAL),  # s_load_dword s40, s[10:11], 0
+    ('dead scalar ALU in a different EXEC-zero block',
+     vertex_red('7e0e02f2 bf880001 ' + DEAD_SCALAR),
+     'slot 57 mesh: s_cbranch_execz skips code with effects outside active lanes'),
+    ('a v_cmpx in the skipped block',
+     mutate('7e0e02f2', '7da8000d', mesh=COUNT_ENTRY), EXCHANGE_BRANCH_REFUSAL),
+    ('an EXEC-zero branch over the count exchange',
+     mutate('bf880001', branch(0xbf88, COUNT + 3, POST_COUNT + 5), mesh=COUNT_ENTRY), EXCHANGE_BRANCH_REFUSAL),
+    ('an EXEC-zero branch past the start of the count exchange',
+     mutate('bf880001', 'bf880002', mesh=COUNT_ENTRY), EXCHANGE_BRANCH_REFUSAL),
+    ('a branch that bypasses the EXEC reset',
+     COUNT_ENTRY[:COUNT] + ['bf850002'] + COUNT_ENTRY[COUNT:], EXCHANGE_BRANCH_REFUSAL),
+    ('a branch into the skipped count-entry block',
+     COUNT_ENTRY[:COUNT] + ['bf850004'] + COUNT_ENTRY[COUNT:], EXCHANGE_BRANCH_REFUSAL),
     ('a branch over the group-index exchange', MESH[:1] + [branch(0xbf82, 1, GROUP_END + 1)] + MESH[1:],
      'slot 57 mesh: a branch enters or crosses a group-memory exchange'),
     # s_branch .post_count replaces s_waitcnt lgkmcnt(0) between the exchanges.
@@ -326,7 +389,7 @@ def controls():
         expect('outputs follow the allocation',
                all(body.index(line) > body.index(want[-1]) for line in body if 'verts[tid]' in line or 'tris[tid]' in line), True)
     prefix = MESH[:1] + 'bf008080 bf850001 bf800000 bf800000'.split() + MESH[1:]
-    for what, mesh, _ in BRANCH_CASES + (('SCC branch before the group-index exchange', prefix, None),):
+    for what, mesh, _ in BRANCH_CASES + COUNT_ENTRY_CASES + (('SCC branch before the group-index exchange', prefix, None),):
         with tempfile.TemporaryDirectory() as tmp:
             key, result = request(tmp, mesh)
             expect(what + ' translates', result, 'ok')
@@ -567,7 +630,7 @@ def draw(dxc, renderer, adapter, publisher=None):
                 expect('a reference with one wrong pixel fails',
                        (r.returncode, 'pixels=1024 mismatches=1' in r.stdout, 'Draw reference mismatch' in r.stderr),
                        (1, True, True))
-        for what, mesh, red in BRANCH_CASES:
+        for what, mesh, red in BRANCH_CASES + COUNT_ENTRY_CASES:
             key, result = request(tmp, mesh)
             expect(what + ' translates and compiles', result, 'ok')
             if result != 'ok':

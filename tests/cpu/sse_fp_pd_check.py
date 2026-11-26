@@ -4,7 +4,10 @@ ADDPD, SUBPD, MULPD, DIVPD, MINPD, MAXPD and SQRTPD (xmm and aligned m128 source
 through the translator in the default control word and under all sixteen combinations of MXCSR rounding
 mode, DAZ and FTZ, each against the exact reference in sse_fp_pd_ref.py. CMPPD (predicates 0..7, xmm and
 aligned m128 sources) gets the same treatment against the predicate rules of that reference. The packed
-single checks in sse_fp_check.py provide the buffer, driver and encoding helpers."""
+single checks in sse_fp_check.py provide the buffer, driver and encoding helpers.
+
+CTest runs the parts (differential, modes, cmp_differential, cmp_modes, rejections) as separate cases in
+parallel. Passing no part name after the four paths still runs all of them serially, for a direct run."""
 
 from pathlib import Path
 import random
@@ -481,9 +484,17 @@ def check_rejections(original_path):
 
 
 if __name__ == "__main__":
-    native_dll, lifted_dll, altered_dll, harness_dll = sys.argv[1:5]
-    check_differential(native_dll, lifted_dll, altered_dll)
-    check_modes(native_dll, lifted_dll, harness_dll)
-    check_cmp_differential(native_dll, lifted_dll, altered_dll)
-    check_cmp_modes(native_dll, lifted_dll, harness_dll)
-    check_rejections(native_dll)
+    native_dll, lifted_dll, altered_dll, harness_dll, *selected = sys.argv[1:]
+    # CTest runs the parts as separate cases; no part runs them all in the original order.
+    parts = {
+        "differential": lambda: check_differential(native_dll, lifted_dll, altered_dll),
+        "modes": lambda: check_modes(native_dll, lifted_dll, harness_dll),
+        "cmp_differential": lambda: check_cmp_differential(native_dll, lifted_dll, altered_dll),
+        "cmp_modes": lambda: check_cmp_modes(native_dll, lifted_dll, harness_dll),
+        "rejections": lambda: check_rejections(native_dll),
+    }
+    unknown = [name for name in selected if name not in parts]
+    if unknown:
+        raise ValueError(f"unknown part {unknown}; choose from {sorted(parts)}")
+    for name in selected or parts:
+        parts[name]()

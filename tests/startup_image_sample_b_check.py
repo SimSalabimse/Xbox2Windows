@@ -1,4 +1,4 @@
-"""Biased implicit-LOD image_sample_b in tools/startup/gfx2hlsl.py (pixel stage only).
+"""Biased implicit-LOD image_sample_b in tools/startup/gfx2hlsl.py (pixel stage only; M200-01 B).
 
   (no arguments)                       translation controls, pure Python
   binary <llvm-mc>                     reassemble every fixture source and compare it with the recorded words
@@ -12,7 +12,9 @@ the bias being "One Dword float": the bias is the FIRST address register and the
 IntrinsicsAMDGPU.td lists the extra argument of AMDGPUSample_b as llvm_anyfloat_ty "bias" and MIMGInstructions.td gives
 IMAGE_SAMPLE_B the gfx10 opcode 0x25. HLSL Texture.SampleBias(sampler, location, bias) adds the bias to the
 implicit mip level, so the lowering is tex.SampleBias(smp, uv, bias). D3D documents the bias range as -16.0 to 15.99;
-the ISA text states no hardware clamp, so values outside that range are an unverified difference.
+the ISA text states no hardware clamp, so values outside that range are an unverified difference. Accepted under the
+entry EXEC mask and wave-uniform control flow even after a uniform (scc) join or later loop; divergent EXEC or a
+vcc/exec-conditioned branch before the sample stays refused.
 
 Each fixture is a source-built gfx1013 pixel stage: v0 = bias, v1 = u = 0.75, v2 = v = 0.25 and v3 = the slice (root
 constant 1, s9). Constant coordinates have no derivatives (the implicit LOD would be log2(0) and the bias is lost), so
@@ -386,9 +388,10 @@ def texel_cell(mip, slice_index):
 
 def check_guards():
     """The stage guard and the address-count guard are decided before any state is read, so a bare stage reaches them."""
-    def call(coords, kind='ps', exec_known=True, blocks=()):
+    def call(coords, kind='ps', exec_known=True, blocks=(), uniform_cf=True):
         bare = G.Stage.__new__(G.Stage)
         bare.kind, bare.exec_known, bare.blocks = kind, exec_known, list(blocks)
+        bare.uniform_cf = uniform_cf
         bare.image(['v5', coords, 's0'], ['dim:SQ_RSRC_IMG_2D', 'dmask:0x1'], 'b')
 
     for coords, count in (('[v1, v2]', 2), ('[v1, v2, v3, v4]', 4)):
@@ -399,13 +402,23 @@ def check_guards():
         else:
             raise AssertionError('image_sample_b accepted %d address registers' % count)
     for label, kwargs in (('vertex stage', {'kind': 'vs'}), ('compute stage', {'kind': 'cs'}),
-                          ('exec modified', {'exec_known': False}), ('after a branch', {'blocks': [object()]})):
+                          ('exec modified', {'exec_known': False}),
+                          ('divergent CF', {'uniform_cf': False})):
         try:
             call('[v1, v2, v3]', **kwargs)
         except G.Unsupported as error:
             assert 'image_sample_b needs implicit derivatives' in str(error), (label, error)
         else:
             raise AssertionError('image_sample_b accepted: %s' % label)
+    # A prior join (non-empty blocks) is fine while EXEC and wave-uniform CF hold (M200-01 B).
+    try:
+        call('[v1, v2, v3]', blocks=[object()], uniform_cf=True)
+    except G.Unsupported as error:
+        raise AssertionError('image_sample_b refused with entry EXEC after a uniform join: %s' % error)
+    except AttributeError:
+        pass
+    else:
+        raise AssertionError('image_sample_b after a join returned without needing a pipeline')
     # The legal case gets past both guards: the bare stage then stops where it needs a pipeline.
     try:
         call('[v1, v2, v3]')
@@ -413,7 +426,34 @@ def check_guards():
         raise AssertionError('legal image_sample_b refused: %s' % error)
     except AttributeError:
         pass
-    print('refused: wrong address count, vertex and compute stages, modified exec, code after a branch')
+    else:
+        raise AssertionError('legal image_sample_b returned without needing a pipeline')
+    print('refused: wrong address count, vertex and compute stages, modified exec, divergent CF; '
+          'join with entry EXEC and uniform CF accepted')
+
+
+def sopp(op, simm):
+    return struct.pack('<I', (simm & 0xffff) | op << 16 | 0x17f << 23)
+
+
+def with_join_before_sample(data):
+    """Uniform forward join (every lane takes the same path) immediately before the sample_b."""
+    off = next(o for o, _s, _n, a in G.decode(data) if 'image_sample_b' in a)
+    join = (bytes.fromhex('800380be') + bytes.fromhex('008006bf') + sopp(5, 1) + bytes.fromhex('810381be'))
+    return data[:off] + join + data[off:]
+
+
+def with_divergent_exec_before_sample(data):
+    """Clear exec_lo after the loads so the entry-mask proof is gone before the sample."""
+    off = next(o for o, _s, _n, a in G.decode(data) if 'image_sample_b' in a)
+    return data[:off] + bytes.fromhex('8003febe') + data[off:]
+
+
+def with_branch_before_sample(data, sopp_op):
+    """Insert s_mov; s_cbranch_<op> +1; s_mov immediately before the sample_b (review probe)."""
+    off = next(o for o, _s, _n, a in G.decode(data) if 'image_sample_b' in a)
+    insert = bytes.fromhex('800380be') + sopp(sopp_op, 1) + bytes.fromhex('810381be')
+    return data[:off] + insert + data[off:]
 
 
 def controls():
@@ -421,6 +461,22 @@ def controls():
     locate()
     stage('array 1').hlsl_ps()  # the plain translation first: a translator without the lowering stops here
     check_guards()
+    plain = bytes.fromhex(WORDS['plain'])
+    join_ps = G.Pipeline(VS_WORDS, with_join_before_sample(plain), root_blob()).hlsl_ps()
+    assert 'SampleBias' in join_ps and bias_call(join_ps, 'float2') == (['v1', 'v2'], 'v0'), join_ps
+    for label, mutate in (
+            ('divergent EXEC', with_divergent_exec_before_sample),
+            ('s_cbranch_vccz', lambda d: with_branch_before_sample(d, 6)),
+            ('s_cbranch_vccnz', lambda d: with_branch_before_sample(d, 7)),
+            ('s_cbranch_execz', lambda d: with_branch_before_sample(d, 8)),
+            ('s_cbranch_execnz', lambda d: with_branch_before_sample(d, 9))):
+        try:
+            G.Pipeline(VS_WORDS, mutate(plain), root_blob()).hlsl_ps()
+        except G.Unsupported as error:
+            assert 'image_sample_b needs implicit derivatives' in str(error), (label, error)
+        else:
+            raise AssertionError('image_sample_b accepted after %s' % label)
+    print('uniform join before sample_b accepted; divergent EXEC and vcc/exec branches before sample_b refused')
     # Address order: the bias register comes first and is the third SampleBias argument.
     expected = {
         'array 1': (['v1', 'v2', 'v3'], 'v0', 'float3', 'Texture2DArray<float4> r0'),
@@ -588,6 +644,18 @@ def check_draw(dxc, renderer, adapter, fxc=None):
                     if run.returncode:
                         raise AssertionError('%s %s slice=%d\n%s\n%s' % (kind, name, slice_index, run.stdout, run.stderr))
                     print('%s sample_b %s slice=%d: %s' % (kind, name, slice_index, expected), flush=True)
+            # M200-01 B: the same bias-1 array sample after a uniform join must still read mip 0.
+            join_words = with_join_before_sample(bytes.fromhex(WORDS['array -1']))
+            join_pipe = G.Pipeline(VS_WORDS, join_words, root_blob())
+            join_shader = compile_hlsl(compiler, kind, drawable(join_pipe.hlsl_ps()), 'ps_join_m1_%s' % kind,
+                                       ps_profile, directory)
+            join_line = sampler_line(join_pipe)
+            for slice_index in (0, 1):
+                expected = texel_cell(mip_for(-1), slice_index)
+                run = draw_once(vs, join_shader, slice_index, expected, join_line)
+                if run.returncode:
+                    raise AssertionError('%s join sample_b slice=%d\n%s\n%s' % (kind, slice_index, run.stdout, run.stderr))
+                print('%s sample_b join-before bias=-1 slice=%d: %s' % (kind, slice_index, expected), flush=True)
             # Negative control: without a bias the draw reads mip 1, so the bias -1 and bias +1 expectations must fail.
             line = sampler_line(stage('array nobias'))
             nobias = compile_hlsl(compiler, kind, drawable(translated['array nobias']), 'ps_nobias_%s' % kind, ps_profile, directory)

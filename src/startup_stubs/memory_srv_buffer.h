@@ -127,6 +127,17 @@ inline bool resolve_buffer_srv_desc(std::uint64_t buffer_title_base, std::uint64
     return true;
 }
 
+// Largest unplaced buffer span, and largest allocation an unplaced buffer may wrap as an existing heap.
+constexpr std::uint64_t unplaced_max_span = 256ull << 20;
+
+// OpenExistingHeapFromAddress wraps the whole allocation holding the view, not just the view's pages. A few KiB
+// view in a multi-GiB title block must not wrap the block (afterwards each VirtualQuery over the block took
+// seconds), so allocations of unknown size (0) or above the span limit take the upload copy instead.
+inline bool unplaced_existing_heap_allowed(std::uint64_t allocation_bytes)
+{
+    return allocation_bytes && allocation_bytes <= unplaced_max_span;
+}
+
 // Calculates 64 KiB page-aligned extent and byte span for unplaced buffer memory SRVs.
 // Returns false on zero address/bytes, arithmetic overflow, or when the span exceeds the maximum allowable limit (256 MiB).
 inline bool unplaced_buffer_extent(std::uint64_t address, std::uint64_t span_bytes,
@@ -134,7 +145,7 @@ inline bool unplaced_buffer_extent(std::uint64_t address, std::uint64_t span_byt
 {
     constexpr std::uint64_t alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
     constexpr std::uint64_t mask = alignment - 1;
-    constexpr std::uint64_t max_span = 256ull << 20;
+    constexpr std::uint64_t max_span = unplaced_max_span;
     if (!address || !span_bytes || span_bytes > ~std::uint64_t{0} - address) return false;
     page_start = address & ~mask;
     const std::uint64_t end = address + span_bytes;

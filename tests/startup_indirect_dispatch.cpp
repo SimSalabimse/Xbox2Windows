@@ -4,6 +4,7 @@
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 
+#include "adapter_name_filter.h"
 #include "desktop_gpu.h"
 
 #include <algorithm>
@@ -317,12 +318,15 @@ int main(int argc, char** argv) try
     if (warp) {
         check(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter)), "find WARP");
     } else {
+        AdapterNameFilter filter;
+        if (!filter.read()) return 4;
         for (UINT index = 0; factory->EnumAdapters1(index, adapter.ReleaseAndGetAddressOf()) == S_OK; ++index) {
             DXGI_ADAPTER_DESC1 desc{};
             if (SUCCEEDED(adapter->GetDesc1(&desc)) && !(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
+                filter.matches(desc.Description) &&
                 SUCCEEDED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, __uuidof(ID3D12Device), nullptr))) break;
         }
-        if (!adapter) return 77;
+        if (!adapter) return filter.no_match();
     }
     check(D3D12XboxCreateDevice(adapter.Get(), nullptr, IID_PPV_ARGS(&device)), "create desktop device through d3d12_xs");
     SetEnvironmentVariableA("X2W_D3D12_PERMISSIVE", "1");

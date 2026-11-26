@@ -1,4 +1,6 @@
 """Report shader populations separately; do not classify or execute programs."""
+from __future__ import annotations
+
 import argparse
 from contextlib import ExitStack
 import hashlib
@@ -6,6 +8,7 @@ import json
 import mmap
 from pathlib import Path
 import struct
+import zlib
 
 from resource_inventory import scene_records
 
@@ -64,30 +67,36 @@ def census(archive, *, cache_blob=None, code_base=None):
     )
 
 
-def main():
+def _map_input(stack: ExitStack, path: Path):
+    if path.is_dir():
+        raise ValueError(f"Expected a file, not a directory: {path}")
+    stream = stack.enter_context(path.open("rb"))
+    if stream.seek(0, 2) == 0:
+        return b""
+    return stack.enter_context(mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ))
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("archive", type=Path)
     parser.add_argument("--cache-blob", type=Path, help="Already decoded PS/9 cache from the same build")
     parser.add_argument("--code-base", type=lambda value: int(value, 0),
                         help="Independently established code-area base in that cache (decimal or hex)")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if (args.cache_blob is None) != (args.code_base is None):
         parser.error("--cache-blob and --code-base must be supplied together")
+    if args.code_base is not None and args.code_base < 0:
+        parser.error("--code-base must be non-negative")
     try:
         with ExitStack() as stack:
-            def mapped(path):
-                stream = stack.enter_context(path.open("rb"))
-                if stream.seek(0, 2) == 0:
-                    return b""
-                return stack.enter_context(mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ))
-
-            archive = mapped(args.archive)
-            blob = mapped(args.cache_blob) if args.cache_blob is not None else None
+            archive = _map_input(stack, args.archive)
+            blob = _map_input(stack, args.cache_blob) if args.cache_blob is not None else None
             result = census(archive, cache_blob=blob, code_base=args.code_base)
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, struct.error, zlib.error) as error:
         parser.exit(1, f"Shader census: {error}\n")
     print(json.dumps(result, indent=2))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
