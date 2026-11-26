@@ -7998,8 +7998,11 @@ bits. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_s_bitcmp$' 
 `dpp_ffbh_u32`. SCC is unchanged. Lane masks and descriptor-bearing sources
 are refused. Run
 `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_s_flbit$' -V`
-(or `python3 -B tests/startup_gfx2hlsl_s_flbit_check.py`). The fixture is
-CPU-only; Windows WARP/hardware draws are left for an independent retest.
+(or `python3 -B tests/startup_gfx2hlsl_s_flbit_check.py`). The `_dispatch_warp`
+/ `_dispatch_hardware` variants compile the translated expression into a
+compute shader and compare UAV readback for 0, 1, 0x80000000 and 0x00010000
+against the same reference (including `flbit(0) == 0xffffffff`):
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_s_flbit_dispatch_warp$' -V`.
 [Refs #1723](https://github.com/R0Y00/Xbox2Windows/issues/1723).
 
 **Scalar immediate comparisons.** The startup translator sign-extends the
