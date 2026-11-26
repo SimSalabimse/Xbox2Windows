@@ -1,0 +1,25 @@
+EXPORTS
+    op_vpmovsxbw_ymm
+    op_vpmovsxbd_ymm
+    op_vpmovsxbq_ymm
+    op_vpmovsxwd_ymm
+    op_vpmovsxwq_ymm
+    op_vpmovsxdq_ymm
+    op_vpmovzxbw_ymm
+    op_vpmovzxbd_ymm
+    op_vpmovzxbq_ymm
+    op_vpmovzxwd_ymm
+    op_vpmovzxwq_ymm
+    op_vpmovzxdq_ymm
+    op_vpunpckldq_ymm
+    op_vpunpckhdq_ymm
+    op_vpunpcklqdq_ymm
+    op_vpunpckhqdq_ymm
+    op_vpmovsxbd_ymm_stale_dst
+    op_vpmovsxbw_ymm_alias
+    op_vpmovzxdq_ymm_alias
+    op_vpunpckldq_ymm_dst_src1
+    op_vpunpckhqdq_ymm_dst_src2
+    op_vpunpckhdq_ymm_all
+    op_vpmovsxwd_ymm_then_xmm_vpunpcklqdq
+    op_chain_ymm_widen_unpack

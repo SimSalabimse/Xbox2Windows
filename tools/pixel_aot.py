@@ -315,6 +315,15 @@ def sample_offset_arg(reg, vector, sample_dest, known_ssa_bits):
     return f", int2({x}, {y})"
 
 
+def check_sample_clamp_sampler(words, mips):
+    # Normalized clamp-to-last-texel in X/Y, point filters, zero sampler
+    # bias and minimum LOD. The sampler must leave the whole view accessible.
+    w0, w1, w2, w3 = words
+    if (w0 != 0x12 or w1 & ~0x00fff000 or (w1 >> 12) < ((mips - 1) << 8)
+            or w2 != 0x04000000 or w3 != 0):
+        raise ValueError("Sample clamp requires a normalized clamp sampler with point XY/mip filters and no LOD modifiers")
+
+
 # Word 2 bits 28-30 (value >> 28): MIP_POINT_PRECLAMP, ANISO_OVERRIDE, BLEND_ZERO_PRT. At an explicit level zero
 # with anisotropy refused and no partially resident texture, none of them changes the result.
 LEVEL_ZERO_IGNORED_W2 = 0x7
@@ -3536,10 +3545,12 @@ def discard_dead_integer_temporaries(lines, candidates):
 def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=None, *,
           texture_offset=0, second_texture_offset=None, integer_export=False, texcoord_components=2, extra_constants=(),
           title_ranges=None, flat_global_only=False, return_write_mask=False, wave_size=None, half_denorm=None,
-          pointer_constants=(), cpu="gfx1013", gather_mips=None):
+          pointer_constants=(), cpu="gfx1013", gather_mips=None, sample_clamp_mips=None):
     """Track descriptor provenance, interpolation and packed or uncompressed exports.
 
     texture_offset is the aligned byte offset of t0 in the texture descriptor table.
+    sample_clamp_mips opts into the experimental minimum-LOD interpretation of ordinary _cl
+    samples, with the declared number of visible mips in matching gfx1030 and desktop views.
     gather_mips declares the number of visible mips in matching gfx1030 and desktop 2D views.
     For comparison gather the selected red texel values and the reference must be in [0, 1].
     Gather coordinates must map to the same half-texel lattice on both views (see experiments.md).
@@ -3574,6 +3585,10 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
         if (cpu != "gfx1030" or sampler is None or second_texture_offset is not None or integer_export
                 or type(gather_mips) is not int or not 1 <= gather_mips <= 16):
             raise ValueError("Gather requires a gfx1030 float pixel profile with one texture and 1 to 16 visible mips")
+    if sample_clamp_mips is not None:
+        if (cpu != "gfx1030" or sampler is None or second_texture_offset is not None or integer_export
+                or type(sample_clamp_mips) is not int or not 1 <= sample_clamp_mips <= 16):
+            raise ValueError("Sample clamp requires a gfx1030 float pixel profile with one texture and 1 to 16 visible mips")
     if title_ranges is not None and (isinstance(title_ranges, bool) or not isinstance(title_ranges, int)
                                      or not 1 <= title_ranges <= 0xffffffff):
         raise ValueError("Invalid title range count")
@@ -3680,6 +3695,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     mask = "entry"
     wqm_width = None
     samples = 0
+    sample_clamp_used = False
     sampled_textures = set()
     sample_kind = None  # "plain", "comparison" or "gather" resource interpretation
     vector_loads = 0  # image samples and title loads issued, in vmcnt order
@@ -5016,7 +5032,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     vector[dst] = f"uv.{component}" if mask == "quad" else ("entry_uv", component)
             else:
                 raise ValueError("Unpaired interpolation")
-        elif m := match(r"(image_sample(?:(?:_lz|_l|_b)?(?:_o)?|_c?d(?:_o)?(?:_g16)?)) (?:v\[(\d+):(\d+)\]|v(\d+)), "
+        elif m := match(r"(image_sample(?:(?:_lz|_l|_b|_cl|_b_cl)?(?:_o)?|_c?d(?:_o)?(?:_g16)?)) (?:v\[(\d+):(\d+)\]|v(\d+)), "
                         r"v\[(\d+):(\d+)\], s\[(\d+):(\d+)\], s\[(\d+):(\d+)\] dmask:0x([1-9a-f]) dim:SQ_RSRC_IMG_2D"):
             op, dst_first, dst_last, dst_single, *rest, dmask_hex = m.groups()
             dmask = int(dmask_hex, 16)
@@ -5030,11 +5046,15 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             gradient = coarse or base_op == "image_sample_d"
             if coarse and cpu != "gfx1030":
                 raise ValueError("Coarse-gradient sampling requires gfx1030")
+            has_clamp = base_op.endswith("_cl")
+            has_bias = base_op in ("image_sample_b", "image_sample_b_cl")
+            if has_clamp and sample_clamp_mips is None:
+                raise ValueError(f"{op} requires --sample-clamp-mips")
             if gradient:
                 # LLVM disassembly lists only the live address operands.
                 coord_width = (4 if g16 else 6) + has_offset
             else:
-                coord_width = (3 if base_op in ("image_sample_l", "image_sample_b") else 2) + has_offset
+                coord_width = 2 + (base_op == "image_sample_l" or has_bias) + has_offset + has_clamp
             channels = ["xyzw"[bit] for bit in range(4) if (dmask >> bit) & 1]
             if len(channels) == 1:
                 if dst_single is None:
@@ -5083,6 +5103,24 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     return value
                 return fp_operand(reg, scalar, vector, pending, sample_dest)
 
+            def known_sample_float(reg):
+                if reg in sample_dest:
+                    raise ValueError("Sample LOD operand used before vmcnt wait")
+                raw = known_ssa_bits.get(vector[reg])
+                return struct.unpack("<f", struct.pack("<I", raw))[0] if raw is not None else None
+
+            clamp_arg = ""
+            if has_clamp:
+                check_sample_clamp_sampler(sampler, sample_clamp_mips)
+                # AMD tables 43/44 and LLVM place the clamp after the UV pair.
+                # The lower-bound interpretation here follows Mesa MinLod lowering.
+                floor = known_sample_float(coord_regs.pop())
+                if floor is None or not 0 <= floor <= sample_clamp_mips - 1:
+                    raise ValueError("Sample clamp requires a known minimum LOD inside the view")
+                offset_arg = offset_arg or ", int2(0, 0)"
+                clamp_arg = f", {floor!r}f"
+                sample_clamp_used = True
+
             if gradient:
                 u, v = [sample_coord(reg) for reg in coord_regs[-2:]]
                 if coarse:
@@ -5120,11 +5158,17 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 if any(value not in quad_values for value in uv):
                     raise ValueError("Unsupported texture coordinate")
                 coordinate = f"float2({', '.join(uv)})"
-                if base_op == "image_sample_b":
-                    bias = sample_coord(coord_regs[0])
-                    call = f"SampleBias(samp, {coordinate}, {bias}{offset_arg})"
+                if has_bias:
+                    if has_clamp:
+                        known_bias = known_sample_float(coord_regs[0])
+                        if known_bias is None or not -16 <= known_bias <= 15.99:
+                            raise ValueError("Sample clamp requires a known LOD bias in the HLSL range")
+                        bias = f"{known_bias!r}f"
+                    else:
+                        bias = sample_coord(coord_regs[0])
+                    call = f"SampleBias(samp, {coordinate}, {bias}{offset_arg}{clamp_arg})"
                 else:
-                    call = f"Sample(samp, {coordinate}{offset_arg})"
+                    call = f"Sample(samp, {coordinate}{offset_arg}{clamp_arg})"
             lines.append(f"    float4 sample{i} = {texture}.{call};")
             samples += 1
             sampled_textures.add(texture)
@@ -5199,17 +5243,20 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             for dst, value in zip(dests, values):
                 vector[dst] = value
                 sample_dest[dst] = vector_loads
-        elif m := match(r"(image_sample_c(?:_lz)?(?:_o)?) (v\d+), (?:v\[(\d+):(\d+)\]|\[(v\d+), (v\d+), (v\d+)\]), "
+        elif m := match(r"(image_sample_c(?:_lz|_l|_b)?(?:_o)?) (v\d+), (?:v\[(\d+):(\d+)\]|\[(v\d+), (v\d+), (v\d+)\]), "
                         r"s\[(\d+):(\d+)\], s\[(\d+):(\d+)\] dmask:0x1 dim:SQ_RSRC_IMG_2D"):
-            # The optional packed offset precedes the reference, followed by the UV pair.
+            # RDNA 2 orders the address as offset, bias, reference, UV, explicit LOD.
+            # Only the reference and UV pair are present in every comparison form.
             op, dst, first, last, *nsa = m.groups()[:7]
             image = registers(*m.groups()[7:9], 8)
             state = registers(*m.groups()[9:11], 4)
             has_offset = op.endswith("_o")
-            explicit_zero = op.removesuffix("_o") == "image_sample_c_lz"
+            base_op = op.removesuffix("_o")
+            explicit_level = base_op in ("image_sample_c_lz", "image_sample_c_l")
+            has_level_operand = base_op in ("image_sample_c_l", "image_sample_c_b")
             if first is None and op != "image_sample_c_lz":
                 raise ValueError("Comparison sample requires a contiguous address")
-            address = ([f"v{n}" for n in registers(first, last, 3 + has_offset)]
+            address = ([f"v{n}" for n in registers(first, last, 3 + has_offset + has_level_operand)]
                        if first is not None else nsa)
             if any(int(reg[1:]) > 255 for reg in (dst, *address)):
                 raise ValueError("Comparison sample VGPR out of range")
@@ -5222,10 +5269,24 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     or descriptor != [("tex", j) for j in range(8)]
                     or [scalar.get(f"s{n}") for n in state] != list(sampler)):
                 raise ValueError("Unsupported image or sampler binding")
-            if not explicit_zero and sampler[1] & 0xfff000:
+            if has_level_operand:
+                if sampler[1] & 0xfff000 != 0x100000 or (sampler[2] >> 26) & 3 != 1:
+                    raise ValueError("Comparison LOD/bias requires MAX_LOD 1 and point mip filtering")
+                if (sampler[2] >> 20) & 0xf:
+                    raise ValueError("Comparison LOD/bias requires point XY filtering")
+            elif not explicit_level and sampler[1] & 0xfff000:
                 raise ValueError("Implicit comparison sampling requires MAX_LOD 0")
             offset_arg = sample_offset_arg(address.pop(0), vector, sample_dest, known_ssa_bits) if has_offset else ""
-            if not explicit_zero and any(vector.get(reg) not in quad_values for reg in address[1:]):
+            level_arg = ""
+            if has_level_operand:
+                operand = address.pop() if explicit_level else address.pop(0)
+                if operand in sample_dest:
+                    raise ValueError("Comparison LOD operand used before vmcnt wait")
+                value = vector.get(operand)
+                if not isinstance(value, str) or known_ssa_bits.get(value) not in (0, 0x3f800000):
+                    raise ValueError("Comparison LOD or bias must be statically 0 or 1")
+                level_arg = f", {value}"
+            if not explicit_level and any(vector.get(reg) not in quad_values for reg in address[1:]):
                 raise ValueError("Implicit comparison sampling requires coordinates with quad provenance")
             if not xy_coordinates([vector.get(reg) for reg in address[1:]], quad_values):
                 if attribute_scales:
@@ -5242,8 +5303,10 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 if not isinstance(value, str) or not (value in quad_values or value.startswith(("sample", "alu", "params"))):
                     raise ValueError("Unsupported comparison sample operand")
             reference, u, v = values
-            method = "SampleCmpLevelZero" if explicit_zero else "SampleCmp"
-            lines.append(f"    float sample{i} = tex.{method}(samp, float2({u}, {v}), {reference}{offset_arg});")
+            method = {"image_sample_c_lz": "SampleCmpLevelZero", "image_sample_c_l": "SampleCmpLevel",
+                      "image_sample_c_b": "SampleCmpBias", "image_sample_c": "SampleCmp"}[base_op]
+            lines.append(f"    float sample{i} = tex.{method}(samp, float2({u}, {v}), "
+                         f"{reference}{level_arg}{offset_arg});")
             samples += 1
             sampled_textures.add("tex")
             vector_loads += 1
@@ -7864,6 +7927,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     scalar.site = vector.site = None
     if region is not None:
         raise ValueError("Program ends inside a masked region")
+    if sample_clamp_mips is not None and not sample_clamp_used:
+        raise ValueError("A sample clamp binding requires a clamped sample")
     if gather_mips is not None and sample_kind != "gather":
         raise ValueError("Expected one gather for the declared view")
     if not ended or sampled_textures != set(bindings.values()):
@@ -7894,6 +7959,8 @@ def main():
     parser.add_argument("--llvm", required=True, help="LLVM C library with AMDGPU support")
     parser.add_argument("--cpu", choices=("gfx1013", "gfx1030"), default="gfx1013",
                         help="Source instruction set (gfx1030 uses the wave64 pixel profile)")
+    parser.add_argument("--sample-clamp-mips", type=int,
+                        help="Opt in to experimental gfx1030 minimum-LOD samples with this visible mip count")
     parser.add_argument("--gather-mips", type=int, help="Declare the matching native and desktop 2D gather view mip count")
     parser.add_argument("--texture-sgpr", type=int, required=True, help="Entry register for the low descriptor-table address")
     parser.add_argument("--interp-sgpr", type=int, required=True, help="Entry register for the interpolation base")
@@ -7937,7 +8004,7 @@ def main():
                        extra_constants=[tuple(entry) for entry in args.extra_constant],
                        pointer_constants=[tuple(entry) for entry in args.pointer_constant],
                        half_denorm=args.half_denorm, return_write_mask=args.rt0_write_mask,
-                       cpu=args.cpu, gather_mips=args.gather_mips)
+                       cpu=args.cpu, gather_mips=args.gather_mips, sample_clamp_mips=args.sample_clamp_mips)
         source, write_mask = result if args.rt0_write_mask else (result, None)
     except (ValueError, KeyError, struct.error, OSError, AttributeError, zlib.error) as exc:
         parser.exit(1, f"Translation failed: {exc}\n")

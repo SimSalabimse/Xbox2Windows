@@ -1,6 +1,8 @@
 """Translate the counter updates following two upscaler working-set queries."""
 import argparse
 from pathlib import Path
+import struct
+import tempfile
 
 import pefile
 
@@ -31,6 +33,47 @@ def generate(image: Path, package: bool) -> str:
     return "\n".join(source)
 
 
+def _validate_paths(image: Path, output: Path, parser: argparse.ArgumentParser) -> None:
+    if image.is_dir():
+        raise IsADirectoryError(f"image path is a directory: {image}")
+    if not image.is_file():
+        raise FileNotFoundError(f"image file not found: {image}")
+    if output.suffix.lower() != ".cpp":
+        parser.error("choose a distinct .cpp output")
+    if output.is_symlink():
+        raise ValueError(f"output path must not be a symlink: {output}")
+    if output.is_dir():
+        raise IsADirectoryError(f"output path is a directory: {output}")
+    for parent in output.parents:
+        if parent.is_file() or ((parent.exists() or parent.is_symlink()) and not parent.is_dir()):
+            raise NotADirectoryError(f"output parent is not a directory: {parent}")
+    if output.resolve() == image.resolve() or (output.exists() and image.samefile(output)):
+        parser.error("choose a distinct .cpp output")
+
+
+def _write_atomic(path: Path, content: str) -> None:
+    """Write ASCII content to a sibling temp file and atomically replace path, leaving 0 temp files on failure."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="ascii",
+            newline="\n",
+            dir=path.parent,
+            prefix=f".{path.stem}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            tmp_path = Path(handle.name)
+            handle.write(content)
+        tmp_path.replace(path)
+    except BaseException:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+        raise
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("image", type=Path)
@@ -38,10 +81,9 @@ def main(argv=None) -> int:
     parser.add_argument("--package", action="store_true")
     args = parser.parse_args(argv)
     try:
-        if args.output.suffix.lower() != ".cpp" or args.output.resolve() == args.image.resolve():
-            parser.error("choose a distinct .cpp output")
-        args.output.write_text(generate(args.image, args.package), encoding="ascii")
-    except (OSError, ValueError, pefile.PEFormatError) as error:
+        _validate_paths(args.image, args.output, parser)
+        _write_atomic(args.output, generate(args.image, args.package))
+    except (OSError, ValueError, struct.error, pefile.PEFormatError) as error:
         parser.exit(1, f"{error}\n")
     return 0
 

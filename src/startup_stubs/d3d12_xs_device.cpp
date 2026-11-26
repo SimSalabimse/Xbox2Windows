@@ -29,6 +29,7 @@
 #include "startup_stubs/heap_indexed_root.h"
 #include "startup_stubs/indexed_indirect_guard.h"
 #include "startup_stubs/indexed_rect_geometry.h"
+#include "startup_stubs/list_dispatch.h"
 #include "startup_stubs/bc7_4k_s.h"
 #include "startup_stubs/bc64_chain.h"
 #include "startup_stubs/address_texture.h"
@@ -63,6 +64,7 @@
 #include "descriptor_heap_type.h"
 #include "small_texture_4k.h"
 #include "null_binding_cause.h"
+#include "root_constant_store.h"
 #include "null_texture_view.h"
 #include "packed_target_format.h"
 #include "present_view_format.h"
@@ -182,6 +184,8 @@ struct alignas(16) WrapperOwn {
     const void* compute_trace_root;
     LONG compute_trace_dispatches;
     bool root_without_bindings; // RootSignature: decoded and has no parameters or static samplers
+    ID3D12RootSignature* pipeline_root; // PipelineState: desktop root signature its compute stream declared
+    bool root_srv_only;         // RootSignature: decoded, no static samplers, every parameter a root SRV (those are forwarded)
     volatile LONG queue_wait_seen; // CommandQueue: publish later signals only after GPU completion.
     void* pass;       // CommandList (render mode): recording state (Pass)
     Wrapper* list_device;    // CommandList: wrapper that created this list.
@@ -457,10 +461,22 @@ u64 unwrap(u64 value)
     return w ? reinterpret_cast<u64>(w->own().real) : value;
 }
 
+volatile LONG wraps_to_fail;  // fixture-only, set by x2w_d3d12_fail_wraps
+constexpr u64 out_of_memory = static_cast<std::uint32_t>(E_OUTOFMEMORY);  // for slots that return u64
+
+// Returns nullptr when the wrapper cannot be allocated or registered (#2653). The caller still owns
+// `real` then: it releases what it created and returns E_OUTOFMEMORY.
 Wrapper* wrap(IUnknown* real, Kind kind)
 {
+    for (LONG n = wraps_to_fail; n > 0; n = wraps_to_fail)
+        if (InterlockedCompareExchange(&wraps_to_fail, n - 1, n) == n) return nullptr;
     const std::size_t area = kind == list_kind ? 0x10000 : sizeof(Wrapper);
     auto* block = static_cast<unsigned char*>(_aligned_malloc(sizeof(WrapperOwn) + area, 16));
+    if (!block) {
+        static LONG failed;
+        if (first_calls(failed, 4)) log("x2w-d3d12 wrap(%s): wrapper allocation failed -> E_OUTOFMEMORY", kind_names[kind]);
+        return nullptr;
+    }
     std::memset(block, 0, sizeof(WrapperOwn) + area);
     auto* w = reinterpret_cast<Wrapper*>(block + sizeof(WrapperOwn));
     w->vtable = tables[kind];
@@ -469,7 +485,13 @@ Wrapper* wrap(IUnknown* real, Kind kind)
     w->own().kind = kind;
     if (kind == fence_kind && real) w->own().completed = static_cast<LONG64>(static_cast<ID3D12Fence*>(real)->GetCompletedValue());
     AcquireSRWLockExclusive(&registry_lock);
-    registry().insert(w);
+    try {
+        registry().insert(w);
+    } catch (const std::bad_alloc&) {
+        ReleaseSRWLockExclusive(&registry_lock);
+        _aligned_free(block);
+        return nullptr;
+    }
     ReleaseSRWLockExclusive(&registry_lock);
     return w;
 }
@@ -872,6 +894,11 @@ __declspec(noinline) u64 create_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d, 
         if (Desc >= 0 && kind == resource_kind && requested_format != DXGI_FORMAT_UNKNOWN)
             x2w_startup::mark_packed_stand_in(static_cast<ID3D12Resource*>(*out), requested_format);
         Wrapper* child = wrap(static_cast<IUnknown*>(*out), kind);
+        if (!child) {
+            static_cast<IUnknown*>(*out)->Release();
+            *out = nullptr;
+            return out_of_memory;
+        }
         if constexpr (K == device_kind && N == 27) {
             if (kind == resource_kind && args[0])
                 retire_set_class(child, *reinterpret_cast<const D3D12_HEAP_PROPERTIES*>(args[0]),
@@ -1043,6 +1070,10 @@ HRESULT __stdcall device_create_command_queue(Wrapper* self, const D3D12_COMMAND
         desc->Priority, desc->Flags, desc->NodeMask, text, static_cast<unsigned long>(hr));
     if (FAILED(hr)) return hr;
     *out = wrap(queue, queue_kind);
+    if (!*out) {
+        queue->Release();
+        return E_OUTOFMEMORY;
+    }
     register_retire_queue(static_cast<Wrapper*>(*out));
     return S_OK;
 }
@@ -1067,6 +1098,10 @@ HRESULT __stdcall device_create_command_queue_x(Wrapper* self, const D3D12_COMMA
         desc->Type, desc->Priority, desc->Flags, desc->NodeMask, text, static_cast<unsigned long>(hr));
     if (FAILED(hr)) return hr;
     *out = wrap(queue, queue_kind);
+    if (!*out) {
+        queue->Release();
+        return E_OUTOFMEMORY;
+    }
     register_retire_queue(static_cast<Wrapper*>(*out));
     return S_OK;
 }
@@ -1163,7 +1198,7 @@ u64 __stdcall device_create_command_signature(Wrapper* self, const D3D12_COMMAND
             }
         }
         *output = wrap(nullptr, command_signature_kind);
-        return S_OK;
+        return *output ? u64{S_OK} : out_of_memory;
     }
     const u64 result = create_slot<device_kind, 41, 2>(self, reinterpret_cast<u64>(desc), root, iid, out, 0, 0, 0, 0);
     if (SUCCEEDED(static_cast<HRESULT>(result)) && out && desc && root && desc->NumArgumentDescs > 1) {
@@ -1216,7 +1251,7 @@ u64 __stdcall device_create_command_signature(Wrapper* self, const D3D12_COMMAND
         for (UINT i = 0; i < desc->NumArgumentDescs; ++i) {
             if (static_cast<UINT>(desc->pArgumentDescs[i].Type) > D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH) {
                 *output = wrap(nullptr, command_signature_kind);
-                return S_OK;
+                return *output ? u64{S_OK} : out_of_memory;
             }
         }
     }
@@ -1985,6 +2020,10 @@ HRESULT __stdcall device_create_root_signature(Wrapper* self, UINT node, const v
         return hr;
     }
     Wrapper* w = wrap(root, root_signature_kind);
+    if (!w) {
+        root->Release();
+        return E_OUTOFMEMORY;
+    }
     note_root_blob(w, blob, size);
     std::vector<RootParameter> parameters;
     UINT heap_flags = 0;
@@ -1994,8 +2033,10 @@ HRESULT __stdcall device_create_root_signature(Wrapper* self, UINT node, const v
         if (SUCCEEDED(deserializer->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1, &desc)) && desc) {
             heap_flags = static_cast<UINT>(desc->Desc_1_1.Flags) & x2w_startup::root_flags_heap_indexed;
             w->own().root_without_bindings = !heap_flags && !desc->Desc_1_1.NumParameters && !desc->Desc_1_1.NumStaticSamplers;
+            w->own().root_srv_only = !heap_flags && !desc->Desc_1_1.NumStaticSamplers && desc->Desc_1_1.NumParameters;
             for (UINT i = 0; i < desc->Desc_1_1.NumParameters; ++i) {
                 const auto& parameter = desc->Desc_1_1.pParameters[i];
+                if (parameter.ParameterType != D3D12_ROOT_PARAMETER_TYPE_SRV) w->own().root_srv_only = false;
                 RootParameter info{parameter.ParameterType, 0, 0};
                 if (parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_CBV || parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_SRV ||
                     parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_UAV) {
@@ -2121,7 +2162,7 @@ std::size_t desktop_stream_size(UINT type)
 
 // Converts the supported stream layout to desktop form and creates the pipeline.
 ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DESC* desc, char* why, std::size_t why_size,
-                                          bool& compute, IndirectGraphicsPipeline& graphics,
+                                          bool& compute, IndirectGraphicsPipeline& graphics, ID3D12RootSignature*& pipeline_root,
                                           ID3D12RootSignature* cached_root = nullptr)
 {
     const bool cached_mesh = cached_root != nullptr;
@@ -2283,6 +2324,8 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
         }
         check_device("Device CreatePipelineState", 86);
     }
+    if (pipeline && compute && root && root->own().kind == root_signature_kind)
+        pipeline_root = static_cast<ID3D12RootSignature*>(root->own().real);
     if (pipeline && (vertex || mesh) && (pixel || cached_mesh)) {
         graphics = {cached_mesh ? cached_root : static_cast<ID3D12RootSignature*>(root->own().real),
             targets.RTFormats[0], mesh, cached_mesh};
@@ -2383,8 +2426,11 @@ struct Pass {
     ID3D12RootSignature* compute_root = nullptr; // latest guest root if it was forwarded
     x2w_startup::ComPtr<ID3D12RootSignature> desktop_compute_root; // last root actually set on this recording
     std::array<D3D12_GPU_VIRTUAL_ADDRESS, 64> desktop_compute_upload_srvs{};
+    ID3D12RootSignature* compute_pipeline_root = nullptr; // root the bound compute pipeline was built against
+    UINT compute_srv_bound = 0;                           // root SRV parameters that reached the desktop list since slot 33
     const std::vector<RootParameter>* compute_params = nullptr;
     std::unique_ptr<ComputeBindingTrace> compute_trace;
+    bool compute_root_has_arguments = false;     // that root declares parameters other than root SRVs, or static samplers
     IndirectGraphicsPipeline indirect_graphics;
     ID3D12RootSignature* graphics_root = nullptr;
     bool targets_bound = false;
@@ -2408,6 +2454,8 @@ struct Pass {
     u64 root_address[16] = {};       // title address of each root descriptor
     std::uint32_t constants[16][8] = {};
     unsigned char constant_words_bound[16] = {};
+    x2w_root_constants::Store compute_constants;  // compute root constants (slots 37 and 39)
+    Wrapper* compute_root_wrapper = nullptr;      // compute root signature last set by slot 33
     D3D12_VERTEX_BUFFER_VIEW vb[8] = {};
     PlacedVertexView placed_vb[8] = {};
     D3D12_INDEX_BUFFER_VIEW ib = {};
@@ -2560,6 +2608,7 @@ void __stdcall list_pipeline(Wrapper* self, void* pipeline)
     // a recognized desktop graphics pipeline just before it records the draw.
     pass.pipeline_real = available && !pass.indirect_graphics.root;
     pass.compute_pipeline = pass.pipeline_real && w->own().compute_pipeline;
+    pass.compute_pipeline_root = pass.compute_pipeline ? w->own().pipeline_root : nullptr;
     pass.pipeline = w && w->own().kind == pipeline_kind ? w : nullptr;
     InterlockedIncrement(pass.pipeline_real ? &render_pipelines_real : &render_pipelines_missing);
     if (auto* list = recording(self); list && pass.pipeline_real) list->SetPipelineState(static_cast<ID3D12PipelineState*>(w->own().real));
@@ -2605,6 +2654,9 @@ void __stdcall list_compute_root(Wrapper* self, void* root)
     if (!list) return;
     Wrapper* w = as_wrapper(root);
     Pass& pass = pass_of(self);
+    // A different root signature invalidates the title's cached compute root arguments.
+    if (pass.compute_root_wrapper != w) pass.compute_constants.clear();
+    pass.compute_root_wrapper = w;
     const bool real = w && w->own().kind == root_signature_kind && w->own().real && !root_heap_flags(w);
     pass.compute_root = real ? static_cast<ID3D12RootSignature*>(w->own().real) : nullptr;
     pass.compute_tables.set_signature(w ? root_info(w) : nullptr);  // a different signature leaves no table bound
@@ -2613,6 +2665,9 @@ void __stdcall list_compute_root(Wrapper* self, void* root)
         pass.compute_trace = std::make_unique<ComputeBindingTrace>();
         pass.compute_trace->root = w;
     }
+    pass.compute_srv_bound = 0;
+    // Root SRV parameters are forwarded by their own slot; anything else the root declares is not.
+    pass.compute_root_has_arguments = real && !w->own().root_without_bindings && !w->own().root_srv_only;
     if (pass.compute_root) {
         if (pass.desktop_compute_root.Get() != pass.compute_root)
             pass.desktop_compute_upload_srvs.fill(0);
@@ -3534,9 +3589,12 @@ void __stdcall list_compute_upload_srv(Wrapper* self, UINT parameter, UINT64 add
     if (!list || !params || parameter >= params->size() || parameter >= pass.desktop_compute_upload_srvs.size() ||
         (*params)[parameter].type != D3D12_ROOT_PARAMETER_TYPE_SRV) return;
     const auto gpu = list_upload_gpu(self, address, 1);
+    // A rejected replacement leaves no valid binding: the desktop list may still hold the previous address.
+    if (parameter < 32) pass.compute_srv_bound &= ~(1u << parameter);
     if (gpu && !(gpu % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)) {
         pass.desktop_compute_upload_srvs[parameter] = gpu;
         list->SetComputeRootShaderResourceView(parameter, gpu);
+        if (parameter < 32) pass.compute_srv_bound |= 1u << parameter;
     }
 }
 
@@ -3588,6 +3646,30 @@ void __stdcall list_root_cbv(Wrapper* self, UINT parameter, u64 address)
         return;
     }
     pass.root_address[parameter] = (address && readable_window(address, 1)) ? address : 0;
+}
+// List slot 14, Dispatch. Forwarded only with a desktop compute pipeline and root bound and group counts within the limit.
+void __stdcall list_dispatch(Wrapper* self, UINT x, UINT y, UINT z)
+{
+    auto* list = recording(self);
+    x2w_startup::ListDispatch request;
+    request.list_open = list != nullptr;
+    if (list) request.type = list->GetType();
+    const Pass& pass = pass_of(self);
+    request.compute_pipeline = pass.compute_pipeline;
+    request.compute_root = pass.compute_root != nullptr;
+    request.compute_root_has_arguments = pass.compute_root_has_arguments;
+    request.root_matches_pipeline = pass.compute_pipeline_root && pass.compute_pipeline_root == pass.compute_root;
+    const UINT count = pass.compute_params ? static_cast<UINT>(pass.compute_params->size()) : 0;
+    request.root_arguments_bound = count <= 32 && (pass.compute_srv_bound & (count >= 32 ? ~0u : (1u << count) - 1)) == (count >= 32 ? ~0u : (1u << count) - 1);
+    request.x = x, request.y = y, request.z = z;
+    const x2w_startup::DispatchDecision decision = x2w_startup::decide_dispatch(request);
+    if (decision != x2w_startup::DispatchDecision::forward) {
+        static LONG refusals;
+        if (first_calls(refusals, 16))
+            log("x2w-render Dispatch(%u, %u, %u) refused: %s", x, y, z, x2w_startup::dispatch_reason(decision));
+        return;
+    }
+    list->Dispatch(x, y, z);
 }
 extern LONG translated_draws, untranslated_draws, frame_number;
 bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance);
@@ -4067,6 +4149,7 @@ HRESULT __stdcall device_create_descriptor_heap(Wrapper* self, const D3D12_DESCR
     // Some callers pass the 16-byte desktop descriptor; the words after it are then unrelated stack
     // data. The extension is taken only when it holds a pointer and exactly the heap's size.
     std::uint64_t title_memory = extra[0] >= 0x10000 && extra[1] == bytes ? extra[0] : 0;
+    const std::uint64_t supplied_memory = title_memory;
     // The title copies descriptors between heaps with its own memory copies. A view heap without
     // title memory therefore gets plain memory of ours as its CPU side, so that the view ids written
     // there (note_view) travel with those copies; the desktop heap behind it is still filled. A heap
@@ -4078,6 +4161,11 @@ HRESULT __stdcall device_create_descriptor_heap(Wrapper* self, const D3D12_DESCR
         return E_OUTOFMEMORY;
     }
     Wrapper* w = wrap(heap, descriptor_heap_kind);
+    if (!w) {
+        if (title_memory != supplied_memory) VirtualFree(reinterpret_cast<void*>(title_memory), 0, MEM_RELEASE);
+        heap->Release();
+        return E_OUTOFMEMORY;
+    }
     if (title_memory) {
         w->own().title_cpu = title_memory;
         AcquireSRWLockExclusive(&descriptor_lock);
@@ -4321,6 +4409,10 @@ HRESULT __stdcall device_create_command_list_x(Wrapper* self, const void* desc, 
             allocator, pso, text, static_cast<unsigned long>(hr));
     if (FAILED(hr)) return hr;
     Wrapper* child = wrap(list, list_kind);
+    if (!child) {
+        list->Release();
+        return E_OUTOFMEMORY;
+    }
     child->own().list_device = self;
     *out = child;
     return S_OK;
@@ -4413,6 +4505,11 @@ HRESULT publish_placed_buffer(Wrapper* self, void* address, const D3D12_RESOURCE
                               ID3D12Resource* resource, bool aliased, x2w_budget::Ticket* backing_budget, void** out)
 {
     Wrapper* w = wrap(resource, resource_kind);
+    if (!w) {
+        if (x2w_startup::linear_buffer_mode() != x2w_startup::LinearBufferMode::off) linear_buffers().discard(resource);
+        resource->Release();
+        return E_OUTOFMEMORY;
+    }
     if (release_retired_enabled()) w->own().retire_never = static_cast<std::uint8_t>(RetireNever::buffer);
     w->own().title_memory = address;
     const ResourceInfo record{*desc, desc->Width, aliased ? Placement::aliased_buffer : Placement::copied_buffer, self, initial_state};
@@ -4483,6 +4580,10 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
         if (FAILED(texture_hr)) return texture_hr;
         x2w_startup::mark_packed_stand_in(created, desktop_format(desc->Format));
         Wrapper* w = wrap(created, resource_kind);
+        if (!w) {
+            created->Release();
+            return E_OUTOFMEMORY;
+        }
         w->own().budget = x2w_budget::committed(device_of(self), created, props.Type);
         w->own().title_memory = address;
         note_resource(w, desc, 0);
@@ -5288,6 +5389,30 @@ extern "C" __declspec(dllexport) std::size_t x2w_d3d12_retire_reasons_line(char*
     return retire_reasons_line(out, capacity);
 }
 
+// The census heartbeat line, or an empty string when X2W_D3D12_VIEW_CENSUS is not set.
+std::size_t view_census_line(char* out, std::size_t capacity)
+{
+    if (!out || !capacity) return 0;
+    out[0] = 0;
+    if (!view_census_enabled()) return 0;
+    AcquireSRWLockShared(&note_lock);
+    const std::size_t used = view_census_format(out, capacity, "distinct by slot");
+    ReleaseSRWLockShared(&note_lock);
+    return used;
+}
+
+// Fixture export (startup_view_census): the line the heartbeat logs, now.
+extern "C" __declspec(dllexport) std::size_t x2w_d3d12_view_census_line(char* out, std::size_t capacity)
+{
+    return view_census_line(out, capacity);
+}
+
+// Fixture-only: the next `count` wrapper allocations fail as an exhausted heap would (#2653).
+extern "C" __declspec(dllexport) void x2w_d3d12_fail_wraps(LONG count)
+{
+    InterlockedExchange(&wraps_to_fail, count);
+}
+
 // Fixture probe (startup_resource_retire): what still names a resource of the class by its raw desktop pointer, how many
 // resources the open recording of a list moved out of COMMON, and how many it holds. Counts entries only.
 struct RetireProbe {
@@ -5554,6 +5679,7 @@ HRESULT __stdcall device_create_compute_pipeline_x(Wrapper*, const D3D12_COMPUTE
             static_cast<unsigned long long>(desc->CS.BytecodeLength), desc->NodeMask, desc->Flags, extra0, extra1, text, bytes);
     if (kind_for(*iid) != pipeline_kind) return E_NOINTERFACE;
     *out = wrap(nullptr, pipeline_kind);
+    if (!*out) return E_OUTOFMEMORY;
     auto* pipeline = static_cast<Wrapper*>(*out);
     note_pipeline(pipeline, 62, nullptr, desc, sizeof(*desc));
     note_compute_binding_pipeline(pipeline, *desc);
@@ -5587,13 +5713,14 @@ HRESULT __stdcall device_create_pipeline_stream_x(Wrapper*, const D3D12_PIPELINE
     D3D12_RASTERIZER_DESC rasterizer{};
     bool has_rasterizer = false;
     bool compute = false;
+    ID3D12RootSignature* pipeline_root = nullptr;
     IndirectGraphicsPipeline graphics;
     u64 mesh86_key = 0;
     if (render_mode()) {
         char why[256] = "";
         // Recognized desktop stages must reach the native path before the
         // guest cache creates a pending translation for any DXBC container.
-        real_pipeline = build_stream_pipeline(desc, why, sizeof(why), compute, graphics);
+        real_pipeline = build_stream_pipeline(desc, why, sizeof(why), compute, graphics, pipeline_root);
         bool mesh_cache_request = false;
         if (!real_pipeline)
             real_pipeline = try_cached_mesh86(*desc, why, sizeof(why), graphics, mesh_cache_request, mesh86_key);
@@ -5605,7 +5732,12 @@ HRESULT __stdcall device_create_pipeline_stream_x(Wrapper*, const D3D12_PIPELINE
             log("x2w-render stream pipeline -> %s%s", real_pipeline ? "REAL desktop pipeline" : "placeholder: ", real_pipeline ? "" : why);
     }
     *out = wrap(real_pipeline, pipeline_kind);
+    if (!*out) {
+        if (real_pipeline) real_pipeline->Release();
+        return E_OUTOFMEMORY;
+    }
     static_cast<Wrapper*>(*out)->own().compute_pipeline = real_pipeline && compute;
+    static_cast<Wrapper*>(*out)->own().pipeline_root = pipeline_root;
     static_cast<Wrapper*>(*out)->own().indirect_graphics = graphics;
     static_cast<Wrapper*>(*out)->own().mesh86_key = mesh86_key;
     note_pipeline(static_cast<Wrapper*>(*out), 86, nullptr, desc->pPipelineStateSubobjectStream, desc->SizeInBytes < 0x2000 ? desc->SizeInBytes : 0x2000,
@@ -5662,6 +5794,7 @@ HRESULT __stdcall device_create_pipeline_placeholder(Wrapper*, const void* desc,
     }
     if constexpr (N == 67) publish_compute_request(desc);
     *out = wrap(nullptr, pipeline_kind);
+    if (!*out) return E_OUTOFMEMORY;
     note_pipeline(static_cast<Wrapper*>(*out), N, nullptr, desc, 0x300);
     return S_OK;
 }
@@ -5689,6 +5822,7 @@ HRESULT __stdcall device_create_derived_pipeline(Wrapper*, void* base, UINT coun
             w ? kind_names[w->own().kind] : "not a wrapper", count, bytes, text);
     }
     *out = wrap(nullptr, pipeline_kind);
+    if (!*out) return E_OUTOFMEMORY;
     note_pipeline(static_cast<Wrapper*>(*out), 55, base, desc, bytes_in_patches);
     return S_OK;
 }
@@ -5700,10 +5834,10 @@ HRESULT __stdcall device_create_derived_pipeline(Wrapper*, void* base, UINT coun
 // COMMON, GENERIC_READ on an upload heap and COPY_DEST on a readback heap (the initial states D3D12
 // requires there; the Windows 10 runtime refuses COMMON with E_INVALIDARG). When desktop rejects the
 // clear value it is retried without one.
-HRESULT __stdcall device_create_committed_x(Wrapper* self, const D3D12_HEAP_PROPERTIES* props, UINT heap_flags,
-                                            const D3D12_RESOURCE_DESC* desc, UINT state, const D3D12_CLEAR_VALUE* clear,
-                                            void* session, UINT castable_count, const void* castable, const GUID* iid,
-                                            void** out)
+// Slot 76 shares the work with the slot number in the log line.
+HRESULT create_committed(int slot, Wrapper* self, const D3D12_HEAP_PROPERTIES* props, UINT heap_flags,
+                         const D3D12_RESOURCE_DESC* desc, UINT state, const D3D12_CLEAR_VALUE* clear, void* session,
+                         UINT castable_count, const void* castable, const GUID* iid, void** out)
 {
     char text[48];
     guid_text(iid, text, sizeof(text));
@@ -5712,7 +5846,7 @@ HRESULT __stdcall device_create_committed_x(Wrapper* self, const D3D12_HEAP_PROP
     const D3D12_RESOURCE_DESC copy = sanitized(*desc);
     const auto flags = static_cast<D3D12_HEAP_FLAGS>(heap_flags);
     const D3D12_RESOURCE_ALLOCATION_INFO info = device_of(self)->GetResourceAllocationInfo(0, 1, &copy);
-    check_device("Device before slot", 127);
+    check_device("Device before slot", slot);
     void* const title_memory = info.SizeInBytes != ~0ull ? title_resource_memory(info.SizeInBytes, info.Alignment) : nullptr;
     ID3D12Resource* resource = nullptr;
     const D3D12_RESOURCE_STATES initial = props->Type == D3D12_HEAP_TYPE_UPLOAD     ? D3D12_RESOURCE_STATE_GENERIC_READ
@@ -5730,19 +5864,43 @@ HRESULT __stdcall device_create_committed_x(Wrapper* self, const D3D12_HEAP_PROP
     }
     static LONG calls;
     if (first_calls(calls, 12))
-        log("x2w-d3d12 Device::slot127(CreateCommittedResource3?) heap=%d flags=0x%x dim=%d %llux%u fmt=%d rflags=0x%x "
-            "state=0x%x clear=%p%s session=%p castable=%u/%p riid=%s -> 0x%08lx", props->Type, heap_flags, desc->Dimension,
+        log("x2w-d3d12 Device::slot%d(%s) heap=%d flags=0x%x dim=%d %llux%u fmt=%d rflags=0x%x "
+            "state=0x%x clear=%p%s session=%p castable=%u/%p riid=%s -> 0x%08lx", slot,
+            slot == 76 ? "CreateCommittedResource" : "CreateCommittedResource3?", props->Type, heap_flags, desc->Dimension,
             desc->Width, desc->Height, desc->Format, desc->Flags, state, static_cast<const void*>(clear),
             clear && !cleared ? "(dropped)" : "", session, castable_count, castable, text, static_cast<unsigned long>(hr));
     if (FAILED(hr)) return hr;
     x2w_startup::mark_packed_stand_in(resource, desktop_format(desc->Format));
     Wrapper* w = wrap(resource, resource_kind);
+    if (!w) {
+        resource->Release();  // title_memory came from the title's allocator, which has no free hook here
+        return E_OUTOFMEMORY;
+    }
     w->own().budget = x2w_budget::committed(device_of(self), resource, props->Type);
     w->own().title_memory = title_memory;
     retire_set_class(w, *props, flags, copy, title_memory);
     note_resource(w, desc, info.SizeInBytes != ~0ull ? info.SizeInBytes : 0);
     *out = w;
     return S_OK;
+}
+
+HRESULT __stdcall device_create_committed_x(Wrapper* self, const D3D12_HEAP_PROPERTIES* props, UINT heap_flags,
+                                            const D3D12_RESOURCE_DESC* desc, UINT state, const D3D12_CLEAR_VALUE* clear,
+                                            void* session, UINT castable_count, const void* castable, const GUID* iid,
+                                            void** out)
+{
+    return create_committed(127, self, props, heap_flags, desc, state, clear, session, castable_count, castable, iid, out);
+}
+
+// Device slot 76 (Xbox order, +0x260): the seven arguments of desktop CreateCommittedResource
+// (heap properties, heap flags, desc, initial state, clear value, riid, ppv). Seen from a console
+// package module (an upscaler) that a title loaded only on the Series S profile. Same desktop
+// creation as slot 127 (tests/startup_committed_slot76_check.cpp).
+HRESULT __stdcall device_create_committed(Wrapper* self, const D3D12_HEAP_PROPERTIES* props, UINT heap_flags,
+                                          const D3D12_RESOURCE_DESC* desc, UINT state, const D3D12_CLEAR_VALUE* clear,
+                                          const GUID* iid, void** out)
+{
+    return create_committed(76, self, props, heap_flags, desc, state, clear, nullptr, 0, nullptr, iid, out);
 }
 
 // Device slot 80 (Xbox order): (type, timeout, 0, flags, &token) -> HRESULT, the frame-event wait
@@ -6071,6 +6229,10 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             static_cast<u64>(heap_infos().size()), static_cast<long long>(placed_buffer_calls),
             static_cast<long long>(placed_buffer_region_info), static_cast<long long>(placed_buffer_queries));
         {
+            char line[640];
+            if (view_census_line(line, sizeof(line))) log("%s", line);
+        }
+        {
             LARGE_INTEGER frequency;
             QueryPerformanceFrequency(&frequency);
             char text[512];
@@ -6195,6 +6357,7 @@ void build_tables()
     tables[device_kind][48] = reinterpret_cast<void*>(&device_create_command_queue_x);
     tables[device_kind][70] = reinterpret_cast<void*>(&device_memory_srv);
     tables[device_kind][73] = reinterpret_cast<void*>(&device_create_command_list_x);
+    tables[device_kind][76] = reinterpret_cast<void*>(&device_create_committed);
     tables[device_kind][78] = reinterpret_cast<void*>(&device_frame_interval);
     tables[device_kind][79] = reinterpret_cast<void*>(&device_frame_event);
     tables[device_kind][80] = reinterpret_cast<void*>(&device_wait_frame_event);
@@ -6230,6 +6393,7 @@ void build_tables()
         list_typed[139] = reinterpret_cast<ListTyped>(&list_reset);
         list_typed[148] = reinterpret_cast<ListTyped>(&list_allocate_upload);
         list_typed[12] = reinterpret_cast<ListTyped>(&list_draw);
+        list_typed[14] = reinterpret_cast<ListTyped>(&list_dispatch);
         list_typed[16] = reinterpret_cast<ListTyped>(&list_copy_texture);
         list_typed[20] = reinterpret_cast<ListTyped>(&list_topology);
         list_typed[21] = reinterpret_cast<ListTyped>(&list_viewports);
@@ -6248,6 +6412,8 @@ void build_tables()
         list_typed[13] = reinterpret_cast<ListTyped>(&list_draw_indexed);
         list_typed[35] = reinterpret_cast<ListTyped>(&list_compute_table);
         list_typed[36] = reinterpret_cast<ListTyped>(&list_table);
+        list_typed[37] = reinterpret_cast<ListTyped>(&list_compute_constant);
+        list_typed[39] = reinterpret_cast<ListTyped>(&list_compute_constants);
         list_typed[40] = reinterpret_cast<ListTyped>(&list_root_constants);
         list_typed[47] = reinterpret_cast<ListTyped>(&list_index_buffer);
         list_typed[48] = reinterpret_cast<ListTyped>(&list_vertex_buffers);
@@ -6311,9 +6477,14 @@ void x2w_startup::attach_device(ID3D12Device* device, void** wrapped)
 {
     static const bool ready = (build_tables(), true);
     (void)ready;
+    Wrapper* const candidate = wrap(device, device_kind);
+    *wrapped = candidate;
+    if (!candidate) {
+        device->Release();
+        return;
+    }
+    the_device = candidate;
     removal_device = device;
-    the_device = wrap(device, device_kind);
-    *wrapped = the_device;
 }
 
 HRESULT x2w_startup::resolve_placed_build(void* guest_device, UINT64 dest, UINT64 scratch,
@@ -6396,7 +6567,8 @@ HRESULT x2w_d3d12_permissive_create_device(IUnknown* adapter, const void* parame
     log("x2w-d3d12 D3D12XboxCreateDevice adapter=%p params=[%s] riid=%s -> 0x%08lx build=%s", static_cast<void*>(adapter),
         block, text, static_cast<unsigned long>(hr), x2w_build_rev);
     if (FAILED(hr)) return hr;
-    if (debug) device->QueryInterface(IID_PPV_ARGS(&info_queue));
     x2w_startup::attach_device(device, out);
+    if (!*out) return E_OUTOFMEMORY;
+    if (debug) device->QueryInterface(IID_PPV_ARGS(&info_queue));
     return S_OK;
 }

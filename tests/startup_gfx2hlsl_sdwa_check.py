@@ -149,7 +149,8 @@ check('v_mov inline constant source',
       mov('-16', 'DWORD', 'UNUSED_PAD', 'BYTE_0') == 'v1 = ((0xfffffff0u >> 0u) & 0xffu);')
 check('v_mov UNUSED_SEXT with a DWORD destination has no unused bits',
       mov('v2', 'DWORD', 'UNUSED_SEXT', 'WORD_0') == 'v1 = ((v2 >> 0u) & 0xffffu);')
-check('v_mov whole lane mask is the plain move', mov('exec_lo', 'DWORD', 'UNUSED_PAD', 'DWORD') == 'v1 = exec;')
+check('v_mov whole lane mask refused',
+      mov('exec_lo', 'DWORD', 'UNUSED_PAD', 'DWORD') == 'refused: v_mov_b32 data operand exec_lo is a lane mask')
 check('v_mov UNUSED_SEXT with a sub-dword destination refused',
       refused_as('v_mov_b32_sdwa v1, v2 dst_sel:WORD_0 dst_unused:UNUSED_SEXT src0_sel:DWORD', 'SDWA UNUSED_SEXT'))
 check('v_mov clamp refused', refused_as('v_mov_b32_sdwa v1, v2 clamp dst_sel:DWORD dst_unused:UNUSED_PAD '

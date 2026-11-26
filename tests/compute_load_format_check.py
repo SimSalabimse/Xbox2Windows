@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from fractions import Fraction
 import os
 from pathlib import Path
+import re
 import struct
 import subprocess
 import sys
@@ -311,38 +312,73 @@ def binary(directory, assembler, objcopy, library):
     return 0
 
 
+def check_references(name, renderer, backend, shader, cases, *, allow_hardware_skip=False):
+    paths = [path for path, _label, _diagnostic in cases]
+    result = subprocess.run([renderer, backend, "--compute-store-batch", shader, *paths],
+                            capture_output=True, text=True)
+    if allow_hardware_skip and backend == "hardware" and result.returncode == 77:
+        return 77
+    statuses = [line for line in result.stdout.splitlines() if line.startswith("case=")]
+    messages = re.split(r"(?=^case=\d+ path=)", result.stderr, flags=re.MULTILINE)[1:]
+    summaries = [line for line in result.stdout.splitlines() if line.startswith("groups=")]
+    for i, (path, label, diagnostic) in enumerate(cases):
+        status = "mismatch" if diagnostic else "pass"
+        if (i >= len(statuses) or statuses[i] != f"case={i} status={status}"
+                or i >= len(messages) or not messages[i].startswith(f"case={i} path={path}\n")
+                or (diagnostic and diagnostic not in messages[i])):
+            raise AssertionError(f"{name}: {label} expected {status}\n{result.stdout}{result.stderr}")
+        summary = summaries[i] if i < len(summaries) else ""
+        counts = re.fullmatch(r"groups=\d+ compared_words=320 mismatches=(\d+)", summary)
+        if not counts or (int(counts[1]) > 0) != bool(diagnostic):
+            raise AssertionError(f"{name}: {label} unexpected readback\n{result.stdout}{result.stderr}")
+    expected_exit = int(any(diagnostic for _, _, diagnostic in cases))
+    if not (len(cases) == len(statuses) == len(messages) == len(summaries)) or result.returncode != expected_exit:
+        raise AssertionError(f"{name}: unexpected batch result ({result.returncode})\n{result.stdout}{result.stderr}")
+    labels = iter(label for _path, label, _diagnostic in cases)
+    for line in result.stdout.splitlines():
+        if line.startswith("groups="):
+            print(f"{name}: {next(labels)}")
+        print(line)
+    return 0
+
+
 def draw(directory, compiler, renderer, backend):
     """Dispatch with chosen t0 words; wrong references and mutated sources must fail.
 
-    Every case owns its case and cso files, so the launches run on a small thread pool. Results are
-    checked afterwards in the original order with the original messages.
+    The reference cases share one device and compute pipeline. Each independently compiled mutation keeps its own
+    renderer process so compilation and readback can overlap with the reference checks.
     """
     src, cso = directory / "load.hlsl", directory / "load.cso"
     source = lower()
     src.write_text(source, encoding="ascii")
     subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
     words = source_words()
-    jobs = []  # (check, label, extra, case bytes, shader, mutated source or None)
+    references = []
+    mutations = []
 
-    def add(check, label, groups, reference, formats=None, extra=None, mutated=None):
+    def write_case(number, groups, reference, formats):
+        case = directory / f"case{number}.bin"
         data = (struct.pack("<321I", groups, *reference) + struct.pack("<16I", *(formats or constants()))
                 + struct.pack("<320I", *words))
-        jobs.append((check, label, extra, data, mutated))
-
-    def run(number, job):
-        _check, _label, _extra, data, mutated = job
-        case, shader = directory / f"case{number}.bin", cso
         case.write_bytes(data)
-        if mutated is not None:
-            shader = directory / f"mutated{number}.cso"
-            bad_src = directory / f"mutated{number}.hlsl"
-            bad_src.write_text(mutated, encoding="ascii")
-            subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", shader, bad_src], check=True)
-        return subprocess.run([renderer, backend, "--compute-store-case", shader, case],
-                              capture_output=True, text=True)
+        return case
+
+    def add_reference(label, groups, reference, formats=None, diagnostic=None):
+        case = write_case(len(references), groups, reference, formats)
+        references.append((case, label, diagnostic))
+
+    def run_mutation(number, label, case, mutated):
+        shader = directory / f"mutated{number}.cso"
+        bad_src = directory / f"mutated{number}.hlsl"
+        bad_src.write_text(mutated, encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", shader, bad_src], check=True)
+        result = subprocess.run([renderer, backend, "--compute-store-case", shader, case],
+                                capture_output=True, text=True)
+        if result.returncode != 1 or "Compute readback differs" not in result.stderr:
+            raise AssertionError(f"{NAME}: mutation '{label}' escaped detection\n{result.stderr}")
 
     for groups in (1, 2):
-        add("pass", "dispatch", groups, expected_words(groups))
+        add_reference("dispatch", groups, expected_words(groups))
 
     def invalid_formats(number):
         formats = constants()
@@ -354,48 +390,37 @@ def draw(directory, compiler, renderer, backend):
     unwritten = [base.SENTINEL] * 320
     zeros = (lambda channels: (lambda words: [0] * channels))
     for number, (label, index, _word) in enumerate(INVALID):
-        add("pass", f"refused {label}", 2, unwritten, invalid_formats(number))
+        add_reference(f"refused {label}", 2, unwritten, invalid_formats(number))
         channels = len(LOADS[index][0])
         placeholders = [("published as zeros", zeros(channels))]
         if number == 2:
             placeholders.append(("published with the (0, 0, 0, 1) fill", lambda words: [words[0], 0]))
         for what, values in placeholders:
             published = expected_words(2, placeholder=(index, values))
-            add("placeholder", f"{label} {what}", 2, published, invalid_formats(number),
-                extra=f"word=0 expected={published[0]:08x} actual=c5c5c5c5")
+            add_reference(f"{label} {what}", 2, published, invalid_formats(number),
+                          diagnostic=f"word=0 expected={published[0]:08x} actual=c5c5c5c5")
     expected = expected_words(2)
     for label, wrong in WRONG:
         reference = expected_words(2, wrong=wrong)
         word = next((i for i, (a, b) in enumerate(zip(expected, reference)) if a != b), None)
         if word is None:
             raise AssertionError(f"{NAME}: reference '{label}' matches the expected words")
-        add("wrong", label, 2, reference, extra=f"word={word} expected=")
+        add_reference(f"reference '{label}'", 2, reference, diagnostic=f"word={word} expected=")
     for label, old, new, run_index in MUTATIONS:
         mutated = source.replace(old, new, 1)
         if mutated == source:
             raise AssertionError(f"{NAME}: mutation '{label}' did not change the source")
-        if run_index is None:
-            add("mutation", label, 2, expected, mutated=mutated)
-        else:
-            add("mutation", label, 2, unwritten, invalid_formats(run_index), mutated=mutated)
+        number = len(references) + len(mutations)
+        reference, formats = (expected, None) if run_index is None else (unwritten, invalid_formats(run_index))
+        case = write_case(number, 2, reference, formats)
+        mutations.append((number, label, case, mutated))
 
     with ThreadPoolExecutor(max_workers=min(LAUNCH_THREADS, os.cpu_count() or 1)) as pool:
-        results = list(pool.map(lambda item: run(*item), enumerate(jobs)))
-    for (check, label, extra, _data, _mutated), result in zip(jobs, results):
-        if check == "pass":
-            print(f"{NAME}: {label}", flush=True)
-            sys.stdout.write(result.stdout)
-            if result.returncode:
-                sys.stderr.write(result.stderr)
-                return 1
-        elif check == "placeholder":
-            if result.returncode != 1 or extra not in result.stderr:
-                raise AssertionError(f"{NAME}: {label} escaped detection\n{result.stderr}")
-        elif check == "wrong":
-            if result.returncode != 1 or extra not in result.stderr:
-                raise AssertionError(f"{NAME}: reference '{label}' escaped detection\n{result.stderr}")
-        elif result.returncode != 1 or "Compute readback differs" not in result.stderr:
-            raise AssertionError(f"{NAME}: mutation '{label}' escaped detection\n{result.stderr}")
+        batch = pool.submit(check_references, NAME, renderer, backend, cso, references)
+        mutants = [pool.submit(run_mutation, *mutation) for mutation in mutations]
+        batch.result()
+        for future in mutants:
+            future.result()
     print(f"{NAME}: {2 + len(INVALID)} dispatches, {len(WRONG) + len(INVALID) + 1} wrong references and "
           f"{len(MUTATIONS)} mutated sources checked")
     return 0
