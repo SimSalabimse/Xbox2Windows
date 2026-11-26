@@ -1,4 +1,8 @@
-"""Compare native and translated XCHG, and check that the memory form stays atomic under contention."""
+"""Compare native and translated XCHG, and check that the memory form stays atomic under contention.
+
+CTest runs the parts as separate cases (check-native, check-lifted, check-controls, in parallel) and keeps
+check-rejections on the aggregate. The `check` mode still runs every part serially for a direct run; the
+parts above are not the only coverage of that mode, they are the same checks split up."""
 from collections import Counter
 import ctypes
 import os
@@ -167,18 +171,20 @@ def token_errors(lib, rounds):
     return threads, worst
 
 
-def check(native_path, lifted_path, *control_paths):
-    for label, path in (("native", native_path), ("lifted", lifted_path)):
-        lib = load_lib(path)
-        cases, bad = value_mismatches(lib)
-        if bad:
-            name, x, y, want, got = bad[0]
-            raise AssertionError(f"{label}: {len(bad)} mismatches; first {name}({x:#x}, {y:#x}) = {got}, expected {want}")
-        threads, errors = token_errors(lib, rounds=3)
-        if any(errors.values()):
-            raise AssertionError(f"{label}: token exchange lost or duplicated values: {errors}")
-        print(f"{label}: {cases} value cases matched; {threads} threads x 100000 tokens x 3 rounds, "
-              f"lost or duplicated tokens {errors}")
+def check_library(label, path):
+    lib = load_lib(path)
+    cases, bad = value_mismatches(lib)
+    if bad:
+        name, x, y, want, got = bad[0]
+        raise AssertionError(f"{label}: {len(bad)} mismatches; first {name}({x:#x}, {y:#x}) = {got}, expected {want}")
+    threads, errors = token_errors(lib, rounds=3)
+    if any(errors.values()):
+        raise AssertionError(f"{label}: token exchange lost or duplicated values: {errors}")
+    print(f"{label}: {cases} value cases matched; {threads} threads x 100000 tokens x 3 rounds, "
+          f"lost or duplicated tokens {errors}")
+
+
+def check_controls(control_paths):
     for path in control_paths:
         control = Path(path).stem.rsplit("_", 1)[-1]
         lib = load_lib(path)
@@ -187,6 +193,12 @@ def check(native_path, lifted_path, *control_paths):
         print(f"control {control}: {len(bad)}/{cases} value mismatches; lost or duplicated tokens {errors}")
         if not bad and not any(errors.values()):
             raise AssertionError(f"control {control} matched every case")
+
+
+def check(native_path, lifted_path, *control_paths):
+    check_library("native", native_path)
+    check_library("lifted", lifted_path)
+    check_controls(control_paths)
 
 
 def check_rejections():
@@ -208,11 +220,19 @@ def check_rejections():
 
 
 if __name__ == "__main__":
-    mode, native, other, *rest = sys.argv[1:]
+    mode, *args = sys.argv[1:]
     if mode == "emit":
-        emit(Path(native), Path(other), *rest)
+        emit(Path(args[0]), Path(args[1]), *args[2:])
     elif mode == "check":
-        check(native, other, *rest)
+        check(*args)
+        check_rejections()
+    elif mode == "check-native":
+        check_library("native", *args)
+    elif mode == "check-lifted":
+        check_library("lifted", *args)
+    elif mode == "check-controls":
+        check_controls(args)
+    elif mode == "check-rejections":  # no fixture needed
         check_rejections()
     else:
         raise ValueError(mode)

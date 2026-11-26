@@ -258,7 +258,8 @@ Wrapper* existing_memory_buffer(Wrapper* device, u64 address, u64 bytes)
 }
 
 // Backing for unplaced buffer memory SRVs: 64 KiB page-aligned placed resource on an existing heap
-// (OpenExistingHeapFromAddress zero-copy aliasing on hardware) or committed UPLOAD buffer (fallback).
+// (OpenExistingHeapFromAddress zero-copy aliasing on hardware, allocations up to 256 MiB) or committed UPLOAD
+// buffer (fallback).
 struct UnplacedBufferEntry {
     Wrapper* device = nullptr;
     void* allocation_base = nullptr;
@@ -350,7 +351,7 @@ Wrapper* unplaced_memory_buffer(Wrapper* device, u64 address, u64 span_bytes, co
                 break;
             }
         }
-        if (!heap) {
+        if (!heap && x2w_startup::unplaced_existing_heap_allowed(x2w_startup::allocation_bytes(memory.base))) {
             ID3D12Device3* device3 = nullptr;
             if (SUCCEEDED(desktop->QueryInterface(IID_PPV_ARGS(&device3)))) {
                 if (SUCCEEDED(device3->OpenExistingHeapFromAddress(memory.base, IID_PPV_ARGS(&heap)))) {

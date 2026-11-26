@@ -7,6 +7,7 @@
 
 namespace {
 using x2w_startup::ComputeTables;
+using x2w_startup::ViewHeapSelection;
 using x2w_startup::ViewTable;
 using x2w_startup::resolve_view_table;
 int failures;
@@ -65,9 +66,36 @@ int main()
     {
         ComputeTables s;
         s.set_signature(&root_a);
+        const auto select = [&](std::uint64_t heap, bool visible, unsigned logical, unsigned desktop) {
+            ViewHeapSelection selection;
+            selection.note(heap, visible, logical, desktop);
+            s.set_view_heap(selection.compute);
+            return selection;
+        };
+        auto selection = select(1, true, 8, 8);
+        check(selection.compute == 1 && !selection.graphics, "ordinary heap is selected only for compute invalidation");
         s.set_table(7, at(6));
-        s.clear();
-        check(s.table(7).address == 0 && s.signature() == &root_a, "a view heap change clears the tables and keeps the signature");
+        select(1, true, 8, 8);
+        check(s.table(7).address == at(6).address, "same ordinary heap keeps the table");
+        select(2, true, 8, 8);
+        check(!s.table(7).address, "different ordinary heap clears the table");
+        s.set_table(7, at(6));
+        selection = select(3, true, 16, 8);
+        check(selection.compute == 3 && selection.graphics == 3, "oversized heap remains visible to graphics lookup");
+        check(!s.table(7).address, "ordinary to oversized clears the table");
+        s.set_table(7, at(6));
+        select(3, true, 16, 8);
+        check(s.table(7).address == at(6).address, "same oversized heap keeps the table");
+        select(4, true, 16, 8);
+        check(!s.table(7).address, "different oversized heap clears the table");
+        s.set_table(7, at(6));
+        select(1, true, 8, 8);
+        check(!s.table(7).address, "oversized to ordinary clears the table");
+        s.set_table(7, at(6));
+        s.set_view_heap(ViewHeapSelection{}.compute);
+        check(!s.table(7).address && s.signature() == &root_a, "unsetting the heap clears the table and keeps the signature");
+        selection = select(5, false, 8, 8);
+        check(!selection.compute && !selection.graphics, "CPU-only heap does not select a view heap");
     }
     {
         ComputeTables s;

@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 
+from compute_load_format_check import check_references
 import compute_store_check as base
 
 
@@ -211,10 +212,12 @@ def draw(directory, compiler, renderer, backend, mode):
 
     default_payload = 0x42000001 if mode == "d16_xyz" else D16_X_PAYLOADS[0][1]
 
-    def run(slot, payload=default_payload, expected_x=D16_X, table_words=table, expected_y=0x40400000,
-            expected_z=0x33800000):
+    def write_case(path, slot, payload=default_payload, expected_x=D16_X, table_words=table,
+                   expected_y=0x40400000, expected_z=0x33800000, written_offsets=None):
         result = [base.SENTINEL] * WORDS
-        for thread, start in enumerate(cases[slot][2]):
+        if written_offsets is None:
+            written_offsets = cases[slot][2]
+        for thread, start in enumerate(written_offsets):
             if mode == "d16_x":
                 result[start] = expected_x[thread]
             elif mode == "d16_xy":
@@ -226,49 +229,39 @@ def draw(directory, compiler, renderer, backend, mode):
                 result[start:start + 4] = [D16_X[thread], 0xc0000000, 0x33800000, 0x80000000]
             else:
                 result[start:start + 4] = [thread, 0x12345678, 0x80000001, 0x3F800001]
-        case = directory / "store.case"
-        case.write_bytes(struct.pack("<321I", 1, *result) + struct.pack("<16I", slot, payload, *([0] * 14))
+        path.write_bytes(struct.pack("<321I", 1, *result) + struct.pack("<16I", slot, payload, *([0] * 14))
                          + struct.pack("<320I", *table_words))
-        return subprocess.run([renderer, backend, "--compute-store-case", cso, case], capture_output=True, text=True)
+
+    references = []
+
+    def add(label, slot, **values):
+        path = directory / f"store_{len(references)}.case"
+        write_case(path, slot, **values)
+        references.append((path, label, None))
 
     compile_shader(source)
     for slot, (label, _, _) in enumerate(cases):
-        result = run(slot)
-        if result.returncode == 77 and backend == "hardware":
-            return 77
-        assert result.returncode == 0, (mode, label, result.stderr)
-    extra = 0
+        add(f"slot {slot} {label}", slot)
     if mode == "d16_x":
         for label, payload, want in D16_X_PAYLOADS[1:]:
-            result = run(0, payload=payload, expected_x=want)
-            assert result.returncode == 0, (label, result.stderr)
-            extra += 1
+            add(label, 0, payload=payload, expected_x=want)
         # A FLOAT4 format word must be refused just like UINT1 by store_heap_word_d16.
         wrong_float4 = list(table)
         wrong_float4[TABLE_BYTE // 4 + 3] = FLOAT4
-        case = directory / "store.case"
-        case.write_bytes(struct.pack("<321I", 1, *([base.SENTINEL] * WORDS)) + struct.pack("<16I", 0, D16_X_PAYLOADS[0][1], *([0] * 14))
-                         + struct.pack("<320I", *wrong_float4))
-        result = subprocess.run([renderer, backend, "--compute-store-case", cso, case], capture_output=True, text=True)
-        assert result.returncode == 0, ("wrong FLOAT4 format", result.stderr)
-        extra += 1
+        add("wrong FLOAT4 format", 0, table_words=wrong_float4, written_offsets=())
     if mode == "d16_xy":
         for payload, expected_y in ((0x80003c00, 0x80000000), (0x00013c00, 0x33800000), (0xc0003c00, 0xc0000000)):
-            result = run(0, payload=payload, expected_y=expected_y)
-            assert result.returncode == 0, (hex(payload), result.stderr)
-            extra += 1
+            add(f"payload {payload:#x}", 0, payload=payload, expected_y=expected_y)
     elif mode == "d16_xyz":
         for payload, z in ((0x7e010001, 0x33800000), (0x3c008000, 0x80000000), (0x4200c000, 0xc0000000)):
-            result = run(0, payload=payload, expected_z=z)
-            assert result.returncode == 0, (hex(payload), result.stderr)
-            extra += 1
+            add(f"payload {payload:#x}", 0, payload=payload, expected_z=z)
     mismatched_formats = {"d16_xy": (FLOAT4, base.aot.descriptor_format_word(62)), "d16_xyz": (FLOAT2, FLOAT4)}
     for wrong_format in mismatched_formats.get(mode, ()):
         wrong_view = table.copy()
         wrong_view[TABLE_BYTE // 4 + 5 * 8 + 3] = wrong_format
-        result = run(5, table_words=wrong_view)
-        assert result.returncode == 0, (hex(wrong_format), result.stderr)
-        extra += 1
+        add(f"wrong format {wrong_format:#x}", 5, table_words=wrong_view)
+    if check_references(f"heap-store {mode}", renderer, backend, cso, references, allow_hardware_skip=True) == 77:
+        return 77
     width_str = {"d16_x": "4u", "d16_xy": "8u", "d16_xyz": "12u"}.get(mode, "16u")
     format_guard = {"d16_x": f"{FLOAT1:#x}u", "d16_xy": f"{FLOAT2:#x}u",
                     "d16_xyz": f"{FLOAT3:#x}u"}.get(mode, "formatWord")
@@ -315,14 +308,16 @@ def draw(directory, compiler, renderer, backend, mode):
     for old, new, slot, *first_mismatch in mutations:
         assert source.count(old) == 1, old
         compile_shader(source.replace(old, new))
-        result = run(slot)
+        case = directory / "mutated.case"
+        write_case(case, slot)
+        result = subprocess.run([renderer, backend, "--compute-store-case", cso, case], capture_output=True, text=True)
         assert result.returncode == 1 and "Compute readback differs" in result.stderr, (old, result.stderr)
         if first_mismatch:
             words = [line for line in result.stderr.splitlines() if line.startswith("word=")]
             assert words[:1] == first_mismatch, (old, result.stderr)
     kind = {"uint4": "UINT4", "d16_xyzw": "D16-to-FLOAT4", "d16_x": "D16_X-to-FLOAT1",
             "d16_xy": "D16_XY-to-FLOAT2", "d16_xyz": "D16_XYZ-to-FLOAT3"}[mode]
-    print(f"{backend} {kind}: {len(cases) + extra} heap-store cases and {len(mutations)} shader mutations checked")
+    print(f"{backend} {kind}: {len(references)} heap-store cases and {len(mutations)} shader mutations checked")
     return 0
 
 

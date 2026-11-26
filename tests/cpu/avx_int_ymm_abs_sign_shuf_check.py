@@ -243,8 +243,8 @@ def check_translator():
          "unsupported EVEX instruction"),
         ("vpshufhw_evex", (loads[0], Instruction.create_reg_reg_u32(
             Code.EVEX_VPSHUFHW_YMM_K1Z_YMMM256_IMM8, R.YMM0, R.YMM1, 0x1B), ret), "unsupported EVEX instruction"),
-        ("vpmovsxbw_ymm_xmm_source", (loads[0], Instruction.create_reg_reg(
-            Code.VEX_VPMOVSXBW_YMM_XMMM128, R.YMM0, R.XMM1), ret), "unsupported VEX.256 (L=1) packed-integer encoding"),
+        ("vpsrld_ymm_xmm_source", (*loads, Instruction.create_reg_reg_reg(
+            Code.VEX_VPSRLD_YMM_YMM_XMMM128, R.YMM0, R.YMM1, R.XMM2), ret), "unsupported VEX.256 (L=1) packed-integer encoding"),
         ("vpshufb_ymm_other_form", (*loads, Instruction.create_reg_reg_reg(
             Code.VEX_VPSHUFB_YMM_YMM_YMMM256, R.YMM0, R.YMM1, R.YMM2), ret), "unsupported instruction"),
         ("vpalignr_ymm_other_form", (*loads, Instruction.create_reg_reg_reg_u32(
