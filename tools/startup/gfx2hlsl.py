@@ -10983,8 +10983,11 @@ def compute_entry(state_a):
     return words[6], (words[3] & 0xffff, words[3] >> 16, words[4] & 0xffff)
 
 
-def load_compute_request(out_dir, key, refusals=None):
-    """The ComputePipeline of a slot 67 request, after checking the files against .desc and the key."""
+def load_compute_request(out_dir, key, refusals=None, pipeline_type=ComputePipeline):
+    """The ComputePipeline of a slot 67 request, after checking the files against .desc and the key.
+
+    pipeline_type(code, root, rsrc2, group, refusals=) builds the pipeline. The default is
+    ComputePipeline. compile_lds_request.py passes a functools.partial of its subclass."""
     name = os.path.join(out_dir, 'req_%016x' % key)
     try:
         parts = {ext: open(name + ext, 'rb').read() for ext in ('.c67', '.data', '.root', '.desc', '.sa', '.sb')}
@@ -11005,7 +11008,7 @@ def load_compute_request(out_dir, key, refusals=None):
     if S_ENDPGM not in struct.unpack('<%dI' % (len(code) // 4), code):
         raise Unsupported('compute code without s_endpgm')
     rsrc2, group = compute_entry(parts['.sa'])
-    return ComputePipeline(code, parts['.root'], rsrc2, group, refusals=refusals)
+    return pipeline_type(code, parts['.root'], rsrc2, group, refusals=refusals)
 
 
 def compute_refusals(out_dir, key):
