@@ -1,4 +1,4 @@
-"""Biased implicit-LOD image_sample_b in tools/startup/gfx2hlsl.py (pixel stage only).
+"""Biased implicit-LOD image_sample_b in tools/startup/gfx2hlsl.py (pixel stage only; M200-01 B).
 
   (no arguments)                       translation controls, pure Python
   binary <llvm-mc>                     reassemble every fixture source and compare it with the recorded words
@@ -12,7 +12,8 @@ the bias being "One Dword float": the bias is the FIRST address register and the
 IntrinsicsAMDGPU.td lists the extra argument of AMDGPUSample_b as llvm_anyfloat_ty "bias" and MIMGInstructions.td gives
 IMAGE_SAMPLE_B the gfx10 opcode 0x25. HLSL Texture.SampleBias(sampler, location, bias) adds the bias to the
 implicit mip level, so the lowering is tex.SampleBias(smp, uv, bias). D3D documents the bias range as -16.0 to 15.99;
-the ISA text states no hardware clamp, so values outside that range are an unverified difference.
+the ISA text states no hardware clamp, so values outside that range are an unverified difference. Accepted under the
+entry EXEC mask even after a uniform join or later loop; divergent EXEC before the sample stays refused.
 
 Each fixture is a source-built gfx1013 pixel stage: v0 = bias, v1 = u = 0.75, v2 = v = 0.25 and v3 = the slice (root
 constant 1, s9). Constant coordinates have no derivatives (the implicit LOD would be log2(0) and the bias is lost), so
@@ -399,13 +400,20 @@ def check_guards():
         else:
             raise AssertionError('image_sample_b accepted %d address registers' % count)
     for label, kwargs in (('vertex stage', {'kind': 'vs'}), ('compute stage', {'kind': 'cs'}),
-                          ('exec modified', {'exec_known': False}), ('after a branch', {'blocks': [object()]})):
+                          ('exec modified', {'exec_known': False})):
         try:
             call('[v1, v2, v3]', **kwargs)
         except G.Unsupported as error:
             assert 'image_sample_b needs implicit derivatives' in str(error), (label, error)
         else:
             raise AssertionError('image_sample_b accepted: %s' % label)
+    # A prior branch target (non-empty blocks) is fine while EXEC is still the entry mask (M200-01 B).
+    try:
+        call('[v1, v2, v3]', blocks=[object()])
+    except G.Unsupported as error:
+        raise AssertionError('image_sample_b refused with entry EXEC after a join: %s' % error)
+    except AttributeError:
+        pass
     # The legal case gets past both guards: the bare stage then stops where it needs a pipeline.
     try:
         call('[v1, v2, v3]')
@@ -413,7 +421,24 @@ def check_guards():
         raise AssertionError('legal image_sample_b refused: %s' % error)
     except AttributeError:
         pass
-    print('refused: wrong address count, vertex and compute stages, modified exec, code after a branch')
+    print('refused: wrong address count, vertex and compute stages, modified exec; join with entry EXEC accepted')
+
+
+def sopp(op, simm):
+    return struct.pack('<I', (simm & 0xffff) | op << 16 | 0x17f << 23)
+
+
+def with_join_before_sample(data):
+    """Uniform forward join (every lane takes the same path) immediately before the sample_b."""
+    off = next(o for o, _s, _n, a in G.decode(data) if 'image_sample_b' in a)
+    join = (bytes.fromhex('800380be') + bytes.fromhex('008006bf') + sopp(5, 1) + bytes.fromhex('810381be'))
+    return data[:off] + join + data[off:]
+
+
+def with_divergent_exec_before_sample(data):
+    """Clear exec_lo after the loads so the entry-mask proof is gone before the sample."""
+    off = next(o for o, _s, _n, a in G.decode(data) if 'image_sample_b' in a)
+    return data[:off] + bytes.fromhex('8003febe') + data[off:]
 
 
 def controls():
@@ -421,6 +446,16 @@ def controls():
     locate()
     stage('array 1').hlsl_ps()  # the plain translation first: a translator without the lowering stops here
     check_guards()
+    plain = bytes.fromhex(WORDS['plain'])
+    join_ps = G.Pipeline(VS_WORDS, with_join_before_sample(plain), root_blob()).hlsl_ps()
+    assert 'SampleBias' in join_ps and bias_call(join_ps, 'float2') == (['v1', 'v2'], 'v0'), join_ps
+    try:
+        G.Pipeline(VS_WORDS, with_divergent_exec_before_sample(plain), root_blob()).hlsl_ps()
+    except G.Unsupported as error:
+        assert 'image_sample_b needs implicit derivatives' in str(error), error
+    else:
+        raise AssertionError('image_sample_b accepted after divergent EXEC')
+    print('uniform join before sample_b accepted; divergent EXEC before sample_b refused')
     # Address order: the bias register comes first and is the third SampleBias argument.
     expected = {
         'array 1': (['v1', 'v2', 'v3'], 'v0', 'float3', 'Texture2DArray<float4> r0'),
@@ -588,6 +623,18 @@ def check_draw(dxc, renderer, adapter, fxc=None):
                     if run.returncode:
                         raise AssertionError('%s %s slice=%d\n%s\n%s' % (kind, name, slice_index, run.stdout, run.stderr))
                     print('%s sample_b %s slice=%d: %s' % (kind, name, slice_index, expected), flush=True)
+            # M200-01 B: the same bias-1 array sample after a uniform join must still read mip 0.
+            join_words = with_join_before_sample(bytes.fromhex(WORDS['array -1']))
+            join_pipe = G.Pipeline(VS_WORDS, join_words, root_blob())
+            join_shader = compile_hlsl(compiler, kind, drawable(join_pipe.hlsl_ps()), 'ps_join_m1_%s' % kind,
+                                       ps_profile, directory)
+            join_line = sampler_line(join_pipe)
+            for slice_index in (0, 1):
+                expected = texel_cell(mip_for(-1), slice_index)
+                run = draw_once(vs, join_shader, slice_index, expected, join_line)
+                if run.returncode:
+                    raise AssertionError('%s join sample_b slice=%d\n%s\n%s' % (kind, slice_index, run.stdout, run.stderr))
+                print('%s sample_b join-before bias=-1 slice=%d: %s' % (kind, slice_index, expected), flush=True)
             # Negative control: without a bias the draw reads mip 1, so the bias -1 and bias +1 expectations must fail.
             line = sampler_line(stage('array nobias'))
             nobias = compile_hlsl(compiler, kind, drawable(translated['array nobias']), 'ps_nobias_%s' % kind, ps_profile, directory)

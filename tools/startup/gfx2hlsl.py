@@ -4836,9 +4836,11 @@ class Stage:
             else:
                 # The bias is added to the LOD derived from the coordinate derivatives of the pixel quad: only a
                 # pixel stage that still runs with its entry mask has them. Elsewhere the plain sample is lowered
-                # to level 0, which would drop the bias, so the bias form is refused instead.
-                if self.kind != 'ps' or not self.exec_known or len(self.blocks) > 0:
-                    raise Unsupported('image_sample_b needs implicit derivatives: pixel stage, entry mask, no branches')
+                # to level 0, which would drop the bias, so the bias form is refused instead. A uniform join or
+                # later loop does not drop the proof: every lane still reaches the sample with the entry EXEC
+                # (M200-01 B/L). Divergent EXEC before the sample stays refused.
+                if self.kind != 'ps' or not self.exec_known:
+                    raise Unsupported('image_sample_b needs implicit derivatives: pixel stage with the entry EXEC mask')
                 bias, cs = cs[0], cs[1:]
         if how == 'get_lod':
             # image_get_lod returns [0] the LOD a sample would use, clamped, and [1] the computed LOD before the clamp
@@ -4850,8 +4852,8 @@ class Stage:
             if self.kind != 'ps' or dim != 'SQ_RSRC_IMG_2D' or not dmask or dmask & ~3 or len(cs) != 2:
                 raise Unsupported('image_get_lod form %s %s' % (', '.join(ops), ' '.join(mods)))
             # Both HLSL calls take implicit derivatives, so the rule of image_sample_b applies.
-            if not self.exec_known or len(self.blocks) > 0:
-                raise Unsupported('image_get_lod needs implicit derivatives: pixel stage, entry mask, no branches')
+            if not self.exec_known:
+                raise Unsupported('image_get_lod needs implicit derivatives: pixel stage with the entry EXEC mask')
         desc_key = self.descriptor(ops[2])
         tex = self.pipe.resource(desc_key, kinds[dim])
         if how in ('load', 'load_mip'):
