@@ -1349,6 +1349,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_D3D12_RELEASE_RETIRED=1` | opt-in, effective with `X2W_D3D12_RENDER=1` only (the list handlers that record holds exist only there): frees the desktop object of a released committed 2D texture of one narrow class once no recorded list, submission or release-time fence refers to it ([details](#d3d12-resource-budget)). Unset, nothing changes |
 | `X2W_D3D12_RELEASE_RETIRED_VIEWS=1` | opt-in, effective only together with `X2W_D3D12_RELEASE_RETIRED=1`: a released class texture that only tracked slot-18 descriptor slots keep alive (the title never overwrites them) is freed once those slots are replaced by null descriptors ([details](#d3d12-resource-budget)). Unset, nothing changes |
 | `X2W_D3D12_RETIRE_REASONS=1` | diagnostic only, effective with `X2W_D3D12_RELEASE_RETIRED=1` and `X2W_D3D12_BUDGET=1`: adds one `x2w-retire held:` line to the heartbeat that counts final-released resources whose desktop object is still alive, by reason ([details](#d3d12-resource-budget)). Unset, nothing is recorded |
+| `X2W_D3D12_VIEW_CENSUS=1` | diagnostic only: counts new distinct view records by device slot (a heartbeat line), and logs the record vector capacity and hash bucket count before either grows ([details](#d3d12-view-census)). Unset, nothing is counted or logged |
 | `X2W_DRAW_NULL_IDENTITY=1` | null descriptors read as identity values instead of zero |
 | `X2W_DEPTH_STATE=1` | translated draws of slot 57 pipelines take their depth-stencil state and stencil reference from state block A instead of the desktop default (depth and stencil off); a refused block keeps the default. Off by default, then nothing changes: see [Shortcuts that are known to be wrong](#shortcuts-that-are-known-to-be-wrong) |
 | `X2W_PRESENT_SIGNATURE_EVERY=<n>` | in render mode, samples a coarse signature of the presented picture every `n` presents from the start, without a script request (`0` off). Unset, sampling starts, every 4 presents, only once a script with a `wait` asks for it: see [Waiting for the presented picture](#waiting-for-the-presented-picture) |
@@ -1533,6 +1534,48 @@ title memory) still records its upload. The fixture-only exports `x2w_d3d12_reti
 FALSE without the switch, like `x2w_d3d12_budget_snapshot`. `startup_resource_retire_off_*`
 runs the same steps without the switch. The hardware cases report 77 without a
 physical adapter, and the debug-layer cases report 77 where the debug layer is not installed.
+
+## D3D12 view census
+
+The stand-in keeps one record per distinct view: slot, resource, counter,
+description bytes and whether the desktop view was created. Records are not
+removed. `X2W_D3D12_VIEW_CENSUS=1` shows which slot adds them. It changes no
+record, id or descriptor binding.
+
+The heartbeat adds a line:
+
+`x2w-view-census distinct by slot: cbv= srv= uav= rtv= dsv= sampler= records= capacity= ids= buckets= grows-records= grows-ids= missed=`
+
+- `cbv` to `sampler`: new records from device slots 17 to 22.
+- `records`, `capacity`: size and capacity of the record vector.
+- `ids`, `buckets`: size and bucket count of the hash map from content to id.
+
+Before an insertion that is expected to grow either container, the same fields
+are logged as `x2w-view-census before growth of <records|ids|records and ids>`,
+with the slot of the new record. The values are those before the growth. The line
+is written before the allocation, so it is in the log when that allocation fails,
+also when no further heartbeat follows. The growth is predicted: from the
+vector's capacity, and for the map from the MSVC rehash rule (the new size over
+the bucket count exceeds the maximum load factor). `missed` counts capacity or
+bucket changes that no line announced.
+
+The census counts distinct byte contents, not distinct views. It does not say
+why two records differ (for example a changing address, or description bytes
+that the view type does not use), and it does not measure the size of the
+containers in bytes or reduce it.
+
+`startup_view_census_<warp|hardware>` calls slots 17, 18 and 22 of the device.
+A repeated descriptor must add no record and grow nothing. A stream of 200,000
+distinct constant buffer views, 3,000 buffer SRVs and 100 samplers must be
+counted by slot, with one log line per announced growth. Both streams run under
+a job commit limit 256 MiB above the commit held after setup. `off` checks that
+nothing is reported without the switch; in `vary` the repeated stream changes
+every call, and the fixture must fail. Slots 19 to 21 are not exercised.
+
+```powershell
+cmake --build --preset dev --target startup_view_census
+ctest --preset dev --no-tests=error -R "^startup_view_census" -V
+```
 
 ## Input script
 

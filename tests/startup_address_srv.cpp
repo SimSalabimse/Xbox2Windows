@@ -533,6 +533,16 @@ int draw_address_buffer_srvs(ID3D12Device* desktop, void* guest, void* list)
     invoke(guest, 70, ptr(&desc), ptr(&raw), cpu);
     draw(5);
     draw(6);
+
+    // An unplaced buffer in an allocation above the 256 MiB limit is not wrapped as an existing heap; its
+    // upload copy must still publish the bytes at the address.
+    static auto* const large = static_cast<std::uint32_t*>(
+        VirtualAlloc(nullptr, (256ull << 20) + 65536, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (!large) return 53;
+    large[4] = 77;
+    raw.address = ptr(large);
+    raw.view.Buffer.FirstElement = 4;
+    invoke(guest, 70, ptr(&desc), ptr(&raw), cpu);
     draw(7);
     return 0;
 }

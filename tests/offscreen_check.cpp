@@ -459,11 +459,14 @@ bool validate_compute_mesh_texture_fallback_args(int argc, char** argv)
            (argc != 10 || std::string_view(argv[9]) == "--stale");
 }
 
-template<class AfterDraw>
-OperationResult run_pixel_batch(const OperationContext& ctx, AfterDraw after_draw)
+template<class AfterCase>
+OperationResult run_readback_batch(const OperationContext& ctx, AfterCase after_case)
 {
-    const bool pairs = std::string_view(ctx.argv[2]) == "--check-pixel-pairs";
+    const std::string_view operation(ctx.argv[2]);
+    const bool pairs = operation == "--check-pixel-pairs";
+    const bool compute = operation == "--compute-store-batch";
     const int stride = pairs ? 2 : 1;
+    ComputeReadbackProgram program;
     bool failed = false;
     for (int i = 4, index = 0; i < ctx.argc; i += stride, ++index) {
         const char* shader = ctx.argv[pairs ? i - 1 : 3];
@@ -471,10 +474,15 @@ OperationResult run_pixel_batch(const OperationContext& ctx, AfterDraw after_dra
         std::fprintf(stderr, "case=%d path=%s\n", index, ctx.argv[i]);
         if (pairs) std::fprintf(stderr, "shader=%s\n", shader);
         try {
-            check(ctx.device->GetDeviceRemovedReason(), "Pixel batch device");
-            check_translated_pixel(ctx.device, shader, false, ctx.argv[i]);
-            after_draw(index);
-        } catch (const PixelMismatch& e) {
+            check(ctx.device->GetDeviceRemovedReason(), compute ? "Compute batch device" : "Pixel batch device");
+            if (compute) {
+                if (!program.pipeline) program = load_compute_store_program(ctx.device, shader);
+                check_compute_store_reference(ctx.device, program, ctx.argv[i]);
+            } else {
+                check_translated_pixel(ctx.device, shader, false, ctx.argv[i]);
+            }
+            after_case(index);
+        } catch (const ReadbackMismatch& e) {
             std::fprintf(stderr, "%s\n", e.what());
             status = "mismatch";
         } catch (const std::exception& e) {
@@ -490,15 +498,15 @@ OperationResult run_pixel_batch(const OperationContext& ctx, AfterDraw after_dra
     return failed ? OperationResult{OutcomeKind::fail, nullptr} : OperationResult{OutcomeKind::pass, nullptr};
 }
 
-OperationResult run_check_pixel_batch(const OperationContext& ctx)
+OperationResult run_check_batch(const OperationContext& ctx)
 {
-    return run_pixel_batch(ctx, [](int) {});
+    return run_readback_batch(ctx, [](int) {});
 }
 
 OperationResult run_pixel_batch_debug_control(const OperationContext& ctx)
 {
     if (!ctx.messages) return {OutcomeKind::skip, "skip: pixel batch control requires the D3D12 debug layer"};
-    return run_pixel_batch(ctx, [&](int index) {
+    return run_readback_batch(ctx, [&](int index) {
         if (index == 1)
             check(ctx.messages->AddApplicationMessage(D3D12_MESSAGE_SEVERITY_ERROR, "pixel batch control error"),
                   "Add pixel batch control message");
@@ -511,7 +519,7 @@ OperationResult run_pixel_batch_removal_control(const OperationContext& ctx)
     const HRESULT hr = ctx.device->QueryInterface(IID_PPV_ARGS(&device));
     if (hr == E_NOINTERFACE) return {OutcomeKind::skip, "skip: pixel batch control requires ID3D12Device5"};
     check(hr, "Query pixel batch control device");
-    return run_pixel_batch(ctx, [&](int index) {
+    return run_readback_batch(ctx, [&](int index) {
         if (index == 1) device->RemoveDevice();
     });
 }
@@ -1620,8 +1628,8 @@ constexpr CapabilityGate kGateSm66MinLod{
 // Scenario-dependent capability checks (such as DXR tier, mesh tier, or existing-heap support)
 // remain inside the handlers and report OutcomeKind::skip.
 const OperationSpec kOperations[] = {
-    {"--check-pixel-batch", 5, kUnboundedArgc, nullptr, kNoGate, run_check_pixel_batch},
-    {"--check-pixel-pairs", 5, kUnboundedArgc, validate_pixel_pairs_args, kNoGate, run_check_pixel_batch},
+    {"--check-pixel-batch", 5, kUnboundedArgc, nullptr, kNoGate, run_check_batch},
+    {"--check-pixel-pairs", 5, kUnboundedArgc, validate_pixel_pairs_args, kNoGate, run_check_batch},
     {"--pixel-batch-debug-control", 7, 7, nullptr, kNoGate, run_pixel_batch_debug_control},
     {"--pixel-batch-removal-control", 7, 7, nullptr, kNoGate, run_pixel_batch_removal_control},
     {"--compute-root", 3, 3, nullptr, kNoGate, run_compute_root},
@@ -1629,6 +1637,7 @@ const OperationSpec kOperations[] = {
     {"--compute-root-file", 4, 4, nullptr, kNoGate, run_compute_root_file},
     {"--ffx-immediate-conversion", 4, 4, nullptr, kNoGate, run_ffx_immediate_conversion},
     {"--compute-store-case", 5, 5, nullptr, kNoGate, run_compute_store_case},
+    {"--compute-store-batch", 5, kUnboundedArgc, nullptr, kNoGate, run_check_batch},
     {"--compute-store-sized-case", 5, 6, nullptr, kNoGate, run_compute_store_sized_case},
     {"--compute-store-dpp-case", 5, 5, nullptr, kGateShaderWave, run_compute_store_dpp_case},
     {"--compute-store-case-atomic64", 5, 5, nullptr, kGateComputeAtomic64, run_compute_store_case},

@@ -1,0 +1,27 @@
+EXPORTS
+    op_bzhi32
+    op_bzhi64
+    op_mulx32
+    op_mulx64
+    op_mulx32_alias
+    op_mulx64_alias
+    op_pdep32
+    op_pdep64
+    op_pext32
+    op_pext64
+    op_bzhi32_mem
+    op_bzhi64_mem
+    op_mulx32_mem
+    op_mulx64_mem
+    op_pdep32_mem
+    op_pdep64_mem
+    op_pext32_mem
+    op_pext64_mem
+    op_mem_r8_source
+    op_bzhi32_flags
+    op_bzhi64_flags
+    op_flags_preserve32
+    op_flags_preserve64
+    op_flags_preserve_pf
+    op_flags_preserve_mem
+    op_bmi2_bit_discarded_read
