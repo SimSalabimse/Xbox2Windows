@@ -3,16 +3,18 @@
 image_get_lod returns [0] the LOD a sample would use, clamped, and [1] the computed LOD before the clamp (Mesa
 nir_texop_lod, emitted by ACO as image_get_lod; GLSL textureQueryLod x/y). It is lowered to HLSL
 CalculateLevelOfDetail / CalculateLevelOfDetailUnclamped, which take implicit derivatives like Sample, so the stage
-must be a pixel stage whose EXEC is still the entry mask (every lane active). A uniform join or later loop does not
-drop that proof; divergent EXEC before the read does. The clamped value depends on the sampler's LOD limits and bias,
-so the sampler must be a constant descriptor under the validation of image_sample_b.
+must be a pixel stage whose EXEC is still the entry mask (every lane active) with wave-uniform control flow. A
+uniform (scc) join or later loop does not drop that proof; divergent EXEC or a vcc/exec-conditioned branch before
+the read does. The clamped value depends on the sampler's LOD limits and bias, so the sampler must be a constant
+descriptor under the validation of image_sample_b.
 
 Fixture (synthetic): the recorded c_lz stage of startup_image_sample_c_check with the MIMG opcode set to 0x60
 (image_get_lod; the decoder reads it back with a 2-register address), sampler word 2 loaded from a literal (mip
 filter point), and for the second form dmask 0x3.
 Checks: dmask 0x1, 0x2 and 0x3 lower to the two calls on the sampler, which carries its LOD limits. A uniform join
-before the read is accepted. Controls (refused): dmask 0x4, a 2D array, divergent EXEC before the read, a sampler LOD
-bias, a sampler with mipmapping disabled, and the stage without op_image_get_lod (negative control: refused as on main).
+before the read is accepted. Controls (refused): dmask 0x4, a 2D array, divergent EXEC, s_cbranch_vccz/execz before
+the read, a sampler LOD bias, a sampler with mipmapping disabled, and the stage without op_image_get_lod
+(negative control: refused as on main).
   draw <dxc> [fxc]: also compile the dmask 0x3 stage with dxc ps_6_0 (and fxc ps_5_1).
 """
 import struct
@@ -39,7 +41,7 @@ def sopp(op, simm):
     return struct.pack('<I', (simm & 0xffff) | op << 16 | 0x17f << 23)
 
 
-def stage(dmask=1, dim=1, branch=False, divergent=False, join=False, word2=MIP_POINT):
+def stage(dmask=1, dim=1, branch=False, divergent=False, join=False, cf_op=None, word2=MIP_POINT):
     w = bytearray(C.WORDS['lz'])
     assert w[W2_AT:W2_AT + 4] == bytes.fromhex('80039abe'), w[W2_AT:W2_AT + 4].hex()
     w[W2_AT:W2_AT + 4] = struct.pack('<II', 0xbe9a03ff, word2)  # s_mov_b32 s26, literal
@@ -56,6 +58,8 @@ def stage(dmask=1, dim=1, branch=False, divergent=False, join=False, word2=MIP_P
         insert += (bytes.fromhex('800380be') + bytes.fromhex('008006bf') + sopp(5, 1) + bytes.fromhex('810381be'))
     if divergent:  # s_mov_b32 exec_lo, 0: the entry-mask proof is gone
         insert += bytes.fromhex('8003febe')
+    if cf_op is not None:  # s_mov; s_cbranch_<op> +1; s_mov (vcc/exec: divergent CF)
+        insert += bytes.fromhex('800380be') + sopp(cf_op, 1) + bytes.fromhex('810381be')
     if insert:
         code = code[:AT] + insert + code[AT:]
     return code
@@ -93,6 +97,8 @@ def controls():
     refused(stage(dmask=4), 'image_get_lod form')
     refused(stage(dim=5), 'image_get_lod form')  # SQ_RSRC_IMG_2D_ARRAY
     refused(stage(divergent=True), 'image_get_lod needs implicit derivatives')
+    for op in (6, 7, 8, 9):  # vccz, vccnz, execz, execnz
+        refused(stage(cf_op=op), 'image_get_lod needs implicit derivatives')
     refused(stage(word2=MIP_POINT | 1), 'image_get_lod with a sampler LOD bias')
     refused(stage(word2=0), 'image_get_lod with mipmapping disabled')
     saved = G.Stage.op_image_get_lod
@@ -102,8 +108,8 @@ def controls():
     finally:
         G.Stage.op_image_get_lod = saved
     print('image_get_lod: CalculateLevelOfDetail / Unclamped for dmask 0x1, 0x2 and 0x3; uniform join/branch before '
-          'the read accepted; dmask 0x4, a 2D array, divergent EXEC, a sampler bias and a sampler without mipmapping '
-          'refused; refused without the handler')
+          'the read accepted; dmask 0x4, a 2D array, divergent EXEC, vcc/exec branches, a sampler bias and a '
+          'sampler without mipmapping refused; refused without the handler')
     return pipe
 
 

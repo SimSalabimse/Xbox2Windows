@@ -2592,6 +2592,8 @@ class Stage:
             self.sym = dict(init_sym)
             self.exec_known = init_exec_known
             self.wqm_exec = init_wqm_exec
+            # True until a wave-divergent branch: SampleBias / CalculateLevelOfDetail need uniform CF.
+            self.uniform_cf = True
             self.masks = set(init_masks)
             self.join_masks = set()   # marked SGPRs whose mark is not proven on every path (unjoined)
             last_write = {}           # SGPR -> offset of its last write in program order
@@ -2749,6 +2751,8 @@ class Stage:
                                 raise Unsupported('slot 57 mesh: %s on a wave-wide condition is not covered' % name)
                             cond_uniform = True
                         if not cond_uniform:
+                            # Divergent CF: later SampleBias / CalculateLevelOfDetail would see uneven quads.
+                            self.uniform_cf = False
                             b_target = int(parse(asm)[1][0].split('_')[1], 16)
                             regs, affected = div_targets.get(off, (set(), set()))
                             regs = {r for r in regs if isinstance(r, int)}
@@ -5087,12 +5091,14 @@ class Stage:
                 lod, cs = cs[-1], cs[:-1]
             else:
                 # The bias is added to the LOD derived from the coordinate derivatives of the pixel quad: only a
-                # pixel stage that still runs with its entry mask has them. Elsewhere the plain sample is lowered
-                # to level 0, which would drop the bias, so the bias form is refused instead. A uniform join or
-                # later loop does not drop the proof: every lane still reaches the sample with the entry EXEC
-                # (M200-01 B/L). Divergent EXEC before the sample stays refused.
-                if self.kind != 'ps' or not self.exec_known:
-                    raise Unsupported('image_sample_b needs implicit derivatives: pixel stage with the entry EXEC mask')
+                # pixel stage that still runs with its entry mask and wave-uniform control flow has them.
+                # Elsewhere the plain sample is lowered to level 0, which would drop the bias, so the bias form is
+                # refused instead. A uniform join (scc with scc_uniform) or later loop does not drop the proof
+                # (M200-01 B/L). Divergent EXEC or a vcc/exec-conditioned branch before the sample stays refused.
+                if (self.kind != 'ps' or not self.exec_known or
+                        not getattr(self, 'uniform_cf', True)):
+                    raise Unsupported('image_sample_b needs implicit derivatives: pixel stage with the entry EXEC '
+                                     'mask and wave-uniform control flow')
                 bias, cs = cs[0], cs[1:]
         if how == 'get_lod':
             # image_get_lod returns [0] the LOD a sample would use, clamped, and [1] the computed LOD before the clamp
@@ -5104,8 +5110,9 @@ class Stage:
             if self.kind != 'ps' or dim != 'SQ_RSRC_IMG_2D' or not dmask or dmask & ~3 or len(cs) != 2:
                 raise Unsupported('image_get_lod form %s %s' % (', '.join(ops), ' '.join(mods)))
             # Both HLSL calls take implicit derivatives, so the rule of image_sample_b applies.
-            if not self.exec_known:
-                raise Unsupported('image_get_lod needs implicit derivatives: pixel stage with the entry EXEC mask')
+            if not self.exec_known or not getattr(self, 'uniform_cf', True):
+                raise Unsupported('image_get_lod needs implicit derivatives: pixel stage with the entry EXEC '
+                                 'mask and wave-uniform control flow')
         desc_key = self.descriptor(ops[2])
         tex = self.pipe.resource(desc_key, kinds[dim])
         if how in ('load', 'load_mip'):
