@@ -1418,6 +1418,20 @@ OperationResult run_startup_image_store(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+// --startup-image-atomic-umin <vs.cso> <ps.cso> <x,y> <expected hex word>: pixel-stage image_atomic_umin
+// on an R32_UINT UAV (tests/startup_image_atomic_umin.cpp); texel (x, y) must hold the word and every
+// other texel 0xffffffff.
+OperationResult run_startup_image_atomic_umin(const OperationContext& ctx)
+{
+    unsigned x = 0, y = 0;
+    std::uint32_t expected = 0;
+    if (std::sscanf(ctx.argv[5], "%u,%u", &x, &y) != 2) return {OutcomeKind::fail, "texel is not x,y"};
+    if (std::sscanf(ctx.argv[6], "%8x", &expected) != 1) return {OutcomeKind::fail, "expected value is not a hex word"};
+    if (check_startup_image_atomic_umin(ctx.device, ctx.argv[3], ctx.argv[4], x, y, expected))
+        return {OutcomeKind::fail, "image atomic umin readback differs"};
+    return {OutcomeKind::pass, nullptr};
+}
+
 const char* check_startup_sharedexp_target(ID3D12Device* device, ID3D12InfoQueue* messages);
 
 OperationResult run_startup_sharedexp_target(const OperationContext& ctx)
@@ -1684,6 +1698,7 @@ const OperationSpec kOperations[] = {
     {"--startup-image-2d-view", 7, 7, nullptr, kNoGate, run_startup_image_2d_view},
     {"--startup-image-3d", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-store", 7, 7, nullptr, kNoGate, run_startup_image_store},
+    {"--startup-image-atomic-umin", 7, 7, nullptr, kNoGate, run_startup_image_atomic_umin},
     {"--startup-image-2d-array", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-2d-array-mips", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-image-load-d16", 7, 7, nullptr, kNoGate, run_startup_image_load_d16},

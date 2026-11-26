@@ -14709,6 +14709,25 @@ cmake --build --preset release --target offscreen_check
 ctest --preset release --no-tests=error -R '^startup_compute_image_store_d16' -V
 ```
 
+### Startup pixel image_atomic_umin
+
+The startup graphics translator lowers pixel-stage gfx1013 `image_atomic_umin`
+on a 2D image with `dmask:0x1` to unsigned `InterlockedMin` on
+`RWTexture2D<uint>` (manifest `uav N tex2du`). The operand stays unsigned (no
+`asint`). `glc` (return the old value), other dimensions, other dmasks and other
+image atomics stay refused. The source-built fixture uses operand `0x80000011`
+so unsigned ordering differs from signed `smin` against an all-ones initial
+texel; an inactive-lane control must leave that texel untouched.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^startup_pixel_image_atomic_umin' -V
+```
+
+```bash
+python3 -B tests/startup_pixel_image_atomic_umin_check.py
+```
+
 ### Startup compute 32-bit float image store
 
 The startup compute translator also accepts a 2D 32-bit `image_store` (with or

@@ -923,7 +923,7 @@ QUAD_SWAPS = {(1, 0, 3, 2): 'QuadReadAcrossX', (2, 3, 0, 1): 'QuadReadAcrossY', 
 
 # Opcodes whose first operand is a source, not a destination (interp_f16_scan must not read it as a write).
 INTERP_STORE_PREFIXES = ('buffer_store', 'tbuffer_store', 'global_store', 'flat_store', 'scratch_store', 'ds_write',
-                         'ds_store', 'image_store')
+                         'ds_store', 'image_store', 'image_atomic')
 
 
 # VALU forms whose second operand is an SGPR destination (VOP3b carry-out or scale flag), not a source.
@@ -5595,6 +5595,52 @@ class Stage:
         body = '%s[uint2(%s, %s)] = %s;' % (image, self.u(cs[0]), self.u(cs[1]), value)
         self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
 
+    def op_image_atomic_umin(self, ops, mods):
+        """Unsigned image atomic minimum on a 2D R32_UINT UAV in the pixel stage (M200-01 A).
+
+        MIMG opcode 0x15 (IMAGE_ATOMIC_UMIN): VDATA is the source word (no return without glc),
+        VADDR the integer texel address (x, y for dim 2D) and SRSRC the image descriptor. Only
+        DMASK 0x1 and dim SQ_RSRC_IMG_2D are lowered. HLSL InterlockedMin on RWTexture2D<uint>
+        compares unsigned; do not wrap the operand in asint (that would be smin ordering).
+        """
+        name = 'image_atomic_umin'
+        if self.kind != 'ps':
+            raise Unsupported('%s outside a pixel stage' % name)
+        if len(ops) != 3:
+            raise Unsupported('%s with %d operands' % (name, len(ops)))
+        for m in mods:
+            # Integer texel coordinates: unorm is a no-op, as on image_store / image_load.
+            if not (m.startswith(('dim:', 'dmask:')) or m in ('dlc', 'slc', 'unorm')):
+                raise Unsupported('%s modifier %s' % (name, m))
+        dims = [m[4:] for m in mods if m.startswith('dim:')]
+        masks = [m[6:] for m in mods if m.startswith('dmask:')]
+        if len(dims) != 1 or len(masks) != 1:
+            raise Unsupported('%s without exactly one dim and dmask' % name)
+        if dims[0] != 'SQ_RSRC_IMG_2D':
+            raise Unsupported('%s on %s: only 2D images are lowered' % (name, dims[0]))
+        try:
+            mask = int(masks[0], 0)
+        except ValueError:
+            raise Unsupported('%s with dmask %s: not an integer' % (name, masks[0])) from None
+        if mask != 0x1:
+            raise Unsupported('%s with dmask %s: only the red channel (0x1) is lowered' % (name, masks[0]))
+        data = reg_range(ops[0])
+        if not data or data[0] != 'v' or data[2] != data[1] or data[2] > 255:
+            raise Unsupported('%s data %s: one VGPR expected' % (name, ops[0]))
+        coords = ops[1]
+        if coords.startswith('['):
+            cs = [c.strip() for c in coords[1:-1].split(',')]
+        else:
+            r = reg_range(coords)
+            cs = ['v%d' % n for n in range(r[1], r[2] + 1)] if r and r[0] == 'v' else []
+        if len(cs) != 2:
+            raise Unsupported('%s with %d address registers: x and y expected' % (name, len(cs)))
+        key = self.descriptor(ops[2])
+        image = self.pipe.uav(key, 'tex2du')
+        body = 'InterlockedMin(%s[uint2(%s, %s)], %s);' % (
+            image, self.u(cs[0]), self.u(cs[1]), self.u('v%d' % data[1]))
+        self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
+
     def gather_2d_setup(self, name, ops, mods, addr_count, addr_label, *, mip_preclamp):
         if self.kind not in ('ps', 'cs') or len(ops) != 4:
             raise Unsupported('%s requires a pixel or compute stage and four operands' % name)
@@ -7631,7 +7677,9 @@ class Pipeline:
         for key, r in sorted(self.resources.items(), key=lambda kv: kv[1]['index']):
             out.append('%s r%d : register(t%d);' % ({'buf': 'ByteAddressBuffer', 'tex1d': 'Texture1D<float4>', 'tex2d': 'Texture2D<float4>', 'tex2da': 'Texture2DArray<float4>', 'tex3d': 'Texture3D<float4>'}[r['kind']], r['index'], r['index']))
         for key, r in sorted(self.stored_images().items(), key=lambda kv: kv[1]['index']):
-            out.append('%s %s%d : register(u%d);' % ({'tex2d': 'RWTexture2D<float4>', 'raw': 'RWByteAddressBuffer'}[r['kind']], 'u' if r['kind'] == 'raw' else 'w', r['index'], r['index']))
+            out.append('%s %s%d : register(u%d);' % (
+                {'tex2d': 'RWTexture2D<float4>', 'tex2du': 'RWTexture2D<uint>', 'raw': 'RWByteAddressBuffer'}[r['kind']],
+                'u' if r['kind'] == 'raw' else 'w', r['index'], r['index']))
         for key, i in self.samplers.items():
             out.append('%s q%d : register(s%d);' % ('SamplerComparisonState' if key[0] == 'cmp' else 'SamplerState', i, i))
         if self.uses_sampler_heap:

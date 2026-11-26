@@ -2008,6 +2008,7 @@ set_tests_properties(startup_list_dispatch_native_skip_srv_warp_control PROPERTI
     PASS_REGULAR_EXPRESSION "bound: expected no Dispatch line, got 1 Dispatch line\\(s\\)[\r\n]+  x2w-render Dispatch\\(2, 3, 1\\) refused: a compute root SRV is not bound")
 target_sources(offscreen_check PRIVATE tests/startup_image_3d.cpp)
 target_sources(offscreen_check PRIVATE tests/startup_image_store.cpp)
+target_sources(offscreen_check PRIVATE tests/startup_image_atomic_umin.cpp)
 target_sources(offscreen_check PRIVATE tests/startup_flat_param.cpp)
 target_sources(offscreen_check PRIVATE tests/startup_entry_words.cpp)
 # The storage root handed to the executable ends in a separator and is never cut off
@@ -3696,6 +3697,15 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/startup_pixel_image_store_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(startup_pixel_image_store_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endforeach()
+    # gfx2hlsl pixel-stage image_atomic_umin (M200-01 A / Refs #2618): unsigned min on R32_UINT.
+    add_test(NAME startup_pixel_image_atomic_umin_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_pixel_image_atomic_umin_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_pixel_image_atomic_umin_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_pixel_image_atomic_umin_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_pixel_image_atomic_umin_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     endforeach()
     # gfx2hlsl 2D array images: translation controls, then a desktop draw that names the slice's texel.
     add_test(NAME startup_image_2d_array_controls COMMAND "${INTAKE_PYTHON}" -B

@@ -31,6 +31,8 @@ void check_startup_image_load_d16(ID3D12Device* device, const char* vertex_path,
                                   bool depth16, std::uint32_t words[64], bool array = false);
 int check_startup_image_store(ID3D12Device* device, const char* vertex_path, const char* pixel_path, UINT x, UINT y,
                               const std::uint32_t expected[4]);
+int check_startup_image_atomic_umin(ID3D12Device* device, const char* vertex_path, const char* pixel_path, UINT x,
+                                    UINT y, std::uint32_t expected);
 void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                               std::uint32_t* words, UINT width = 1, UINT height = 1,
                               D3D12_CULL_MODE cull = D3D12_CULL_MODE_NONE, BOOL front_ccw = FALSE,
