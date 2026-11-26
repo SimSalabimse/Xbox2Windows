@@ -86,6 +86,7 @@ jobs:
               (["tests/startup_gfx2hlsl_scalar_m0_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_waitcnt_depctr_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_mesh57_skeleton_check.py", "binary", "llvm-mc-15"], {}),
+              (["tests/startup_mesh57_loop_refusal_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_cvt_alu_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_cvt_pk_u8_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_cvt_pk_int16_check.py", "binary", "llvm-mc-15"], {}),
@@ -249,6 +250,7 @@ jobs:
             tests/startup_gfx2hlsl_int_med3_check.py \
             tests/startup_gfx2hlsl_cselect_mask_check.py \
             tests/startup_gfx2hlsl_mask_overwrite_check.py \
+            tests/startup_gfx2hlsl_mask_data_check.py \
             tests/startup_gfx2hlsl_image_get_lod_check.py \
             tests/startup_gfx2hlsl_add_sub_co_check.py \
             tests/startup_gfx2hlsl_add_sub_co_ci_check.py \
@@ -267,6 +269,7 @@ jobs:
             tests/startup_gfx2hlsl_scalar_m0_check.py \
             tests/startup_gfx2hlsl_waitcnt_depctr_check.py \
             tests/startup_mesh57_skeleton_check.py \
+            tests/startup_mesh57_loop_refusal_check.py \
             tests/startup_gfx2hlsl_scalar_shift64_bfe_check.py \
             tests/startup_gfx2hlsl_readfirstlane_uniform_check.py \
             tests/startup_gfx2hlsl_loop_constants_check.py \
@@ -290,6 +293,7 @@ jobs:
             tests/startup_compute_lds_b128_check.py \
             tests/startup_compute_translate_check.py \
             tests/startup_gfx2hlsl_swap_check.py \
+            tests/startup_gfx2hlsl_s_flbit_check.py \
             tests/startup_gfx2hlsl_fma_mix_check.py \
             tests/startup_gfx2hlsl_shift64_check.py \
             tests/startup_gfx2hlsl_mul_mad_i24_check.py \
@@ -308,6 +312,7 @@ jobs:
             tests/startup_gfx2hlsl_mul_hi_check.py \
             tests/startup_gfx2hlsl_sad_check.py \
             tests/startup_gfx2hlsl_scalar_brev_fold_check.py \
+            tests/startup_gfx2hlsl_pack_b32_f16_check.py \
             tests/startup_inline_sampler_check.py \
             tests/startup_buffer_address_check.py \
             tests/startup_buffer_format_word3_table_check.py \
@@ -328,6 +333,7 @@ jobs:
             tests/startup_gfx2hlsl_getpc_refusal_check.py \
             tests/startup_gfx2hlsl_image_arity_check.py \
             tests/startup_compute_lds_dual_atomics_check.py \
+            tests/startup_gfx2hlsl_desc_ptr_prop_check.py \
             tests/run_checks_parallel_check.py
   build-and-test:
     name: Build and test on Windows

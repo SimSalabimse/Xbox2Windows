@@ -412,6 +412,7 @@ CASES = {
 
 # Single instructions the controls splice into case A before its store, recorded from llvm-mc 15.
 STORE_A = WORDS_A.index(bytes.fromhex('001070e004050480'))
+SCC_LANE_SELECT = 'v_cndmask_b32_e64 v5, 0, 1, s20'
 SPLICE = {
     's_cmp_lt_u32 s7, 4': '07840abf',
     's_and_b32 s13, s13, 0xc000ffff': '0dff0d87ffff00c0',
@@ -422,7 +423,7 @@ SPLICE = {
     's_cmov_b32 s20, 1': '810594be',
     's_cmov_b64 s[20:21], s[4:5]': '040694be',
     's_cmovk_i32 s20, 3': '030014b1',
-    's_cbranch_scc0 1': '010084bf',
+    's_cbranch_scc0 2': '020084bf',
     's_cbranch_scc1 1': '010085bf',
     's_cbranch_vccz 1': '010086bf',
     'v_mov_b32 v3, 0': '8002067e',
@@ -441,6 +442,7 @@ SPLICE = {
     's_add_u32 s20, s7, 1': '07811480',
     's_or_b32 exec_lo, exec_lo, s0': '7e007e88',
     'v_mov_b32 v5, s20': '14020a7e',
+    SCC_LANE_SELECT: '050001d580025100',
     's_mov_b32 s21, exec_lo': '7e0395be',
     's_mov_b32 exec_lo, vcc_lo': '6a03febe',
     's_mov_b32 exec_lo, s21': '1503febe',
@@ -694,11 +696,10 @@ def check_mbcnt():
 
 def check_descriptor_scc():
     # Case A loads the input descriptor into s[12:15] and stores through s[16:19].
-    # Put the condition into the stored value, or let the branch skip the move.
+    # Read s20's lane bit into the stored value. The SCC branches skip both dwords of the lane select.
     compare = 's_cmp_lt_u32 s7, 4'
     mask = 's_and_b32 s13, s13, 0xc000ffff'
     select = 's_cselect_b32 s20, 1, 0'
-    move = 'v_mov_b32 v5, s20'
 
     def pipeline(*lines):
         return translate('A', code=splice(*lines))
@@ -707,20 +708,20 @@ def check_descriptor_scc():
         refused('scc from descriptor data', lambda: pipeline(*lines))
 
     for reader in (select, 's_cselect_b64 s[20:21], 1, 0', 's_cmov_b32 s20, 1', 's_cmov_b64 s[20:21], s[4:5]',
-                   's_cmovk_i32 s20, 3', 's_cbranch_scc0 1', 's_cbranch_scc1 1'):
-        rejected(compare, mask, reader, move)
-        assert 'uav 0 table 1 16' in pipeline(mask, compare, reader, move).manifest()
-    rejected(compare, 's_add_u32 s13, s13, 1', select, move)
-    assert 's20 = scc ?' in pipeline(compare, 's_mov_b32 s13, s13', select, move).hlsl_cs()
-    assert 's20 = scc ?' in pipeline(mask, 's_and_b32 s22, s7, 1', select, move).hlsl_cs()
-    assert 's20 = scc ?' in pipeline(mask, 's_and_saveexec_b32 s0, vcc_lo', select, move).hlsl_cs()
+                   's_cmovk_i32 s20, 3', 's_cbranch_scc0 2', 's_cbranch_scc1 2'):
+        rejected(compare, mask, reader, SCC_LANE_SELECT)
+        assert 'uav 0 table 1 16' in pipeline(mask, compare, reader, SCC_LANE_SELECT).manifest()
+    rejected(compare, 's_add_u32 s13, s13, 1', select, SCC_LANE_SELECT)
+    assert 's20 = scc ?' in pipeline(compare, 's_mov_b32 s13, s13', select, SCC_LANE_SELECT).hlsl_cs()
+    assert 's20 = scc ?' in pipeline(mask, 's_and_b32 s22, s7, 1', select, SCC_LANE_SELECT).hlsl_cs()
+    assert 's20 = scc ?' in pipeline(mask, 's_and_saveexec_b32 s0, vcc_lo', select, SCC_LANE_SELECT).hlsl_cs()
 
     # A conditional edge can bypass the fresh comparison. A back edge can carry
     # the descriptor-derived flag to a read that comes first in program order.
-    rejected(mask, 's_cbranch_vccz 1', compare, select, move)
+    rejected(mask, 's_cbranch_vccz 1', compare, select, SCC_LANE_SELECT)
     rejected(compare, 'v_mov_b32 v3, 0', select, mask, 'v_add_nc_u32 v3, 1, v3',
-             'v_cmp_gt_u32 vcc_lo, 2, v3', 's_cbranch_vccnz 65530', move)
-    assert 's20 = scc ?' in pipeline(compare, 's_branch 2', mask, select, move).hlsl_cs()
+             'v_cmp_gt_u32 vcc_lo, 2, v3', 's_cbranch_vccnz 65530', SCC_LANE_SELECT)
+    assert 's20 = scc ?' in pipeline(compare, 's_branch 2', mask, select, SCC_LANE_SELECT).hlsl_cs()
 
 
 def check_lds():

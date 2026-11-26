@@ -27,6 +27,8 @@
 //    it. Decisions as above; in addition every placement must be proven without VirtualQuery (a call
 //    count, not a time). The time per placement of the full walk, the bounded walk and the exact
 //    proof is printed.
+// 10. allocation_bytes (the unplaced slot 70 path's existing-heap limit): 64 KiB and 256 MiB + 64 KiB
+//    reservations with only their first page committed, asked at the base and at the last byte.
 //
 // --mutate region-only trusts the allocation size without checking that every page is committed: it
 // passes (exits 0) only if decisions differ in the partly committed cases and nowhere else.
@@ -409,6 +411,23 @@ int main(int argc, char** argv)
             current = other;
             VirtualFree(block, 0, MEM_RELEASE);
         }
+    }
+
+    // Case 10: allocation_bytes reports the whole allocation from any address in it, committed or not.
+    {
+        const SIZE_T sizes[] = {page, (SIZE_T{256} << 20) + page};
+        for (const SIZE_T bytes : sizes) {
+            auto* block = static_cast<char*>(VirtualAlloc(nullptr, bytes, MEM_RESERVE, PAGE_NOACCESS));
+            if (!block || !VirtualAlloc(block, page, MEM_COMMIT, PAGE_READWRITE)) {
+                setup_fail("cannot reserve the allocation-size block", block);
+                if (block) VirtualFree(block, 0, MEM_RELEASE);
+                continue;
+            }
+            if (x2w_startup::allocation_bytes(block) != bytes) fail("allocation_bytes at the base", block);
+            if (x2w_startup::allocation_bytes(block + bytes - 1) != bytes) fail("allocation_bytes at the last byte", block);
+            VirtualFree(block, 0, MEM_RELEASE);
+        }
+        if (x2w_startup::allocation_bytes(nullptr) != 0) fail("allocation_bytes of a null address", nullptr);
     }
 
     std::printf("all %llu placements: VirtualQuery calls full walk %llu, measured %llu\n", placements, full_queries,

@@ -58,6 +58,18 @@ inline QueryRegion query_region()
 }
 } // namespace placed_detail
 
+// Size of the whole allocation holding address, from one region-information call (no page-table scan);
+// 0 when the call is missing or fails.
+inline std::uint64_t allocation_bytes(const void* address)
+{
+    placed_detail::RegionInformation info{};
+    SIZE_T returned = 0;
+    const placed_detail::QueryRegion query = placed_detail::query_region();
+    if (!address || !query || !query(GetCurrentProcess(), address, 0 /* MemoryRegionInfo */, &info, sizeof(info), &returned))
+        return 0;
+    return info.RegionSize;
+}
+
 // False when the address is not committed (slot 133 returns E_INVALIDARG). Otherwise covered is
 // exactly "offset <= committed bytes from base && width <= committed bytes - offset" for the run the
 // full walk measures.
