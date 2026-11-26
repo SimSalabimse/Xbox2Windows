@@ -707,21 +707,22 @@ def check_rejections(original_path):
 
     # 1) VEX.L=1 (256-bit) packed-integer encodings of surviving forms must be rejected explicitly (AVX2, not AVX1).
     # The 256-bit add, subtract, saturating add and subtract, compare, minimum, maximum, absolute value,
-    # sign, word shuffle, horizontal, and pack forms are lowered and are covered by avx_int_ymm_addsub_check.py,
-    # avx_int_ymm_sat_check.py, avx_int_ymm_minmax_check.py, avx_int_ymm_abs_sign_shuf_check.py,
-    # avx_int_ymm_horizontal_check.py, and avx_int_ymm_pack_check.py.
+    # sign, word shuffle, horizontal, pack, cross-lane extend, and dword/qword unpack forms are lowered and
+    # covered by avx_int_ymm_addsub_check.py, avx_int_ymm_sat_check.py, avx_int_ymm_minmax_check.py,
+    # avx_int_ymm_abs_sign_shuf_check.py, avx_int_ymm_horizontal_check.py, avx_int_ymm_pack_check.py,
+    # and avx_int_ymm_widen_unpack_check.py.
     vex256_int_cases = [
         ("vpmulhuw_ymm", Instruction.create_reg_reg_reg(Code.VEX_VPMULHUW_YMM_YMM_YMMM256, R.YMM0, R.YMM1, R.YMM2)),
-        ("vpunpckhdq_ymm", Instruction.create_reg_reg_reg(Code.VEX_VPUNPCKHDQ_YMM_YMM_YMMM256, R.YMM0, R.YMM1, R.YMM2)),
+        ("vpsrld_ymm_imm", Instruction.create_reg_reg_u32(Code.VEX_VPSRLD_YMM_YMM_IMM8, R.YMM0, R.YMM1, 4)),
         ("vpalignr_ymm", Instruction.create_reg_reg_reg_u32(Code.VEX_VPALIGNR_YMM_YMM_YMMM256_IMM8, R.YMM0, R.YMM1, R.YMM2, 4)),
         ("vpblendvb_ymm", Instruction.create_reg_reg_reg_reg(Code.VEX_VPBLENDVB_YMM_YMM_YMMM256_YMM, R.YMM0, R.YMM1, R.YMM2, R.YMM3)),
         ("vpblendw_ymm", Instruction.create_reg_reg_reg_u32(Code.VEX_VPBLENDW_YMM_YMM_YMMM256_IMM8, R.YMM0, R.YMM1, R.YMM2, 0xAA)),
         ("vpmaddwd_ymm", Instruction.create_reg_reg_reg(Code.VEX_VPMADDWD_YMM_YMM_YMMM256, R.YMM0, R.YMM1, R.YMM2)),
         ("vpmulld_ymm", Instruction.create_reg_reg_reg(Code.VEX_VPMULLD_YMM_YMM_YMMM256, R.YMM0, R.YMM1, R.YMM2)),
         ("vmpsadbw_ymm", Instruction.create_reg_reg_reg_u32(Code.VEX_VMPSADBW_YMM_YMM_YMMM256_IMM8, R.YMM0, R.YMM1, R.YMM2, 0)),
-        ("vpmovsxbw_ymm", Instruction.create_reg_reg(Code.VEX_VPMOVSXBW_YMM_XMMM128, R.YMM0, R.XMM1)),
-        ("vpmovzxdq_ymm", Instruction.create_reg_reg(Code.VEX_VPMOVZXDQ_YMM_XMMM128, R.YMM0, R.XMM1)),
-        ("vpunpckldq_ymm", Instruction.create_reg_reg_reg(Code.VEX_VPUNPCKLDQ_YMM_YMM_YMMM256, R.YMM0, R.YMM1, R.YMM2)),
+        ("vpsrld_ymm_xmm", Instruction.create_reg_reg_reg(Code.VEX_VPSRLD_YMM_YMM_XMMM128, R.YMM0, R.YMM1, R.XMM2)),
+        ("vpsllq_ymm_imm", Instruction.create_reg_reg_u32(Code.VEX_VPSLLQ_YMM_YMM_IMM8, R.YMM0, R.YMM1, 4)),
+        ("vpsrlq_ymm_xmm", Instruction.create_reg_reg_reg(Code.VEX_VPSRLQ_YMM_YMM_XMMM128, R.YMM0, R.YMM1, R.XMM2)),
         ("vpslld_ymm_imm", Instruction.create_reg_reg_u32(Code.VEX_VPSLLD_YMM_YMM_IMM8, R.YMM0, R.YMM1, 4)),
         ("vpslld_ymm_xmm", Instruction.create_reg_reg_reg(Code.VEX_VPSLLD_YMM_YMM_XMMM128, R.YMM0, R.YMM1, R.XMM2)),
         ("vpsrlq_ymm_imm", Instruction.create_reg_reg_u32(Code.VEX_VPSRLQ_YMM_YMM_IMM8, R.YMM0, R.YMM1, 4)),

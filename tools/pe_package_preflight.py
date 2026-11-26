@@ -9,6 +9,7 @@ from collections import Counter, defaultdict
 import heapq
 import json
 from pathlib import Path
+import struct
 import sys
 import tempfile
 
@@ -35,7 +36,7 @@ def _relative(root, path):
 def _paths(root):
     result = {}
     total_bytes = 0
-    for path in root.rglob("*"):
+    for path in sorted(root.rglob("*"), key=lambda p: (p.as_posix().casefold(), p.as_posix())):
         if path.suffix.casefold() not in (".dll", ".exe"):
             continue
         if path.is_symlink():
@@ -160,7 +161,25 @@ def summarize(images, entry):
                 ignored_images=sorted(set(images) - set(reached)))
 
 
+def _validate_entry(entry):
+    if not isinstance(entry, str) or not entry.strip():
+        raise ValueError("Entry must be a non-empty relative path to an .exe inside the package")
+
+
+def _validate_output(output, root):
+    if output.is_symlink():
+        raise ValueError(f"Output path must not be a symlink: {output}")
+    for parent in output.parents:
+        if parent.is_file() or ((parent.exists() or parent.is_symlink()) and not parent.is_dir()):
+            raise NotADirectoryError(f"Output parent is not a directory: {parent}")
+    if output.resolve().is_relative_to(root):
+        raise ValueError("Write reports outside the inspected package")
+    if output.is_dir():
+        raise IsADirectoryError(f"Output path is a directory: {output}")
+
+
 def inspect(root, entry):
+    _validate_entry(entry)
     root = Path(root).resolve(strict=True)
     if not root.is_dir():
         raise ValueError("Package root must be a directory")
@@ -183,11 +202,14 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         root = args.package.resolve(strict=True)
-        if args.output and args.output.resolve().is_relative_to(root):
-            raise ValueError("Write reports outside the inspected package")
+        if not root.is_dir():
+            raise ValueError("Package root must be a directory")
+        _validate_entry(args.entry)
+        if args.output is not None:
+            _validate_output(args.output, root)
         report = inspect(root, args.entry)
         output = json.dumps(report, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
-        if args.output:
+        if args.output is not None:
             args.output.parent.mkdir(parents=True, exist_ok=True)
             # Replace the directory entry instead of writing through a possible hard link.
             with tempfile.TemporaryDirectory(dir=args.output.parent) as directory:
@@ -196,7 +218,7 @@ def main(argv=None):
                 report_path.replace(args.output)
         else:
             print(output, end="")
-    except (OSError, ValueError, KeyError, pefile.PEFormatError) as exc:
+    except (OSError, ValueError, KeyError, struct.error, pefile.PEFormatError) as exc:
         parser.exit(1, f"pe_package_preflight: {exc}\n")
     return 0
 

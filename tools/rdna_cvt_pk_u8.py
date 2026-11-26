@@ -28,6 +28,7 @@ import ctypes
 import json
 import math
 import os
+from pathlib import Path
 import re
 import shutil
 import struct
@@ -526,7 +527,103 @@ def self_test():
 
 # ---------------------------------------------------------------- main
 
-def main():
+def _same_path(left, right):
+    left_p = Path(left)
+    right_p = Path(right)
+    if os.path.normcase(str(left_p.resolve())) == os.path.normcase(str(right_p.resolve())):
+        return True
+    return left_p.exists() and right_p.exists() and left_p.samefile(right_p)
+
+
+def _validate_output_path(flag, raw_path):
+    if not raw_path or not raw_path.strip():
+        raise ValueError('%s path must not be empty' % flag)
+    if raw_path.endswith(('/', '\\')):
+        raise ValueError('%s path is a directory path: %s' % (flag, raw_path))
+    p = Path(raw_path)
+    if p.is_symlink():
+        raise ValueError('%s path must not be a symlink: %s' % (flag, raw_path))
+    if p.is_dir():
+        raise ValueError('%s path is a directory: %s' % (flag, raw_path))
+    if p.exists() and not p.is_file():
+        raise ValueError('%s path is not a regular file: %s' % (flag, raw_path))
+    for parent in p.parents:
+        if parent.is_symlink() and not parent.is_dir():
+            raise ValueError('%s parent path is a symlink to non-directory: %s' % (flag, parent))
+        if parent.exists() and not parent.is_dir():
+            raise ValueError('%s parent path is not a directory: %s' % (flag, parent))
+    return p
+
+
+def _validate_args(args):
+    if args.show < 0:
+        raise ValueError('--show must be >= 0, got %d' % args.show)
+
+    keep_path = None
+    if args.keep is not None:
+        if not args.keep.strip():
+            raise ValueError('--keep path must not be empty')
+        keep_path = Path(args.keep)
+        if keep_path.exists() and not keep_path.is_dir():
+            raise ValueError('--keep path is not a directory: %s' % args.keep)
+        if keep_path.is_symlink() and not keep_path.is_dir():
+            raise ValueError('--keep path is a broken symlink: %s' % args.keep)
+        for parent in keep_path.parents:
+            if parent.exists() and not parent.is_dir():
+                raise ValueError('--keep parent path is not a directory: %s' % parent)
+
+    cmp_path = None
+    if args.compare:
+        cmp_path = Path(args.compare)
+        if cmp_path.is_dir():
+            raise ValueError('--compare path is a directory: %s' % args.compare)
+
+    out_path = _validate_output_path('--out', args.out)
+    json_path = _validate_output_path('--json', args.json) if args.json is not None else None
+
+    if cmp_path is not None and _same_path(out_path, cmp_path):
+        raise ValueError('--out path collides with --compare: %s' % args.out)
+    if json_path is not None and cmp_path is not None and _same_path(json_path, cmp_path):
+        raise ValueError('--json path collides with --compare: %s' % args.json)
+    if json_path is not None and _same_path(out_path, json_path):
+        raise ValueError('--out and --json paths must not collide: %s' % args.out)
+    if keep_path is not None:
+        if _same_path(keep_path, out_path):
+            raise ValueError('--keep and --out paths must not collide: %s' % args.out)
+        if json_path is not None and _same_path(keep_path, json_path):
+            raise ValueError('--keep and --json paths must not collide: %s' % args.json)
+        if cmp_path is not None and _same_path(keep_path, cmp_path):
+            raise ValueError('--keep and --compare paths must not collide: %s' % args.compare)
+
+
+def _write_atomic(path, content):
+    """Write content to a sibling temp file and atomically replace path, cleaning up on failure."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode='w',
+            encoding='utf-8',
+            newline='\n',
+            dir=target.parent,
+            prefix='.%s.' % target.name,
+            suffix='.tmp',
+            delete=False,
+        ) as handle:
+            tmp_path = Path(handle.name)
+            handle.write(content)
+        os.replace(tmp_path, target)
+    except BaseException:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
+
+
+def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--device', type=int, default=0, help='HIP device index (default 0; every device is listed)')
     ap.add_argument('--arch', help='target, e.g. gfx1030, gfx1032, gfx1100 (default: from the HIP device)')
@@ -543,72 +640,89 @@ def main():
     ap.add_argument('--clang', help='clang executable (--build hip)')
     ap.add_argument('--llvm-mc', help='llvm-mc executable (--build asm)')
     ap.add_argument('--lld', help='ld.lld executable (--build asm)')
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     if args.self_test:
         return self_test()
 
-    hip, arch = None, args.arch
-    if not args.asm_only:
+    temp_workdir = None
+    try:
+        _validate_args(args)
+
+        hip, arch = None, args.arch
+        if not args.asm_only:
+            try:
+                hip = Hip()
+                hip.device = args.device
+                for i in range(hip.count()):
+                    print('HIP device %d: %s%s' % (i, hip.arch(i), '  <- used' if i == args.device else ''))
+                if not arch:
+                    arch = hip.arch()
+            except RuntimeError as e:
+                print('error: %s' % e, file=sys.stderr)
+                return 2
+        if not arch:
+            print('error: --asm-only needs --arch', file=sys.stderr)
+            return 2
+        arch = arch.split(':')[0]
+
+        if args.keep:
+            workdir = args.keep
+            os.makedirs(workdir, exist_ok=True)
+        else:
+            temp_workdir = tempfile.mkdtemp(prefix='cvt_pk_u8_')
+            workdir = temp_workdir
+
+        images = {}
+        for var in VARIANTS:
+            images[var] = build(arch, var, workdir, args)
+            print('built %s (%d bytes): %s' % (var, len(images[var][0]), images[var][1]))
+        if args.asm_only:
+            return 0
+
+        rows = build_rows()
+        words = [(r[1], r[2]) for r in rows]
+        results = {}
         try:
-            hip = Hip()
-            hip.device = args.device
-            for i in range(hip.count()):
-                print('HIP device %d: %s%s' % (i, hip.arch(i), '  <- used' if i == args.device else ''))
-            if not arch:
-                arch = hip.arch()
+            for var in VARIANTS:
+                results[var] = hip.run_kernel(images[var][0], 'cvt_pk_u8_' + var, words)
         except RuntimeError as e:
             print('error: %s' % e, file=sys.stderr)
-            return 2
-    if not arch:
-        sys.exit('error: --asm-only needs --arch')
-    arch = arch.split(':')[0]
-
-    workdir = args.keep or tempfile.mkdtemp(prefix='cvt_pk_u8_')
-    os.makedirs(workdir, exist_ok=True)
-    images = {}
-    for var in VARIANTS:
-        images[var] = build(arch, var, workdir, args)
-        print('built %s (%d bytes): %s' % (var, len(images[var][0]), images[var][1]))
-    if args.asm_only:
+            return 3
+        summary = analyse(rows, results, args.show)
+        print_report(rows, results, summary, arch, args.show)
+        header = ['# rdna_cvt_pk_u8 v1: v_cvt_pk_u8_f32 vD, vIn, vSel, vS2 measured by tools/rdna_cvt_pk_u8.py',
+                  '# sentinel (S2) %08x' % SENTINEL, '# device %s' % arch,
+                  '# columns (tab separated, words in hex): label in sel default rtz flush',
+                  '# default = MODE at launch default, rtz = s_round_mode 0xf, flush = s_denorm_mode 0']
+        lines = ['\t'.join([r[0], '%08x' % r[1], '%08x' % r[2]] + ['%08x' % results[v][i] for v in VARIANTS])
+                 for i, r in enumerate(rows)]
+        _write_atomic(args.out, '\n'.join(header + lines) + '\n')
+        print('\nresults written to %s' % os.path.abspath(args.out))
+        if args.json:
+            payload = json.dumps(
+                {'arch': arch, 'sentinel': SENTINEL,
+                 'rows': [{'label': r[0], 'in': '%08x' % r[1], 'sel': '%08x' % r[2],
+                           **{v: '%08x' % results[v][i] for v in results}} for i, r in enumerate(rows)],
+                 'summary': summary},
+                indent=1,
+            )
+            _write_atomic(args.json, payload)
+            print('verbose JSON written to %s' % os.path.abspath(args.json))
+        if args.compare and os.path.exists(args.compare):
+            with open(args.compare, encoding='utf-8') as f:
+                stored = [l.rstrip('\n') for l in f if not l.startswith('#')]
+            if stored == lines:
+                print('rows identical to %s' % args.compare)
+            else:
+                print('rows DIFFER from %s (%d of %d rows)' % (args.compare, sum(a != b for a, b in zip(stored, lines)), len(lines)))
         return 0
-
-    rows = build_rows()
-    words = [(r[1], r[2]) for r in rows]
-    results = {}
-    try:
-        for var in VARIANTS:
-            results[var] = hip.run_kernel(images[var][0], 'cvt_pk_u8_' + var, words)
-    except RuntimeError as e:
+    except (OSError, ValueError, json.JSONDecodeError) as e:
         print('error: %s' % e, file=sys.stderr)
-        return 3
-    summary = analyse(rows, results, args.show)
-    print_report(rows, results, summary, arch, args.show)
-    header = ['# rdna_cvt_pk_u8 v1: v_cvt_pk_u8_f32 vD, vIn, vSel, vS2 measured by tools/rdna_cvt_pk_u8.py',
-              '# sentinel (S2) %08x' % SENTINEL, '# device %s' % arch,
-              '# columns (tab separated, words in hex): label in sel default rtz flush',
-              '# default = MODE at launch default, rtz = s_round_mode 0xf, flush = s_denorm_mode 0']
-    lines = ['\t'.join([r[0], '%08x' % r[1], '%08x' % r[2]] + ['%08x' % results[v][i] for v in VARIANTS])
-             for i, r in enumerate(rows)]
-    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
-    with open(args.out, 'w', newline='\n') as f:
-        f.write('\n'.join(header + lines) + '\n')
-    print('\nresults written to %s' % os.path.abspath(args.out))
-    if args.json:
-        with open(args.json, 'w') as f:
-            json.dump({'arch': arch, 'sentinel': SENTINEL,
-                       'rows': [{'label': r[0], 'in': '%08x' % r[1], 'sel': '%08x' % r[2],
-                                 **{v: '%08x' % results[v][i] for v in results}} for i, r in enumerate(rows)],
-                       'summary': summary}, f, indent=1)
-        print('verbose JSON written to %s' % os.path.abspath(args.json))
-    if args.compare and os.path.exists(args.compare):
-        with open(args.compare) as f:
-            stored = [l.rstrip('\n') for l in f if not l.startswith('#')]
-        if stored == lines:
-            print('rows identical to %s' % args.compare)
-        else:
-            print('rows DIFFER from %s (%d of %d rows)' % (args.compare, sum(a != b for a, b in zip(stored, lines)), len(lines)))
-    return 0
+        return 1
+    finally:
+        if temp_workdir is not None:
+            shutil.rmtree(temp_workdir, ignore_errors=True)
 
 
 if __name__ == '__main__':

@@ -61,6 +61,33 @@ std::vector<std::uint8_t>& view_materialized() { static std::vector<std::uint8_t
 std::unordered_map<u64, std::uint32_t>& view_ids() { static std::unordered_map<u64, std::uint32_t> m; return m; }  // content hash -> view id
 LONG64 views_noted, views_distinct, descriptors_copied;
 
+// X2W_D3D12_VIEW_CENSUS=1 (diagnostic only, docs/startup-runtime.md): new distinct view records by slot, and one line
+// before an insertion that is expected to grow view_records or the view_ids buckets. All fields: note_lock held.
+bool view_census_enabled()
+{
+    static const bool on = x2w_local::env_on("X2W_D3D12_VIEW_CENSUS");
+    return on;
+}
+struct ViewCensus {
+    u64 distinct[6];  // slots 17..22
+    u64 grows_records, grows_ids;  // growths announced
+    u64 missed;                    // capacity or bucket count changed without an announcement
+};
+ViewCensus view_census{};
+
+std::size_t view_census_format(char* out, std::size_t capacity, const char* what)
+{
+    const ViewCensus& c = view_census;
+    const int n = std::snprintf(out, capacity,
+        "x2w-view-census %s: cbv=%llu srv=%llu uav=%llu rtv=%llu dsv=%llu sampler=%llu records=%llu capacity=%llu "
+        "ids=%llu buckets=%llu grows-records=%llu grows-ids=%llu missed=%llu",
+        what, c.distinct[0], c.distinct[1], c.distinct[2], c.distinct[3], c.distinct[4], c.distinct[5],
+        static_cast<u64>(view_records().size()), static_cast<u64>(view_records().capacity()),
+        static_cast<u64>(view_ids().size()), static_cast<u64>(view_ids().bucket_count()),
+        c.grows_records, c.grows_ids, c.missed);
+    return n < 0 ? 0 : (std::min)(static_cast<std::size_t>(n), capacity - 1);
+}
+
 // The shadow entry for a desktop CPU descriptor handle (note_lock held), or null.
 std::uint32_t* shadow_slot(u64 desktop_handle, std::uint32_t* room = nullptr)
 {
@@ -306,10 +333,37 @@ void note_view(int slot, u64 resource, u64 counter, const void* desc, std::size_
         record.id = found->second;
     } else {
         record.id = static_cast<std::uint32_t>(view_records().size());
+        const bool census = view_census_enabled();
+        std::size_t capacity_before = 0, buckets_before = 0;
+        bool records_full = false, ids_full = false;
+        if (census) {
+            capacity_before = view_records().capacity();
+            buckets_before = view_ids().bucket_count();
+            records_full = view_records().size() == capacity_before;
+            // MSVC's rule: unordered_map rehashes when the new size would exceed the maximum load factor.
+            ids_full = static_cast<float>(view_ids().size() + 1) / static_cast<float>(buckets_before) >
+                       view_ids().max_load_factor();
+            // Logged before the allocation, so the last line survives an allocation that fails.
+            if (records_full || ids_full) {
+                view_census.grows_records += records_full;
+                view_census.grows_ids += ids_full;
+                char line[640];
+                view_census_format(line, sizeof(line),
+                                   records_full && ids_full ? "before growth of records and ids"
+                                   : records_full           ? "before growth of records"
+                                                            : "before growth of ids");
+                log("%s (new slot %u)", line, record.slot);
+            }
+        }
         view_records().push_back(record);
         view_materialized().push_back(created);
         view_ids()[hash] = record.id;
         ++views_distinct;
+        if (census) {
+            if (record.slot >= 17 && record.slot <= 22) ++view_census.distinct[record.slot - 17];
+            view_census.missed += !records_full && view_records().capacity() != capacity_before;
+            view_census.missed += !ids_full && view_ids().bucket_count() != buckets_before;
+        }
     }
     if (std::uint32_t* slot_ptr = shadow_slot(dest_desktop)) {
         const std::uint32_t prev = *slot_ptr;
