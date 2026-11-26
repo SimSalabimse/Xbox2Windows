@@ -879,7 +879,8 @@ def check_controls():
     for code in (bytes.fromhex('8003febe') + ff1 + end,
                  ff1 + bytes.fromhex('feff82bf') + end):
         refused('compute entry EXEC mask', lambda: translate('A', code=code))
-    refused('requires compute exec_lo', lambda: translate('A', code=bytes.fromhex('6a1385be') + end))
+    # vcc_lo is a lane mask; general-scalar ff1 (#2022 Item F) still refuses it.
+    refused('lane mask', lambda: translate('A', code=bytes.fromhex('6a1385be') + end))
     assert 's5 = 0u;' in translate('A-ff1').hlsl_cs()
     assert expected('A-ff1') != expected('A')
     check_lds()

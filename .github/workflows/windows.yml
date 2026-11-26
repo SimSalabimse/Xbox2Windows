@@ -293,6 +293,7 @@ jobs:
             tests/startup_compute_lds_b128_check.py \
             tests/startup_compute_translate_check.py \
             tests/startup_gfx2hlsl_swap_check.py \
+            tests/startup_gfx2hlsl_s_ff1_check.py \
             tests/startup_gfx2hlsl_fma_mix_check.py \
             tests/startup_gfx2hlsl_shift64_check.py \
             tests/startup_gfx2hlsl_mul_mad_i24_check.py \

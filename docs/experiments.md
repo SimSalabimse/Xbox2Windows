@@ -7993,6 +7993,16 @@ one. Only the low five bits of the index are used. EXEC, VCC and SGPRs tracked
 as lane masks are refused because their per-lane projections lose the other
 bits. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_s_bitcmp$' -V`.
 
+**Scalar find-first-one.** Startup translation lowers `s_ff1_i32_b32` and
+`s_ff1_i32_b64` of a general scalar to `firstbitlow` (and a lo-then-hi scan for
+the 64-bit form), matching `pixel_aot` / Mesa. The compute-entry special case
+on `exec_lo` still folds to lane 0. SCC is unchanged. Lane masks and
+descriptor-bearing sources are refused. Run
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_s_ff1$' -V`
+(or `python3 -B tests/startup_gfx2hlsl_s_ff1_check.py`). The fixture is
+CPU-only; Windows WARP/hardware draws are left for an independent retest.
+[Refs #2022](https://github.com/R0Y00/Xbox2Windows/issues/2022) Item F.
+
 **Scalar immediate comparisons.** The startup translator sign-extends the
 16-bit field of `s_movk_i32` and `s_cmpk_*_i32`, and zero-extends the field
 of `s_cmpk_*_u32`. The source-built check covers all six relations against

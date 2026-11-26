@@ -5493,16 +5493,85 @@ class Stage:
                    % (rest, shift, bits, value, shift))
 
     def op_s_ff1_i32_b32(self, ops, mods):
-        if self.kind != 'cs' or mods or len(ops) != 2 or ops[1] != 'exec_lo':
-            raise Unsupported('s_ff1_i32_b32 requires compute exec_lo')
+        """Find first set bit in a 32-bit scalar; SCC unchanged (#2022 Item F).
+
+        The compute-entry special case on `exec_lo` still folds to lane 0. Every other accepted
+        source uses `firstbitlow` (0xffffffff when the word is zero), matching `pixel_aot`.
+        """
+        if mods or len(ops) != 2:
+            raise Unsupported('s_ff1_i32_b32 with %d operands, expected 2 unmodified' % len(ops))
         dst = reg_range(ops[0])
         if not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105:
-            raise Unsupported('s_ff1_i32_b32 requires one SGPR destination')
-        if self.past_entry or not self.exec_known:
-            raise Unsupported('s_ff1_i32_b32 requires the compute entry EXEC mask')
-        # At dispatch entry even the last partial wave starts at lane zero.
-        # FF1 reports its index and leaves SCC unchanged.
-        self.set_s(dst[1], '0u', ('const', 0))
+            raise Unsupported('s_ff1_i32_b32 destination %s' % ops[0])
+        if ops[1] == 'exec_lo':
+            if self.kind != 'cs':
+                raise Unsupported('s_ff1_i32_b32 of exec_lo outside compute')
+            if getattr(self, 'past_entry', False) or not getattr(self, 'exec_known', False):
+                raise Unsupported('s_ff1_i32_b32 requires the compute entry EXEC mask')
+            # At dispatch entry even the last partial wave starts at lane zero.
+            self.set_s(dst[1], '0u', ('const', 0))
+            return None
+        if self.is_lane_mask(ops[0]) or self.is_lane_mask(ops[1]) or dst[1] in self.masks:
+            raise Unsupported('s_ff1_i32_b32 on a lane mask')
+        imm = re.fullmatch(r'-?(0x[0-9a-fA-F]+|\d+)', ops[1])
+        if imm:
+            value = int(ops[1], 0) & 0xffffffff
+            # firstbitlow of zero is -1; otherwise the lowest set bit index.
+            folded = 0xffffffff if value == 0 else (value & -value).bit_length() - 1
+            self.set_s(dst[1], '0x%08xu' % folded, ('const', folded))
+            return None
+        src = reg_range(ops[1])
+        if not src or src[0] != 's' or src[1] != src[2] or src[1] > 105:
+            raise Unsupported('s_ff1_i32_b32 source %s' % ops[1])
+        if src[1] in self.masks:
+            raise Unsupported('s_ff1_i32_b32 on a lane mask')
+        sym = self.sym.get(src[1])
+        if sym and sym[0] not in ('const', 'ud', 'fixed_buffer_word'):
+            raise Unsupported('s_ff1_i32_b32 on %s data' % sym[0])
+        if sym and sym[0] == 'const':
+            value = sym[1] & 0xffffffff
+            folded = 0xffffffff if value == 0 else (value & -value).bit_length() - 1
+            self.set_s(dst[1], '0x%08xu' % folded, ('const', folded))
+            return None
+        self.set_s(dst[1], 'firstbitlow(%s)' % self.u(ops[1]))
+        return None
+
+    def op_s_ff1_i32_b64(self, ops, mods):
+        """Find first set bit across a 64-bit SGPR pair; SCC unchanged (#2022 Item F)."""
+        if mods or len(ops) != 2:
+            raise Unsupported('s_ff1_i32_b64 with %d operands, expected 2 unmodified' % len(ops))
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105:
+            raise Unsupported('s_ff1_i32_b64 destination %s' % ops[0])
+        if self.is_lane_mask(ops[0]) or dst[1] in self.masks:
+            raise Unsupported('s_ff1_i32_b64 on a lane mask')
+        src = reg_range(ops[1])
+        if not src or src[0] != 's' or src[2] != src[1] + 1 or src[1] % 2 or src[2] > 105:
+            raise Unsupported('s_ff1_i32_b64 source %s' % ops[1])
+        if self.is_lane_mask(ops[1]) or src[1] in self.masks or (src[1] + 1) in self.masks:
+            raise Unsupported('s_ff1_i32_b64 on a lane mask')
+        for half in (src[1], src[1] + 1):
+            sym = self.sym.get(half)
+            if sym and sym[0] not in ('const', 'ud', 'fixed_buffer_word'):
+                raise Unsupported('s_ff1_i32_b64 on %s data' % sym[0])
+        lo_sym = self.sym.get(src[1])
+        hi_sym = self.sym.get(src[1] + 1)
+        if (lo_sym and lo_sym[0] == 'const' and hi_sym and hi_sym[0] == 'const'):
+            lo_v, hi_v = lo_sym[1] & 0xffffffff, hi_sym[1] & 0xffffffff
+            if lo_v:
+                folded = (lo_v & -lo_v).bit_length() - 1
+            elif hi_v:
+                folded = 32 + ((hi_v & -hi_v).bit_length() - 1)
+            else:
+                folded = 0xffffffff
+            self.set_s(dst[1], '0x%08xu' % folded, ('const', folded))
+            return None
+        lo, hi = self.S(src[1]), self.S(src[1] + 1)
+        # Scan the low word first; only then the high word at offset 32 (pixel_aot / Mesa).
+        expr = ('(%s != 0u ? firstbitlow(%s) : (%s != 0u ? 32u + firstbitlow(%s) : 0xffffffffu))'
+                % (lo, lo, hi, hi))
+        self.set_s(dst[1], expr)
+        return None
 
     # ---- slot 57 mesh stage: instructions mesh_skeleton() puts in place of the group-memory exchanges ----
     def op_x2w_mesh_lane0(self, ops, mods):
