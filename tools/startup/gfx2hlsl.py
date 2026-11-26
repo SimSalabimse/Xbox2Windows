@@ -1722,6 +1722,9 @@ class Stage:
         if kind == 'ms':
             self.mesh_vcc_branches = {}
             self.mesh_wave_limits = {}
+            # Keep the pre-skeleton program so spill-only proofs still see the exchange VGPRs
+            # (mesh_skeleton rewrites those ops to x2w_mesh_* / s_nop).
+            self.mesh_source_ins = list(self.ins)
             self.ins = mesh_skeleton(self.ins, self.mesh_vcc_branches, self.mesh_wave_limits)
         # A loop header is translated before the back edges into it, so whether a back edge brings the symbol kept
         # there is known only afterwards: translate again with that register read at run time or refused there. A
@@ -5651,7 +5654,10 @@ class Stage:
 
     def require_spill_only(self, n, name):
         """Refuse unless every instruction naming v<n> is a lane write or read of it."""
-        for _, _, op, asm in getattr(self, 'ins', ()):
+        # Mesh: scan the pre-skeleton program. The accepted group-memory exchanges rewrite to
+        # x2w_mesh_* / s_nop, which would hide ordinary use of exchange VGPRs (v5 and temps).
+        source = getattr(self, 'mesh_source_ins', None) or getattr(self, 'ins', ())
+        for _, _, op, asm in source:
             if re.sub(r'_e(32|64)$', '', op) in ('v_writelane_b32', 'v_readlane_b32'):
                 continue
             for lo, hi, single in re.findall(r'\bv\[(\d+):(\d+)\]|\bv(\d+)\b', asm):
@@ -5662,13 +5668,10 @@ class Stage:
     def op_v_writelane_b32(self, ops, mods):
         n, src, lane = self.spill_operands('v_writelane_b32', ops, mods)
         if src is None:
-            # Mesh mirrors #2127: exec_lo / exec_hi may park a saved EXEC word. The one-lane mesh model
-            # keeps only bit 0 of exec, so exec_hi lowers to 0.
-            if ops[1] in ('exec_lo', 'exec') and getattr(self, 'kind', None) == 'ms':
-                value, sym, uniform = 'exec', None, True
-            elif ops[1] == 'exec_hi' and getattr(self, 'kind', None) == 'ms':
-                value, sym, uniform = '0u', ('const', 0), True
-            elif ops[1] in ('vcc', 'vcc_lo', 'vcc_hi', 'exec', 'exec_lo', 'exec_hi', 'm0'):
+            # Slot 57 mesh keeps ordinary scalar spills only (R0Y00 on #2637). Raw EXEC words are not
+            # proven under the one-lane model (exec_hi would be wrong under full EXEC; exec_lo under
+            # a lane-0 mask would reload per thread). mesh_entry_aot still models EXEC for #2127.
+            if ops[1] in ('vcc', 'vcc_lo', 'vcc_hi', 'exec', 'exec_lo', 'exec_hi', 'm0'):
                 raise Unsupported('v_writelane_b32 source %s is a lane mask or m0' % ops[1])
             else:
                 value, sym, uniform = self.u(ops[1]), None, True

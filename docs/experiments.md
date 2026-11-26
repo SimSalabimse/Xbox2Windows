@@ -9533,11 +9533,13 @@ branch polarity and a VCC-zero branch after a join.
 
 The `startup_mesh57_lane_spill_{warp,hardware}` tests cover the constant-lane
 `v_writelane_b32` / `v_readlane_b32` spill idiom in `translate_mesh57` (#2413 T7).
-A source-built program parks a scalar (and a saved `exec_hi` word) in fixed lanes
-of a spill-only VGPR, reloads them, and uses the colour reload as vertex red.
-Host checks refuse an unwritten slot, a register-selected lane, lane 64, and
-ordinary vector use of the spill VGPR. The draw compares all 1,024 pixels with a
-CPU rasterizer; zeroing the spilled colour word in HLSL must change the image.
+A source-built program parks ordinary scalars in fixed wave64 lanes of a spill-only
+VGPR (including lane 63), reloads them, and uses the colour reload as vertex red.
+Raw `exec_lo` / `exec_hi` sources stay refused under the one-lane model. Host checks
+also refuse an unwritten slot, a register-selected lane, lane 64, ordinary vector use
+of the spill VGPR, and a spill into an exchange VGPR. The draw compares all 1,024
+pixels with a CPU rasterizer; zeroing the spilled colour assignment in HLSL (not the
+multi-decl) must change the image.
 Run `python -B tests/startup_mesh57_lane_spill_check.py` for host refusals, or
 `ctest --preset release --no-tests=error -R '^startup_mesh57_lane_spill' -V`
 for WARP and hardware.

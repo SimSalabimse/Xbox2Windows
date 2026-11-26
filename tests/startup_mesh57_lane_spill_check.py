@@ -5,10 +5,11 @@ usage: startup_mesh57_lane_spill_check.py
        startup_mesh57_lane_spill_check.py draw <dxc> <offscreen_check> <warp|hardware>
 
 The fixture extends the accepted slot 57 group-memory shape with the #2127 spill idiom:
-park a scalar in a fixed lane of a VGPR under EXEC-independent writelane/readlane, clobber the
-SGPR, reload it, and use the reloaded word as vertex red. Only the constant-lane form is accepted;
-ordinary VGPR use of the spill register, an unwritten slot, a register-selected lane, and a mutant
-that zeroes the spilled word must fail by name or change pixels.
+park ordinary scalars in fixed wave64 lanes of a spill-only VGPR under EXEC-independent
+writelane/readlane, clobber the SGPRs, reload them, and use the colour reload as vertex red.
+Raw EXEC sources stay refused. Ordinary VGPR use of the spill register, an exchange VGPR, an
+unwritten slot, a register-selected lane, and a mutant that zeroes the spilled colour assignment
+(not the multi-decl) must fail by name or change pixels.
 """
 import os
 from pathlib import Path
@@ -39,19 +40,20 @@ def readlane(sd, vv, lane):
     return ['%08x' % (0xd7600000 | sd), '%08x' % ((256 + vv) | ((128 + lane) << 9))]
 
 
-# s_mov_b32 s40, 1.0; writelane v30 lane 3; clobber; readlane; also park/reload EXEC high word in lane 63;
-# v_mov_b32 v7, s40 — vertex red comes from the reloaded spill.
+# s_mov_b32 s40, 1.0; writelane v30 lane 3; clobber; park/reload a second ordinary scalar in lane 63
+# (wave64); v_mov_b32 v7, s40 — vertex red comes from the colour reload. Raw EXEC spills are refused.
 SPILL_ASM = """s_mov_b32 s40, 1.0
 v_writelane_b32 v30, s40, 3
 s_mov_b32 s40, 0
-v_writelane_b32 v30, exec_hi, 63
+s_mov_b32 s41, 0x11
+v_writelane_b32 v30, s41, 63
 s_mov_b32 s41, 0
 v_readlane_b32 s41, v30, 63
 v_readlane_b32 s40, v30, 3
 v_mov_b32 v7, s40"""
 SPILL_WORDS = (
     ['bea803f2'] + writelane(30, 40, 3) + ['bea80380']
-    + writelane(30, 127, 63) + ['bea90380'] + readlane(41, 30, 63)
+    + ['bea90391'] + writelane(30, 41, 63) + ['bea90380'] + readlane(41, 30, 63)
     + readlane(40, 30, 3) + ['7e0e0228']
 )
 # After the colour load's waitcnt, overwrite v20 (red) with the reloaded spill in v7.
@@ -64,8 +66,8 @@ SPILL_MESH = (
 # successful translation zero the spill assignment in HLSL so the draw oracle fails.
 MUTANT_NO_WRITE = (
     MESH[:POST_COUNT] + (
-        ['bea803f2', 'bea80380'] + writelane(30, 127, 63) + ['bea90380'] + readlane(41, 30, 63)
-        + readlane(40, 30, 3) + ['7e0e0228']
+        ['bea803f2', 'bea80380'] + ['bea90391'] + writelane(30, 41, 63) + ['bea90380']
+        + readlane(41, 30, 63) + readlane(40, 30, 3) + ['7e0e0228']
     ) + MESH[POST_COUNT:_WAIT + 1] + ['7e280307'] + MESH[_WAIT + 1:]
 )
 
@@ -87,7 +89,7 @@ def controls():
             text = (Path(tmp) / ('%016x.ms57.hlsl' % key)).read_text()
             expect('spill slots are declared', 'sp30_3' in text and 'sp30_63' in text, True)
             expect('colour spill is assigned', 'sp30_3 =' in text, True)
-            expect('exec_hi spill lowers to zero in the one-lane model', 'sp30_63 = 0u' in text, True)
+            expect('wave64 lane 63 parks the second scalar', 'sp30_63 =' in text and 's41 = sp30_63' in text, True)
             expect('reload feeds the SGPR', 's40 = sp30_3' in text, True)
             expect('spill VGPR is not a vector temporary', not re.search(r'\bv30\b', text), True)
 
@@ -109,6 +111,16 @@ def controls():
          + ['7e3c0300']  # v_mov_b32 v30, v0 — ordinary vector write of the spill VGPR
          + readlane(40, 30, 3) + ['7e0e0228'] + MESH[POST_COUNT:],
          'v_writelane_b32: v30 is also used as a vector (v_mov_b32_e32)'),
+        ('spill into the group-index exchange VGPR',
+         MESH[:POST_COUNT] + ['bea803f2'] + writelane(5, 40, 3) + ['bea80380']
+         + readlane(40, 5, 3) + ['7e0e0228'] + MESH[POST_COUNT:],
+         'v_writelane_b32: v5 is also used as a vector (v_lshrrev_b32_e32)'),
+        ('raw exec_hi spill',
+         MESH[:POST_COUNT] + writelane(30, 127, 63) + MESH[POST_COUNT:],
+         'v_writelane_b32 source exec_hi is a lane mask or m0'),
+        ('raw exec_lo spill',
+         MESH[:POST_COUNT] + writelane(30, 126, 3) + MESH[POST_COUNT:],
+         'v_writelane_b32 source exec_lo is a lane mask or m0'),
         ('read before any write',
          MESH[:POST_COUNT] + readlane(40, 30, 3) + ['7e0e0228'] + MESH[POST_COUNT:],
          'v_readlane_b32 reads v30 lane 3 before any v_writelane_b32 wrote it'),
@@ -161,10 +173,15 @@ def draw(dxc, renderer, adapter):
         expect('draw of spill fixture', (run.returncode, 'pixels=1024 mismatches=0' in run.stdout), (0, True))
 
         # Mutant: zero the spilled colour word in HLSL so the reload yields 0 and red becomes 0.
+        # Match a standalone assignment only (not the multi-decl `uint sp30_3 = 0, sp30_63 = 0;`).
         source = name.with_suffix('.ms57.hlsl').read_text()
-        expect('fixture writes the colour spill slot', source.count('sp30_3 =') >= 1, True)
+        expect('fixture writes the colour spill slot',
+               re.search(r'(?m)^\s*sp30_3 = ', source) is not None, True)
         mutated = Path(tmp) / 'zero-spill.hlsl'
-        mutated.write_text(re.sub(r'sp30_3 = [^;]+;', 'sp30_3 = 0u;', source, count=1))
+        mutated_text, nsub = re.subn(r'(?m)^(\s*)sp30_3 = [^;]+;', r'\1sp30_3 = 0u;', source, count=1)
+        expect('mutant rewrites exactly one colour spill assignment', nsub, 1)
+        expect('mutant still declares lane 63', 'sp30_63' in mutated_text, True)
+        mutated.write_text(mutated_text)
         mutant = Path(tmp) / 'zero-spill.cso'
         subprocess.run([dxc, '-T', 'ms_6_5', '-E', 'main', '-Fo', mutant, mutated], check=True)
         zero_red = [(0, g, b, a) for (_, g, b, a) in colours]
