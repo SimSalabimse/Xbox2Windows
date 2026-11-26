@@ -14,6 +14,19 @@
 
 namespace x2w_startup {
 
+// Slot 32 builds this selection afresh for each call. The graphics lookup still singles out
+// oversized logical heaps; compute table invalidation also needs ordinary shader-visible heaps.
+struct ViewHeapSelection {
+    std::uint64_t graphics = 0;
+    std::uint64_t compute = 0;
+
+    void note(std::uint64_t wrapper, bool shader_visible, unsigned logical_count, unsigned desktop_count)
+    {
+        if (shader_visible) compute = wrapper;
+        if (logical_count > desktop_count) graphics = wrapper;
+    }
+};
+
 class ComputeTables {
 public:
     static constexpr unsigned max_parameters = 16;  // same range as the graphics tables
@@ -26,9 +39,10 @@ public:
     }
 
     // Slot 32 with another view heap: the recorded addresses belong to the old one.
-    void clear()
+    void set_view_heap(std::uint64_t heap)
     {
-        for (auto& table : tables_) table = {};
+        if (heap != view_heap_) clear();
+        view_heap_ = heap;
     }
 
     // False when the parameter is out of range (counted).
@@ -47,7 +61,13 @@ public:
     std::uint32_t out_of_range_count() const { return out_of_range_; }
 
 private:
+    void clear()
+    {
+        for (auto& table : tables_) table = {};
+    }
+
     const void* signature_ = nullptr;
+    std::uint64_t view_heap_ = 0;
     ViewTable tables_[max_parameters] = {};
     std::uint32_t out_of_range_ = 0;
 };

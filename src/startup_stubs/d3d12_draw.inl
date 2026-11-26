@@ -451,7 +451,13 @@ bool stream_input_layout(const unsigned char* subobject, std::string& text)
 {
     D3D12_INPUT_LAYOUT_DESC layout;
     std::memcpy(&layout, subobject + 8, sizeof(layout));
-    if (!layout.NumElements) return true;
+    if (!layout.NumElements) {
+        // Declared without elements. The value of a fetched input here is unverified, so the zero-fill translation
+        // is an experimental opt-in (X2W_STREAM_ZERO_FILL=1); by default nothing is published and the fetch is refused.
+        const char* zero_fill = std::getenv("X2W_STREAM_ZERO_FILL");
+        if (zero_fill && zero_fill[0] == '1') text = "ia1 0\n";
+        return true;
+    }
     if (layout.NumElements > D3D12_IA_VERTEX_INPUT_STRUCTURE_ELEMENT_COUNT ||
         !x2w_local::readable(layout.pInputElementDescs, sizeof(D3D12_INPUT_ELEMENT_DESC) * layout.NumElements)) return false;
     text = "ia1 " + std::to_string(layout.NumElements) + "\n";
@@ -2385,15 +2391,14 @@ const char* draw_translated_indirect(Wrapper* self, ID3D12CommandSignature* sign
 void __stdcall list_set_descriptor_heaps(Wrapper* self, UINT count, void* const* heaps)
 {
     x2w_startup::SamplerSource source;
-    u64 view_heap = 0;
+    x2w_startup::ViewHeapSelection view_heaps;
     if (count && count <= 4 && x2w_local::readable(heaps, std::size_t{count} * sizeof(*heaps))) {
         AcquireSRWLockShared(&note_lock);
         for (UINT i = 0; i < count; ++i) {
             for (const HeapInfo& heap : heap_infos()) {
                 if (heap.wrapper == reinterpret_cast<u64>(heaps[i]) &&
-                    heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
-                    heap.logical_count > heap.count)
-                    view_heap = heap.wrapper;
+                    heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+                    view_heaps.note(heap.wrapper, heap.desktop_gpu != 0, heap.logical_count, heap.count);
                 if (heap.wrapper == reinterpret_cast<u64>(heaps[i]) &&
                     heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER && heap.desktop_gpu)
                     source = {static_cast<std::uintptr_t>(heap.title_sampler_cpu), heap.count};
@@ -2402,12 +2407,11 @@ void __stdcall list_set_descriptor_heaps(Wrapper* self, UINT count, void* const*
         ReleaseSRWLockShared(&note_lock);
     }
     auto& pass = pass_of(self);
-    if (pass.source_view_heap != view_heap)
-    {
+    if (pass.source_view_heap != view_heaps.graphics) {
         for (auto& table : pass.view_tables) table = {};
-        pass.compute_tables.clear();
     }
-    pass.source_view_heap = view_heap;
+    pass.compute_tables.set_view_heap(view_heaps.compute);
+    pass.source_view_heap = view_heaps.graphics;
     pass.title_samplers = source;
 }
 
@@ -2446,6 +2450,17 @@ void __stdcall list_compute_table(Wrapper* self, UINT parameter, u64 gpu_handle)
         log("x2w-render compute descriptor table dropped: parameter %u (%u parameters are kept)", parameter,
             x2w_startup::ComputeTables::max_parameters);
 }
+// Keeps the words of a root constants call; a call outside the 16 x 8 words kept is logged and cut or dropped.
+static void store_root_constants(x2w_root_constants::Store& store, const char* kind, UINT parameter, UINT count,
+                                 const std::uint32_t* data, UINT offset)
+{
+    if (!count || !x2w_local::readable(data, std::size_t{count} * 4)) return;
+    const auto result = store.set(parameter, count, data, offset);
+    static LONG refused;
+    if (result != x2w_root_constants::Result::stored && first_calls(refused, 4))
+        log("x2w-render %s root constants %s: parameter %u, offset %u, count %u (16 parameters of 8 words are kept)", kind,
+            result == x2w_root_constants::Result::dropped ? "dropped" : "truncated", parameter, offset, count);
+}
 // List slot 40 (desktop 36 + 4), SetGraphicsRoot32BitConstants(parameter, count, data, offset).
 void __stdcall list_root_constants(Wrapper* self, UINT parameter, UINT count, const std::uint32_t* data, UINT offset)
 {
@@ -2460,6 +2475,16 @@ void __stdcall list_root_constants(Wrapper* self, UINT parameter, UINT count, co
         (*pass.root)[parameter].type == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS &&
         count <= 8 - offset && offset + count <= (*pass.root)[parameter].constants_count)
         pass.constant_words_bound[parameter] |= static_cast<unsigned char>(((1u << count) - 1) << offset);
+}
+// List slot 37 (desktop 33 + 4), SetComputeRoot32BitConstant(parameter, value, offset).
+void __stdcall list_compute_constant(Wrapper* self, UINT parameter, UINT value, UINT offset)
+{
+    store_root_constants(pass_of(self).compute_constants, "compute", parameter, 1, &value, offset);
+}
+// List slot 39 (desktop 35 + 4), SetComputeRoot32BitConstants(parameter, count, data, offset).
+void __stdcall list_compute_constants(Wrapper* self, UINT parameter, UINT count, const std::uint32_t* data, UINT offset)
+{
+    store_root_constants(pass_of(self).compute_constants, "compute", parameter, count, data, offset);
 }
 // List slot 47 (desktop 43 + 4), IASetIndexBuffer(view).
 void __stdcall list_index_buffer(Wrapper* self, const D3D12_INDEX_BUFFER_VIEW* view)

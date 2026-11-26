@@ -250,8 +250,21 @@ struct StoreCase {
     }
 };
 
-static void run_compute(ID3D12Device* device, bool tables, D3D12_SHADER_BYTECODE shader,
-                        D3D12_SHADER_BYTECODE rootBytes, bool conversion_pair = false,
+static ComputeReadbackProgram create_compute_program(ID3D12Device* device, D3D12_SHADER_BYTECODE shader,
+                                                     D3D12_SHADER_BYTECODE rootBytes)
+{
+    ComputeReadbackProgram program;
+    check(device->CreateRootSignature(0, rootBytes.pShaderBytecode, rootBytes.BytecodeLength, IID_PPV_ARGS(&program.signature)),
+          "Create compute root signature");
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pso{};
+    pso.pRootSignature = program.signature.Get();
+    pso.CS = shader;
+    check(device->CreateComputePipelineState(&pso, IID_PPV_ARGS(&program.pipeline)), "Create compute pipeline");
+    return program;
+}
+
+static void run_compute(ID3D12Device* device, bool tables, const ComputeReadbackProgram& program,
+                        bool conversion_pair = false,
                         const StoreCase* store = nullptr, const std::vector<UINT>* texels = nullptr,
                         DXGI_FORMAT texture_format = DXGI_FORMAT_UNKNOWN, ID3D12Resource* rendered_texture = nullptr,
                         bool dpp_case = false, bool sized_views = false, UINT texture_first_mip = 0,
@@ -259,14 +272,6 @@ static void run_compute(ID3D12Device* device, bool tables, D3D12_SHADER_BYTECODE
 {
     if ((texels || rendered_texture) && !tables) throw std::runtime_error("An image load needs the descriptor-table signature");
     if (uav_words == 0 || uav_words > capacity) throw std::runtime_error("Invalid compute UAV word count");
-    ComPtr<ID3D12RootSignature> signature;
-    check(device->CreateRootSignature(0, rootBytes.pShaderBytecode, rootBytes.BytecodeLength, IID_PPV_ARGS(&signature)),
-          "Create compute root signature");
-    D3D12_COMPUTE_PIPELINE_STATE_DESC pso{};
-    pso.pRootSignature = signature.Get();
-    pso.CS = shader;
-    ComPtr<ID3D12PipelineState> pipeline;
-    check(device->CreateComputePipelineState(&pso, IID_PPV_ARGS(&pipeline)), "Create compute pipeline");
     auto input = make_buffer(device, constants_offset + 4 * alignment, D3D12_HEAP_TYPE_UPLOAD,
                              D3D12_RESOURCE_STATE_GENERIC_READ);
     auto output = make_buffer(device, bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON,
@@ -275,14 +280,14 @@ static void run_compute(ID3D12Device* device, bool tables, D3D12_SHADER_BYTECODE
     fill_upload(input.Get(), store && store->has_source ? &store->source : nullptr,
                 store && store->has_initial ? &store->initial : nullptr,
                 store ? &store->root_constants : nullptr);
-    ComputeCommands commands(device, pipeline.Get());
+    ComputeCommands commands(device, program.pipeline.Get());
     auto& list = commands.list;
     ComPtr<ID3D12Resource> texture_upload, texture;
     if (texels) texture = upload_texture(device, list.Get(), *texels, texture_format, texture_upload);
     transition(list.Get(), output.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
     list->CopyBufferRegion(output.Get(), 0, input.Get(), bytes, bytes);
     transition(list.Get(), output.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    list->SetComputeRootSignature(signature.Get());
+    list->SetComputeRootSignature(program.signature.Get());
     ComPtr<ID3D12DescriptorHeap> heap;
     if (tables) {
         // An image-load case binds its output at u0 and the source texture at t0; the table
@@ -346,77 +351,17 @@ static void run_compute(ID3D12Device* device, bool tables, D3D12_SHADER_BYTECODE
                     store->axis(2), capacity, mismatches);
     else std::printf("layout=%s output_words=%u guard_words=%u mismatches=%u\n",
                 tables ? "tables" : "root", active, capacity - active, mismatches);
-    if (mismatches) throw std::runtime_error("Compute readback differs from CPU reference");
+    if (mismatches) throw ReadbackMismatch("Compute readback differs from CPU reference");
 }
 
 void check_compute(ID3D12Device* device, bool tables)
 {
     const D3D12_SHADER_BYTECODE shader = tables ? D3D12_SHADER_BYTECODE{compute_tables, sizeof(compute_tables)} :
                                                   D3D12_SHADER_BYTECODE{compute_root, sizeof(compute_root)};
-    run_compute(device, tables, shader, shader);
+    run_compute(device, tables, create_compute_program(device, shader, shader));
 }
 
-void check_compute_file(ID3D12Device* device, const char* path, bool conversion_pair, const char* reference,
-                        bool dpp_case, bool sized_views, UINT uav_words)
-{
-    if (sized_views && uav_words > capacity)
-        throw std::runtime_error("Invalid compute UAV word count");
-    std::ifstream file(path, std::ios::binary | std::ios::ate);
-    if (!file) throw std::runtime_error(std::string("Could not open compute shader: ") + path);
-    const auto size = file.tellg();
-    if (size <= 0) throw std::runtime_error(std::string("Empty compute shader: ") + path);
-    std::vector<char> bytes(static_cast<std::size_t>(size));
-    file.seekg(0);
-    if (!file.read(bytes.data(), static_cast<std::streamsize>(bytes.size())))
-        throw std::runtime_error(std::string("Could not read compute shader: ") + path);
-    const D3D12_SHADER_BYTECODE shader{bytes.data(), bytes.size()};
-    if (reference) {
-        StoreCase store{};
-        std::ifstream file(reference, std::ios::binary);
-        file.read(reinterpret_cast<char*>(&store.groups), sizeof(store.groups));
-        file.read(reinterpret_cast<char*>(store.expected.data()), sizeof(store.expected));
-        // Bit 31 declares the trailing initial output segment; no other bit above the
-        // group counts is known, so an unflagged case keeps its historic bounds check.
-        constexpr UINT initial_data_flag = 1u << 31;
-        store.has_initial = (store.groups & initial_data_flag) != 0;
-        store.groups &= ~initial_data_flag;
-        if (!file || store.groups >> 24 || !store.axis(0) || store.axis(0) > 5 || store.axis(1) > 5 ||
-            store.axis(2) > 5)
-            throw std::runtime_error("Invalid compute store reference");
-        if (dpp_case && store.groups != 1)
-            throw std::runtime_error("Invalid compute DPP reference dispatch");
-        if (store.has_initial) {
-            file.read(reinterpret_cast<char*>(store.initial.data()), sizeof(store.initial));
-            if (!file)
-                throw std::runtime_error("Invalid compute store initial words");
-        }
-        if (file.peek() != std::char_traits<char>::eof()) {
-            file.read(reinterpret_cast<char*>(store.root_constants.data()), sizeof(store.root_constants));
-            if (!file)
-                throw std::runtime_error("Invalid compute store constants");
-            if (file.peek() != std::char_traits<char>::eof()) {
-                file.read(reinterpret_cast<char*>(store.source.data()), sizeof(store.source));
-                if (!file || file.peek() != std::char_traits<char>::eof())
-                    throw std::runtime_error("Invalid compute store source words");
-                store.has_source = true;
-            }
-        }
-        if (sized_views) {
-            const UINT effective_uav_words = uav_words ? uav_words : capacity;
-            if (effective_uav_words > capacity)
-                throw std::runtime_error("Invalid compute UAV word count");
-            run_compute(device, true, shader, {compute_tables, sizeof(compute_tables)}, false, &store, nullptr,
-                        DXGI_FORMAT_UNKNOWN, nullptr, dpp_case, true, 0, effective_uav_words);
-        } else {
-            run_compute(device, false, shader, {compute_root, sizeof(compute_root)}, false, &store, nullptr,
-                        DXGI_FORMAT_UNKNOWN, nullptr, dpp_case);
-        }
-    } else {
-        run_compute(device, false, shader, shader, conversion_pair);
-    }
-}
-
-static std::vector<char> read_texture_shader(const char* path)
+static std::vector<char> read_compute_shader(const char* path)
 {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file) throw std::runtime_error(std::string("Could not open compute shader: ") + path);
@@ -429,10 +374,83 @@ static std::vector<char> read_texture_shader(const char* path)
     return bytes;
 }
 
+static StoreCase read_store_reference(const char* reference, bool dpp_case)
+{
+    StoreCase store{};
+    std::ifstream file(reference, std::ios::binary);
+    file.read(reinterpret_cast<char*>(&store.groups), sizeof(store.groups));
+    file.read(reinterpret_cast<char*>(store.expected.data()), sizeof(store.expected));
+    // Bit 31 declares the trailing initial output segment; no other bit above the
+    // group counts is known, so an unflagged case keeps its historic bounds check.
+    constexpr UINT initial_data_flag = 1u << 31;
+    store.has_initial = (store.groups & initial_data_flag) != 0;
+    store.groups &= ~initial_data_flag;
+    if (!file || store.groups >> 24 || !store.axis(0) || store.axis(0) > 5 || store.axis(1) > 5 ||
+        store.axis(2) > 5)
+        throw std::runtime_error("Invalid compute store reference");
+    if (dpp_case && store.groups != 1)
+        throw std::runtime_error("Invalid compute DPP reference dispatch");
+    if (store.has_initial) {
+        file.read(reinterpret_cast<char*>(store.initial.data()), sizeof(store.initial));
+        if (!file)
+            throw std::runtime_error("Invalid compute store initial words");
+    }
+    if (file.peek() != std::char_traits<char>::eof()) {
+        file.read(reinterpret_cast<char*>(store.root_constants.data()), sizeof(store.root_constants));
+        if (!file)
+            throw std::runtime_error("Invalid compute store constants");
+        if (file.peek() != std::char_traits<char>::eof()) {
+            file.read(reinterpret_cast<char*>(store.source.data()), sizeof(store.source));
+            if (!file || file.peek() != std::char_traits<char>::eof())
+                throw std::runtime_error("Invalid compute store source words");
+            store.has_source = true;
+        }
+    }
+    return store;
+}
+
+ComputeReadbackProgram load_compute_store_program(ID3D12Device* device, const char* shader)
+{
+    const auto code = read_compute_shader(shader);
+    return create_compute_program(device, {code.data(), code.size()}, {compute_root, sizeof(compute_root)});
+}
+
+void check_compute_store_reference(ID3D12Device* device, const ComputeReadbackProgram& program, const char* reference)
+{
+    const StoreCase store = read_store_reference(reference, false);
+    run_compute(device, false, program, false, &store);
+}
+
+void check_compute_file(ID3D12Device* device, const char* path, bool conversion_pair, const char* reference,
+                        bool dpp_case, bool sized_views, UINT uav_words)
+{
+    if (sized_views && uav_words > capacity)
+        throw std::runtime_error("Invalid compute UAV word count");
+    const auto bytes = read_compute_shader(path);
+    const D3D12_SHADER_BYTECODE shader{bytes.data(), bytes.size()};
+    if (reference) {
+        const StoreCase store = read_store_reference(reference, dpp_case);
+        if (sized_views) {
+            const UINT effective_uav_words = uav_words ? uav_words : capacity;
+            if (effective_uav_words > capacity)
+                throw std::runtime_error("Invalid compute UAV word count");
+            const auto program = create_compute_program(device, shader, {compute_tables, sizeof(compute_tables)});
+            run_compute(device, true, program, false, &store, nullptr,
+                        DXGI_FORMAT_UNKNOWN, nullptr, dpp_case, true, 0, effective_uav_words);
+        } else {
+            const auto program = create_compute_program(device, shader, {compute_root, sizeof(compute_root)});
+            run_compute(device, false, program, false, &store, nullptr,
+                        DXGI_FORMAT_UNKNOWN, nullptr, dpp_case);
+        }
+    } else {
+        run_compute(device, false, create_compute_program(device, shader, shader), conversion_pair);
+    }
+}
+
 // The image load uses a descriptor-table signature. Its case file appends the source texels.
 void check_compute_texture_file(ID3D12Device* device, const char* path, const char* reference)
 {
-    const auto code = read_texture_shader(path);
+    const auto code = read_compute_shader(path);
     const D3D12_SHADER_BYTECODE shader{code.data(), code.size()};
     StoreCase store{};
     std::ifstream source(reference, std::ios::binary);
@@ -458,7 +476,8 @@ void check_compute_texture_file(ID3D12Device* device, const char* path, const ch
         throw std::runtime_error("Invalid compute image load reference");
     const auto format = rgba8 ? DXGI_FORMAT_R8G8B8A8_UINT
         : rgba32_float ? DXGI_FORMAT_R32G32B32A32_FLOAT : DXGI_FORMAT_R32G32B32A32_UINT;
-    run_compute(device, true, shader, {compute_tables, sizeof(compute_tables)}, false, &store, &texels, format,
+    const auto program = create_compute_program(device, shader, {compute_tables, sizeof(compute_tables)});
+    run_compute(device, true, program, false, &store, &texels, format,
                 nullptr, false, false, view_mip1 ? 1 : 0);
 }
 
@@ -540,12 +559,12 @@ bool check_compute_texture_msaa_file(ID3D12Device* device, const char* path, con
     source.read(reinterpret_cast<char*>(store.expected.data()), sizeof(store.expected));
     if (!source || source.peek() != std::char_traits<char>::eof() || store.groups != 1)
         throw std::runtime_error("Invalid compute MSAA load reference");
-    const auto code = read_texture_shader(path);
-    const auto vs = read_texture_shader(vs_path), ps = read_texture_shader(ps_path);
+    const auto code = read_compute_shader(path);
+    const auto vs = read_compute_shader(vs_path), ps = read_compute_shader(ps_path);
     auto texture = render_msaa_texture(device, {vs.data(), vs.size()}, {ps.data(), ps.size()});
     if (!texture) return false;
-    run_compute(device, true, {code.data(), code.size()}, {compute_tables, sizeof(compute_tables)},
-                false, &store, nullptr, DXGI_FORMAT_UNKNOWN, texture.Get());
+    const auto program = create_compute_program(device, {code.data(), code.size()}, {compute_tables, sizeof(compute_tables)});
+    run_compute(device, true, program, false, &store, nullptr, DXGI_FORMAT_UNKNOWN, texture.Get());
     return true;
 }
 
@@ -650,7 +669,7 @@ bool check_compute_texture_store_file(ID3D12Device* device, const char* path, co
         return false;
     }
 
-    const auto code = read_texture_shader(path);
+    const auto code = read_compute_shader(path);
     ComPtr<ID3D12RootSignature> signature;
     check(device->CreateRootSignature(0, compute_tables, sizeof(compute_tables), IID_PPV_ARGS(&signature)),
           "Create image store root signature");
@@ -761,6 +780,7 @@ void check_bvh_root_roundtrip(ID3D12Device* device)
     if (roundtrip->GetBufferSize() != control->GetBufferSize() ||
         std::memcmp(roundtrip->GetBufferPointer(), control->GetBufferPointer(), control->GetBufferSize()) != 0)
         throw std::runtime_error("Normalized signature differs from independent control serialization");
-    run_compute(device, false, shader, {roundtrip->GetBufferPointer(), roundtrip->GetBufferSize()});
+    const auto program = create_compute_program(device, shader, {roundtrip->GetBufferPointer(), roundtrip->GetBufferSize()});
+    run_compute(device, false, program);
     std::puts("normalized_signature=matched_control root_creation=passed pipeline_creation=passed dispatch=passed");
 }

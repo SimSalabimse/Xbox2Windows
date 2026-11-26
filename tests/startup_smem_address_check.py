@@ -291,6 +291,22 @@ def controls():
             for word in words[:64]:
                 assert 0 < ((word >> 23) & 0xff) < 0xff, hex(word)
 
+    # 10. A complete s_add_u32/s_addc_u32 table-pointer pair goes through the full translate() (with its SCC
+    #     check) and reads the same bytes as the single load at the summed offset; any other SCC reader is refused.
+    assert build_smem_pointer_pair_pipeline().hlsl_vs() == build_smem_dwordx4_pipeline().hlsl_vs()
+    vs_scc = b''.join((
+        encode_sop2(0x00, 20, 0, 128 + 8),
+        encode_sop2(0x04, 21, 1, 128 + 0),
+        encode_sop2(0x0a, 30, 129, 128),                             # s_cselect_b32 s30, 1, 0 reads the carry
+        encode_smem(SMEM_LOAD_DWORDX4, 16, 20, soffset=125, imm=0x8),
+        struct.pack('<3I', 0xf80008cf, 0x07060504, 0xbf810000),
+    ))
+    try:
+        G.Pipeline(vs_scc, struct.pack('<3I', 0xf800180f, 0, 0xbf810000), root_with_one_constant()).hlsl_vs()
+        raise AssertionError('an independent SCC read after the pointer pair was accepted')
+    except G.Unsupported as error:
+        assert 'scc' in str(error), error
+
 
 # ---- D3D12 GPU readback cases -------------------------------------------------------------------------
 
@@ -304,6 +320,24 @@ def build_smem_dwordx4_pipeline():
         encode_vop1(0x01, 6, 22),                                    # v_mov_b32_e32 v6, s22
         encode_vop1(0x01, 7, 23),                                    # v_mov_b32_e32 v7, s23
         struct.pack('<3I', 0xf80008cf, 0x07060504, 0xbf810000),      # exp pos0 v4, v5, v6, v7 done; s_endpgm
+    ))
+    ps = struct.pack('<3I', 0xf800180f, 0, 0xbf810000)
+    return G.Pipeline(vs, ps, root_with_one_constant())
+
+
+def build_smem_pointer_pair_pipeline():
+    """Same loads as build_smem_dwordx4_pipeline, but the vertex-buffer table pointer s[0:1] is advanced by a complete
+    s_add_u32 s20, s0, 8 / s_addc_u32 s21, s1, 0 pair and the load adds offset:0x8 (total 0x10)."""
+    vs = b''.join((
+        encode_sop2(0x00, 20, 0, 128 + 8),                           # s_add_u32 s20, s0, 8
+        encode_sop2(0x04, 21, 1, 128 + 0),                           # s_addc_u32 s21, s1, 0
+        encode_smem(SMEM_LOAD_DWORDX4, 16, 20, soffset=125, imm=0x8),
+        encode_smem(SMEM_BUFFER_LOAD_DWORDX4, 20, 16, soffset=8, imm=0x18, glc=1),
+        encode_vop1(0x01, 4, 20),
+        encode_vop1(0x01, 5, 21),
+        encode_vop1(0x01, 6, 22),
+        encode_vop1(0x01, 7, 23),
+        struct.pack('<3I', 0xf80008cf, 0x07060504, 0xbf810000),
     ))
     ps = struct.pack('<3I', 0xf800180f, 0, 0xbf810000)
     return G.Pipeline(vs, ps, root_with_one_constant())
@@ -415,6 +449,15 @@ def check_gpu(directory, compiler, consumer, adapter, fxc=None):
             raise RuntimeError(f's_buffer_load_dwordx4 soffset={soffset}:\n' + res.stdout + res.stderr)
         print(f's_buffer_load_dwordx4 (soffset={soffset}, offset:0x18):',
               [l for l in res.stdout.splitlines() if 'mismatches=' in l][0])
+
+    # 1b. Vertex-buffer table pointer advanced by a complete s_add_u32/s_addc_u32 pair must read the same bytes as case 1.
+    p_pair = build_smem_pointer_pair_pipeline()
+    res_pair = run_buffer_case(directory, compiler, consumer, adapter, p_pair, p_pair.hlsl_vs(),
+                               expected_smem_dwordx4(soffset=32), soffset=32)
+    if res_pair.returncode:
+        raise RuntimeError('advanced vertex-buffer table pointer pair:\n' + res_pair.stdout + res_pair.stderr)
+    print('advanced vertex-buffer table pointer (s_add_u32 + s_addc_u32, offset:0x8):',
+          [l for l in res_pair.stdout.splitlines() if 'mismatches=' in l][0])
 
     # 2. m0 + offset:0x14 dlc and destination-overlapping runtime SGPR s[20:21] + offset:0x1c glc.
     p_m0 = build_smem_m0_and_overlap_pipeline()

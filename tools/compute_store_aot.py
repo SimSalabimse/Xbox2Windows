@@ -878,7 +878,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
         raise ValueError("Unknown image SRV dimension")
     if image_srv_dimension == "1d" and not (rgba32_float_image and image_srv_descriptor is not None):
         raise ValueError("1D image loads require a separate gfx1013 RGBA32 FLOAT SRV binding")
-    # gfx1013 takes the shared image atomic lowering on an R32_UINT UAV only (add, umax, cmpswap; see lower()).
+    # gfx1013 takes the shared image atomic lowering on an R32_UINT UAV only
+    # (add, umin, umax, cmpswap; see lower()).
     gfx1013_image_atomic = cpu == "gfx1013" and image_atomic_type is not None and image_format == "R32_UINT"
     if image_output:
         if ((cpu != "gfx1030" and not float_image and not gfx1013_image_atomic)
@@ -2500,8 +2501,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             op = m["op"]
             signed = op in ("smin", "smax")
             # gfx1013 is limited to the forms its draws cover; the lowering itself is the gfx1030 one.
-            if cpu == "gfx1013" and op not in ("add", "umax", "cmpswap"):
-                raise ValueError("gfx1013 image atomics require add, umax or cmpswap")
+            if cpu == "gfx1013" and op not in ("add", "umin", "umax", "cmpswap"):
+                raise ValueError("gfx1013 image atomics require add, umin, umax or cmpswap")
             if (image_atomic_type != ("int" if signed else "uint") or image_float != (op in IMAGE_FLOAT_ATOMIC_OPS)
                     or guard_span is not None or stores):
                 raise ValueError("Unsupported image atomic target or binding")

@@ -290,7 +290,11 @@ MUTATIONS = [
     ('no mask refusal',
      "if d in self.masks or self.sym.get(d, ('',))[0] == 'execcopy':", 'if False:'),
     ('no descriptor refusal',
-     "if sym and sym[0] not in ('const', 'ud', 'fixed_buffer_word'):", 'if False:'),
+     # Pin the sopk-only raise (uses `base`); other SOP1 ports share the same sym allow-list line.
+     "if sym and sym[0] not in ('const', 'ud', 'fixed_buffer_word'):\n"
+     "            raise Unsupported('%s on %s data' % (base, sym[0]))",
+     "if False:\n"
+     "            raise Unsupported('%s on %s data' % (base, sym[0]))"),
     ('lowering removed', 'def op_s_addk_i32(self, ops, mods):', 'def op_unused_addk(self, ops, mods):'),
 ]
 

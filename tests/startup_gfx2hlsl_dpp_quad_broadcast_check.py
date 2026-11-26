@@ -1,4 +1,4 @@
-"""DPP16 quad broadcasts (quad_perm:[k,k,k,k]) in tools/startup/gfx2hlsl.py (#2125 item A).
+"""DPP16 quad broadcasts (quad_perm:[k,k,k,k]) in tools/startup/gfx2hlsl.py (#2125 item A; M200-01/003).
 
   (no arguments)                       translation controls and refusals, pure Python
   binary <llvm-mc>                     assemble the pixel fixtures with llvm-mc (gfx1013) and compare the words
@@ -19,12 +19,15 @@ covers whole quads):
            second source is a plain VGPR, so a permuted second source or a lane-0 read through the add would differ
   float:   the coarse derivative idiom, v_sub_f32_dpp (lane 1 minus own lane), and v_mul_f32_dpp with a negated
            permuted source (the modifier applies to the word the lane read)
+  loop:    the integer broadcasts, then a uniform scalar loop (two trips) that does not touch EXEC; the exported
+           words match the integer reference. A later loop used to refuse the entry-prefix broadcasts (M200-01/003).
 Two mutated translations, one that reads lane k + 1 and one that reads the lane's own word, must fail the draw
 against the reference and match their own plain-Python image.
 
 Refused (the single-lane model cannot read a neighbour, or the quad may be partly off): swaps, pair broadcasts, row
-shifts, mirrors, DPP8, a partial row_mask or bank_mask, fi:1 without the whole-quad proof, bound_ctrl:0, a scalar or constant source, a vertex
-stage, a pixel stage after EXEC changed or with branches, and operations outside the VOP1/VOP2 tables.
+shifts, mirrors, DPP8, a partial row_mask or bank_mask, fi:1 without the whole-quad proof, bound_ctrl:0, a scalar or
+constant source, a vertex stage, a broadcast after a branch target, after EXEC changed, or with divergent EXEC before
+the broadcast, and operations outside the VOP1/VOP2 tables.
 """
 import re
 import struct
@@ -98,9 +101,25 @@ s_endpgm
 """ % {'m': DPP}
 FLOAT_WORDS = (WQM + vop1(6, 5, 0) + dpp16(True, 0x4, 6, 5, 5, (1, 1, 1, 1), True)
                + dpp16(True, 0x8, 7, 5, 5, (0, 0, 0, 0), True, neg0=True) + export((6, 7, 5, 5)))
+# Uniform scalar loop after the integer broadcasts (two trips); EXEC and the exported words are unchanged.
+# s_mov_b32 s0, 0; s_add_u32 s0, s0, 1; s_cmp_lt_u32 s0, 2; s_cbranch_scc1 back to the add.
+def sopp(op, simm):
+    return struct.pack('<I', (simm & 0xffff) | op << 16 | 0x17f << 23)
+
+
+LOOP_BODY = bytes.fromhex('00ff008001000000') + bytes.fromhex('00820abf')  # add + cmp (3 dwords)
+EXPORT_TAIL = export((1, 2, 3, 4))  # exp + s_endpgm
+LOOP_WORDS = (INT_WORDS[:-len(EXPORT_TAIL)] + bytes.fromhex('800380be') + LOOP_BODY
+              + sopp(5, -len(LOOP_BODY) // 4 - 1) + EXPORT_TAIL)
+# Branch target before the first broadcast: still refused (no longer the entry prefix).
+AFTER_BRANCH_WORDS = WQM + sopp(4, 0) + INT_WORDS[len(WQM):]
+# The same loop targeting offset zero would execute the broadcast again.
+ENTRY_BACKEDGE_PREFIX = LOOP_WORDS[:-len(EXPORT_TAIL) - 4]
+ENTRY_BACKEDGE_WORDS = ENTRY_BACKEDGE_PREFIX + sopp(5, -len(ENTRY_BACKEDGE_PREFIX) // 4 - 1) + EXPORT_TAIL
+# Divergent EXEC before the broadcast: clear exec_lo after WQM so the whole-quad proof is gone.
+DIVERGENT_WORDS = WQM + bytes.fromhex('8003febe') + INT_WORDS[len(WQM):]  # s_mov_b32 exec_lo, 0
 NO_WQM_WORDS = INT_WORDS[len(WQM):]  # the entry EXEC may leave out lanes of a partly covered quad
 OTHER_WQM_WORDS = struct.pack('<I', 0xBE800000 | 2 << 16 | 0x0a << 8) + NO_WQM_WORDS  # s_wqm_b64 s[2:3], s[0:1]
-FIXTURES = {'integer': (INT_SOURCE, INT_WORDS), 'float': (FLOAT_SOURCE, FLOAT_WORDS)}
 MUTATIONS = ('wrong lane', 'own lane')
 
 
@@ -130,7 +149,8 @@ def image(kind, how='reference'):
     for y in range(HEIGHT):
         for x in range(WIDTH):
             own = x | y << 16
-            if kind == 'integer':
+            if kind in ('integer', 'loop'):
+                # The loop fixture keeps the same four exported words; the scalar trips do not touch them.
                 q0 = read(x, y, 0, how)
                 words += [q0, read(x, y, 1, how), read(x, y, 2, how), (read(x, y, 3, how) + q0) & MASK]
             else:
@@ -154,7 +174,8 @@ def pixel_hlsl(kind, how='reference'):
         text, count = re.subn(r'QuadReadLaneAt\((v\d+), [0-3]u\)', r'\1', text)
     else:
         return text
-    assert count == (4 if kind == 'integer' else 2), (kind, how, count)
+    want = 2 if kind == 'float' else 4
+    assert count == want, (kind, how, count)
     return text
 
 
@@ -185,6 +206,19 @@ def refused_in_stage(words):
     return False
 
 
+def fixtures():
+    """Build FIXTURES after LOOP_WORDS so the loop decode supplies the source lines."""
+    loop_source = '\n'.join(asm for _o, _s, _n, asm in G.decode(LOOP_WORDS)) + '\n'
+    return {
+        'integer': (INT_SOURCE, INT_WORDS),
+        'float': (FLOAT_SOURCE, FLOAT_WORDS),
+        'loop': (loop_source, LOOP_WORDS),
+    }
+
+
+FIXTURES = fixtures()
+
+
 def controls():
     for kind, (source, words) in FIXTURES.items():
         decoded = [asm for _o, _s, _n, asm in G.decode(words)]
@@ -192,7 +226,8 @@ def controls():
         stage = pixel_stage(words)
         text = stage.hlsl_ps()
         reads = re.findall(r'v256 = QuadReadLaneAt\((v\d+), ([0-3])u\);', text)
-        want = [('v0', '0'), ('v0', '1'), ('v0', '2'), ('v0', '3')] if kind == 'integer' else [('v5', '1'), ('v5', '0')]
+        want = ([('v5', '1'), ('v5', '0')] if kind == 'float'
+                else [('v0', '0'), ('v0', '1'), ('v0', '2'), ('v0', '3')])
         check('%s fixture reads the quad lanes' % kind, reads == want, text)
         check('%s fixture needs ps_6_0' % kind, stage.ps_profile() == 'ps_6_0')
         reference = image(kind)
@@ -201,6 +236,7 @@ def controls():
             differing = sum(other[i:i + 4] != reference[i:i + 4] for i in range(0, len(other), 4))
             check('%s: %s mutation changes %d pixels' % (kind, how, differing), differing > 0)
             pixel_hlsl(kind, how)
+    check('loop fixture matches the integer reference image', image('loop') == image('integer'))
     plain = pixel_stage(vop1(6, 5, 0) + export((5, 5, 5, 5)))
     check('a stage without a quad read stays ps_5_1', plain.ps_profile() == 'ps_5_1')
     # The four lanes of the integer image are four distinct words in every quad, so a lane mix-up cannot hide.
@@ -237,7 +273,13 @@ def controls():
     check('refused: no s_wqm exec, exec before the broadcast', refused(sane, quad_exec=False))
     check('refused: the stage translator without s_wqm', refused_in_stage(NO_WQM_WORDS))
     check('refused: s_wqm into another register', refused_in_stage(OTHER_WQM_WORDS))
-    check('refused: pixel stage with branches', refused(sane, branches=True))
+    # A later loop in the same stage used to refuse entry-prefix broadcasts; Probe(branches=True) still
+    # has an empty block list, so the entry-prefix proof holds (M200-01/003).
+    check('entry-prefix broadcast still translates when the stage later has branches',
+          not refused(sane, branches=True))
+    check('refused: broadcast after a branch target', refused_in_stage(AFTER_BRANCH_WORDS))
+    check('refused: branch back to the broadcast entry block', refused_in_stage(ENTRY_BACKEDGE_WORDS))
+    check('refused: divergent EXEC before the broadcast', refused_in_stage(DIVERGENT_WORDS))
     check('control: the sane line itself translates', not refused(sane))
     # fi:1 only decides what a disabled source lane returns, and the whole quad is proven active.
     with_fi = 'v_subrev_f32_dpp v1, v0, v0 quad_perm:[0,0,0,0]' + DPP + ' bound_ctrl:1 fi:1'
@@ -250,12 +292,15 @@ def controls():
           stages[0].lines == ['v256 = QuadReadLaneAt(v0, 0u);', 'v1 = U(F(v0) - F(v256));'], str(stages[0].lines))
     check('refused: fi:1 without s_wqm exec, exec', refused(with_fi, quad_exec=False))
     check('refused: fi:1 with EXEC no longer the entry mask', refused(with_fi, exec_known=False))
-    check('refused: fi:1 in a pixel stage with branches', refused(with_fi, branches=True))
+    check('fi:1 still translates when the stage later has branches', not refused(with_fi, branches=True))
     check('refused: fi:1 in a vertex stage', refused(with_fi, kind='vs'))
 
 
 def check_binary(llvm_mc):
     for kind, (source, words) in FIXTURES.items():
+        if kind == 'loop':
+            # The loop fixture's branch label is decoder text; llvm-mc needs a real symbol.
+            continue
         check('llvm-mc assembles the %s fixture to the same words' % kind, assemble(llvm_mc, source) == words)
 
 

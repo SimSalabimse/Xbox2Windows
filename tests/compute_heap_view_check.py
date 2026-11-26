@@ -259,58 +259,56 @@ def draw(directory, compiler, renderer, backend):
         src.write_text(lower(suffix), encoding="ascii")
         subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
         shaders[suffix] = cso
-    case = directory / "heap.case"
-    dispatches = 0
+    sources = {suffix: source_words(views) for suffix, views in SUFFIXES.items()}
+    cases = {suffix: [] for suffix in SUFFIXES}
 
-    def write(suffix, slot, groups, reference):
-        words = source_words(SUFFIXES[suffix])
+    def write(case, suffix, slot, groups, reference):
         case.write_bytes(struct.pack("<321I", groups, *reference) + struct.pack("<16I", *constants(slot))
-                         + struct.pack("<320I", *words))
-        return words
+                         + struct.pack("<320I", *sources[suffix]))
+
+    def add(suffix, slot, groups, reference, label, actual=None):
+        diagnostic = None
+        if actual is not None:
+            word = next((i for i, (a, b) in enumerate(zip(reference, actual)) if a != b), None)
+            if word is None:
+                raise AssertionError(f"{NAME}: reference '{label}' matches the expected words")
+            diagnostic = f"word={word} expected={reference[word]:08x} actual={actual[word]:08x}"
+        path = directory / f"heap_{suffix}_{len(cases[suffix])}.case"
+        write(path, suffix, slot, groups, reference)
+        cases[suffix].append((path, f"{suffix} slot {slot} {label} (groups={groups})", diagnostic))
 
     for suffix, views in SUFFIXES.items():
         for slot in range(len(views) + 1):
-            words = source_words(views)
-            for groups in (1, 2):
-                write(suffix, slot, groups, expected_words(suffix, slot, groups, words))
-                if subprocess.run([*cmd, shaders[suffix], case]).returncode:
-                    return 1
-                dispatches += 1
             label = views[slot]["label"] if slot < len(views) else "no record"
-            print(f"{NAME}: {suffix} slot {slot} {'refused' if slot in REFUSED[suffix] or slot >= len(views) else 'read'}"
-                  f" ({label})", flush=True)
+            action = "refused" if slot in REFUSED[suffix] or slot >= len(views) else "read"
+            for groups in (1, 2):
+                add(suffix, slot, groups, expected_words(suffix, slot, groups, sources[suffix]), f"{action} ({label})")
+    dispatches = sum(map(len, cases.values()))
     # A refusal must stay distinguishable from a published zero read: zeros against a refused slot must fail.
     for suffix, slot in (("xy", 4), ("xy", 10), ("xy", 11), ("xyzw", 3)):
-        words = source_words(SUFFIXES[suffix])
-        zeros = [0] * WORDS
-        write(suffix, slot, 2, zeros)
-        bad = subprocess.run([*cmd, shaders[suffix], case], capture_output=True, text=True)
-        if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
-            raise AssertionError(f"{NAME}: zeros published for {suffix} slot {slot} escaped detection\n{bad.stderr}")
+        add(suffix, slot, 2, [0] * WORDS, "zeros published", expected_words(suffix, slot, 2, sources[suffix]))
     for label, wrong, (suffix, slot) in WRONG:
-        words = source_words(SUFFIXES[suffix])
+        words = sources[suffix]
         good = expected_words(suffix, slot, 2, words)
         wrong_words = expected_words(suffix, slot, 2, words, wrong=wrong)
-        if good == wrong_words:
-            raise AssertionError(f"{NAME}: reference '{label}' matches the expected words")
-        write(suffix, slot, 2, wrong_words)
-        bad = subprocess.run([*cmd, shaders[suffix], case], capture_output=True, text=True)
-        if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
-            raise AssertionError(f"{NAME}: reference '{label}' escaped detection\n{bad.stderr}")
+        add(suffix, slot, 2, wrong_words, label, good)
+    for suffix, references in cases.items():
+        fmt.check_references(NAME, renderer, backend, shaders[suffix], references)
+    wrong_count = sum(map(len, cases.values())) - dispatches
     original = {suffix: lower(suffix) for suffix in SUFFIXES}
+    case = directory / "mutated.case"
     for label, old, new, (suffix, slot) in MUTATIONS:
         mutated = original[suffix].replace(old, new, 1)
         if mutated == original[suffix]:
             raise AssertionError(f"{NAME}: mutation '{label}' did not change the source")
-        words = source_words(SUFFIXES[suffix])
-        write(suffix, slot, 2, expected_words(suffix, slot, 2, words))
+        write(case, suffix, slot, 2, expected_words(suffix, slot, 2, sources[suffix]))
         bad_src, bad_cso = directory / "mutated.hlsl", directory / "mutated.cso"
         bad_src.write_text(mutated, encoding="ascii")
         subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", bad_cso, bad_src], check=True)
         bad = subprocess.run([*cmd, bad_cso, case], capture_output=True, text=True)
         if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
             raise AssertionError(f"{NAME}: mutation '{label}' escaped detection\n{bad.stderr}")
-    print(f"{NAME}: {dispatches} dispatches, {3 + len(WRONG)} wrong references and "
+    print(f"{NAME}: {dispatches} dispatches, {wrong_count} wrong references and "
           f"{len(MUTATIONS)} mutated sources checked")
     return 0
 

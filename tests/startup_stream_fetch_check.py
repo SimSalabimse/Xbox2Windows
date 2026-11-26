@@ -101,7 +101,7 @@ SWAPPED = expected(lambda x, y: (0 <= x < 4 and y < 1) or (x, y) == (3, 3))
 
 
 class Run:
-    def __init__(self, directory, consumer, backend, vs_bytes, layout):
+    def __init__(self, directory, consumer, backend, vs_bytes, layout, zero_fill=False):
         self.cache = directory / "cache"
         self.cache.mkdir(parents=True)
         self.vs, ps, self.root, self.output = (directory / name for name in ("vs", "ps", "root", "pixels"))
@@ -112,8 +112,11 @@ class Run:
         self.env = dict(os.environ, X2W_D3D12_PERMISSIVE="1", X2W_D3D12_LIST_NOOP="1", X2W_D3D12_RENDER="1",
                         X2W_SHADER_CACHE=str(self.cache), X2W_TEST_VERTEX_FETCH="1")
         self.env.setdefault("X2W_D3D12_DEBUG", "0")
+        self.env.pop("X2W_STREAM_ZERO_FILL", None)
+        if zero_fill:
+            self.env["X2W_STREAM_ZERO_FILL"] = "1"
         if layout:
-            self.env["X2W_TEST_INPUT_LAYOUT"] = "1"
+            self.env["X2W_TEST_INPUT_LAYOUT"] = layout if isinstance(layout, str) else "1"
         else:
             self.env.pop("X2W_TEST_INPUT_LAYOUT", None)
         subprocess.run(self.args, env=self.env, check=True)
@@ -191,6 +194,29 @@ def check(directory, consumer, backend):
     if "-> drawn;" in result.stderr:
         raise AssertionError("a vertex shader with a fetch call and no layout was drawn")
     print(f"{backend} no layout: refused and not drawn")
+
+    # empty layout, production default: declared with no elements, nothing is published and the fetch is refused.
+    refused = Run(directory / "empty_default", consumer, backend, vertex(), "empty")
+    assert not list(refused.cache.glob("req_*.ia")), "an empty layout was published without the opt-in"
+    result = refused.draw()
+    if "-> drawn;" in result.stderr:
+        raise AssertionError("an empty declared layout was drawn without X2W_STREAM_ZERO_FILL")
+    print(f"{backend} empty layout, default: refused and not drawn")
+
+    # empty layout, experimental opt-in X2W_STREAM_ZERO_FILL=1: every fetched input reads zero (an assumption, not a
+    # measurement); the vertices collapse and nothing but the blue clear reaches the readback.
+    empty = Run(directory / "empty", consumer, backend, vertex(), "empty", zero_fill=True)
+    layout = (empty.cache / ("req_%016x.ia" % empty.key)).read_bytes()
+    assert layout == b"ia1 0\n", layout
+    status = gfx2hlsl.translate_request(str(empty.cache), empty.key)
+    assert status == "ok", status
+    result = empty.draw()
+    if result.returncode or "-> drawn;" not in result.stderr:
+        raise RuntimeError(f"empty layout draw failed on {backend}: {result.returncode}\n{result.stderr}")
+    difference = first_difference(empty.output.read_bytes(), expected(lambda x, y: False))
+    if difference:
+        raise AssertionError(f"empty layout: {difference}")
+    print(f"{backend} empty layout: zero-fed vertices draw nothing, all {WIDTH * HEIGHT} pixels exact")
     return 0
 
 
@@ -251,6 +277,14 @@ def translate_cases(directory):
     assert status == "ok", status
     for line in ("w = ldu(r0, a);", "v4 = w & 255u;", "v5 = (w >> 8) & 255u;", "v6 = (w >> 16) & 255u;"):
         assert "    %s\n" % line in vs, line + "\n" + vs
+
+    # A layout declared with no elements translates: no vertex-buffer load, every fetched register reads zero.
+    status, vs, manifest = translate(directory / "empty_layout", vertex(), "ia1 0\n")
+    assert status == "ok", status
+    for line in ("v4 = 0u;", "v6 = 0u;", "v8 = 0u;", "v10 = 0u;"):
+        assert "    %s\n" % line in vs, line + "\n" + vs
+    assert "r0.Load(" not in vs and "buf vb" not in manifest, vs + manifest
+    print("translate: an empty declared layout reads every fetched input as zero")
 
     # Refused: no layout; a register nothing defines; the only write masked off by exec, or bypassed by a branch.
     for label, words, layout, want in (

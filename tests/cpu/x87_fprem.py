@@ -5,6 +5,8 @@ Usage:
     python tests/cpu/x87_fprem.py emit <dll> <cpp> [control]   translate (and optionally mutate) the fixture
     python tests/cpu/x87_fprem.py check <harness> <native> <lifted> [controls...]
 
+CTest runs the check-* parts as separate cases in parallel; `check` runs every part serially for a direct run.
+
 Each export loads ST(1) from offset 16 and ST(0) from offset 0 of its input block, takes the partial
 remainder, and stores the result, the divisor and records of the status word in its output block. The
 translation is lower(..., x87=Checked(REJECT)) inside a checked entry, uint32_t name(word input,
@@ -455,8 +457,23 @@ def is_nan(raw):
 
 
 def check(harness_path, native_path, lifted_path, *control_paths):
+    check_light()
+    expected = build_expected()
+    check_lifted(harness_path, lifted_path, expected)
+    check_native(harness_path, native_path, expected)
+    check_controls(harness_path, expected, control_paths)
+
+
+def check_light():
     print(f"the model agreed with {check_model()} remainders worked by hand")
-    expected = [(name, data, run(name, data)) for name, data in cases()]
+    check_rejections()
+
+
+def build_expected():
+    return [(name, data, run(name, data)) for name, data in cases()]
+
+
+def check_lifted(harness_path, lifted_path, expected):
     lifted = CheckedRunner(harness_path, lifted_path)
     statuses = dict.fromkeys(STATUS.values(), 0)
     bad = 0
@@ -473,6 +490,9 @@ def check(harness_path, native_path, lifted_path, *control_paths):
     print(f"{len(expected)} cases over {len(SEQUENCES)} exports matched the model in the checked translation (status, "
           "output block and guards, and *result, which only status 0 writes)")
     print("translated statuses: " + ", ".join(f"{name} {statuses[code]}" for name, code in STATUS.items()))
+
+
+def check_native(harness_path, native_path, expected):
     native = base.Runner(harness_path, native_path)
     compared = partial_records = nan_results = looped = skipped = 0
     for name, data, model in expected:
@@ -509,6 +529,9 @@ def check(harness_path, native_path, lifted_path, *control_paths):
           f"was a NaN in the {nan_results} single-step cases with a NaN model result, and the loops reduced partially "
           f"and iterated in {looped} cases; {skipped} loop cases with a NaN result ran only translated")
     print(f"processor: {platform.processor()}")
+
+
+def check_controls(harness_path, expected, control_paths):
     for path in control_paths:
         control = Path(path).stem.rsplit("_", 1)[-1]
         run_control = CheckedRunner(harness_path, path)
@@ -516,7 +539,6 @@ def check(harness_path, native_path, lifted_path, *control_paths):
         print(f"control {control}: {bad}/{len(expected)} mismatches")
         if not bad:
             raise AssertionError(f"control {control} matched every case")
-    check_rejections()
 
 
 def check_rejections():
@@ -567,12 +589,22 @@ def check_rejections():
 
 
 if __name__ == "__main__":
-    mode, first, second, *rest = sys.argv[1:]
+    mode, *args = sys.argv[1:]  # check-light takes no paths
+    first, second = (args + [None, None])[:2]
+    rest = args[2:]
     if mode == "asm":
         write_asm(first, second)
     elif mode == "emit":
         emit(Path(first), Path(second), *rest)
     elif mode == "check":
         check(first, second, *rest)
+    elif mode == "check-light":  # the hand-worked model and the rejections; no fixture needed
+        check_light()
+    elif mode == "check-lifted":
+        check_lifted(first, second, build_expected())
+    elif mode == "check-native":
+        check_native(first, second, build_expected())
+    elif mode == "check-controls":  # args: harness, unused, then the control DLLs
+        check_controls(first, build_expected(), rest)
     else:
         raise ValueError(mode)
