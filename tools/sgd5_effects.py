@@ -23,6 +23,8 @@ class Cursor:
         self.end = end
 
     def skip(self, size: int) -> int:
+        if size < 0:
+            raise ValueError("Negative SGD5 field size")
         start = self.pos
         if size > self.end - start:
             raise ValueError("SGD5 field exceeds supplied range")
@@ -30,7 +32,10 @@ class Cursor:
         return start
 
     def read(self, size: int) -> bytes:
-        return self.view.read(self.skip(size), size)
+        data = self.view.read(self.skip(size), size)
+        if len(data) != size:
+            raise ValueError("Truncated SGD5 field")
+        return data
 
     def word(self) -> int:
         return int.from_bytes(self.read(4), "little")
@@ -158,7 +163,10 @@ def candidates(stream: BinaryIO, name: str, group_start: int, group_end: int, ar
 
 
 def offset(value: str) -> int:
-    return int(value, 0)
+    parsed = int(value, 0)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError(f"Expected non-negative offset, got {value}")
+    return parsed
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -172,10 +180,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help="Physical bounds of the selected effect, including its final name block")
     args = parser.parse_args(argv)
     try:
+        if not args.archive.is_file():
+            raise ValueError(f"Expected an existing regular file: {args.archive}")
         with args.archive.open("rb") as stream:
             found = candidates(stream, args.effect, *args.group, args.arrays, *args.record)
         print(json.dumps({"effect": args.effect, "candidates": [asdict(item) for item in found]}, indent=2))
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, struct.error, zlib.error) as exc:
         sys.stderr.write(f"{args.archive}: {exc}\n")
         return 1
     return 0

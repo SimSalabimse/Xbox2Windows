@@ -46,6 +46,12 @@ void check_spirv_compare_sampler(ID3D12Device* device, const char* shader_path, 
                                  const char* reference_path, const char* descriptors = nullptr);
 void check_compute_file(ID3D12Device* device, const char* path, bool conversion_pair, const char* reference = nullptr,
                         bool dpp_case = false, bool sized_views = false, UINT uav_words = 0);
+struct ComputeReadbackProgram {
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> signature;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> pipeline;
+};
+ComputeReadbackProgram load_compute_store_program(ID3D12Device* device, const char* shader);
+void check_compute_store_reference(ID3D12Device* device, const ComputeReadbackProgram& program, const char* reference);
 void check_compute_texture_file(ID3D12Device* device, const char* path, const char* reference);
 bool check_compute_texture_msaa_file(ID3D12Device* device, const char* path, const char* reference,
                                      const char* vs_path, const char* ps_path);
@@ -80,8 +86,11 @@ void check_texture_mips(ID3D12Device* device);
 void check_depth_mask_draw(ID3D12Device*, const char*, const char*, const char*, bool);
 void check_sampled_coverage(ID3D12Device*, const char*, const char*);
 void check_dual_pixel(ID3D12Device*, const char*, const char*, bool);
-struct PixelMismatch : std::runtime_error {
-    PixelMismatch() : std::runtime_error("AOT color export differs from CPU reference") {}
+struct ReadbackMismatch : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+struct PixelMismatch : ReadbackMismatch {
+    PixelMismatch() : ReadbackMismatch("AOT color export differs from CPU reference") {}
 };
 
 void check_translated_pixel(ID3D12Device* device, const char* path, bool swapRB, const char* reference = nullptr,
