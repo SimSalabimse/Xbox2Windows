@@ -3215,9 +3215,16 @@ if(EXISTS "${INTAKE_PYTHON}")
     # gfx2hlsl lowers s_bitcmp1_b32 and s_bitcmp0_b32 (SOPC): CPU evaluation of the translated SCC test.
     add_test(NAME startup_gfx2hlsl_s_bitcmp COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_s_bitcmp_check.py")
-    # gfx2hlsl lowers s_flbit_i32_b32 (SOP1, #1723): CPU evaluation and refusals.
+    # gfx2hlsl lowers s_flbit_i32_b32 (SOP1, #1723): CPU evaluation, then a D3D12 UAV
+    # readback on WARP/hardware (same dispatch pattern as s_ff1 / s_abs / pack_absdiff).
     add_test(NAME startup_gfx2hlsl_s_flbit COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_s_flbit_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_gfx2hlsl_s_flbit_dispatch_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_s_flbit_check.py" dispatch "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_gfx2hlsl_s_flbit_dispatch_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endforeach()
     # gfx2hlsl lowers v_cube{id,sc,tc,ma}_f32: device-free translation controls.
     add_test(NAME startup_gfx2hlsl_cube_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_cube_check.py")
