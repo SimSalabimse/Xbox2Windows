@@ -13,7 +13,11 @@ import zlib
 from section_probe import sections
 
 
-def joaat(text):
+def joaat(text, *, allow_empty=True):
+    if not isinstance(text, str):
+        raise ValueError("State label must be an ASCII string")
+    if not allow_empty and not text:
+        raise ValueError("State label must be non-empty ASCII")
     value = 0
     for byte in text.encode("ascii"):
         value = (value + byte) & 0xffffffff
@@ -22,6 +26,26 @@ def joaat(text):
     value = (value + (value << 3)) & 0xffffffff
     value ^= value >> 11
     return (value + (value << 15)) & 0xffffffff
+
+
+def _validate_state(state):
+    if not isinstance(state, str) or not state:
+        raise ValueError("State label must be non-empty ASCII")
+    try:
+        return joaat(state, allow_empty=False)
+    except UnicodeEncodeError as exc:
+        raise ValueError(f"State label must be ASCII: {state!r}") from exc
+
+
+def _require_archive_file(path):
+    path = Path(path)
+    if not path.is_file():
+        if path.is_dir():
+            raise ValueError(f"archive path is a directory, not a file: {path}")
+        if not path.exists():
+            raise FileNotFoundError(f"archive file not found: {path}")
+        raise ValueError(f"archive path is not a regular file: {path}")
+    return path
 
 
 CAMERA = {joaat(s): s for s in ("blendduration", "orbitdistance", "priority", "pitchlimits", "headinglimits")}
@@ -200,7 +224,8 @@ def inspect_tree(nodes, attrs, vectors, state_id, record_index=0):
 def inspect(path, state=None):
     totals = Counter()
     candidates = []
-    state_id = joaat(state) if state is not None else None
+    state_id = _validate_state(state) if state is not None else None
+    path = _require_archive_file(path)
     with path.open("rb") as stream:
         if os.fstat(stream.fileno()).st_size == 0:
             raise ValueError("Empty archive; expected an RPF9 archive")
@@ -229,7 +254,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--state", help="Report at most one hash-verified example for this state label")
     args = parser.parse_args(argv)
     try:
-        result = inspect(args.archive, args.state)
+        if args.state is not None:
+            _validate_state(args.state)
+        archive = _require_archive_file(args.archive)
+        result = inspect(archive, args.state)
     except (OSError, ValueError, struct.error, zlib.error) as exc:
         parser.exit(1, f"{args.archive}: {exc}\n")
     print(json.dumps(result, indent=2))

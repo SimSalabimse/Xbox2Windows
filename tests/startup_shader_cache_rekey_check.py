@@ -6,11 +6,11 @@ one, so the check follows the next revision bump without an edit.
 
 - An old cache holds requests of the older revision (two graphics requests, one with an input layout, one
   compute request, an RTV variant of the first graphics request), one current-revision graphics request, the same
-  pipeline as the first at the current revision, a mesh request, a result and a .fail. Their old names differ
-  from pipeline_key / compute_key of the current revision.
+  pipeline as the first at the current revision, an old and a current slot 57 mesh request, a slot 86 marker,
+  a result and a .fail. Old request names differ from the current pipeline_key, compute_key or mesh57_key.
 - The tool, run as a script with two hashing processes, writes exactly the current names with the same bytes
   (the RTV variant re-keyed to its new base), no results or .fail, and gfx2hlsl.pending_keys lists them.
-- With the newer revision the same requests get other names again.
+- With the newer graphics and compute revision those requests and the RTV variant get other names again.
 - A second run writes nothing; re-keying a current cache keeps every name.
 - A missing request part, a truncated RTV variant or an RTV variant whose base request is missing exits with 1
   and creates nothing.
@@ -75,10 +75,17 @@ def gkey(module, parts):
 COMPUTE = {'.desc': struct.pack('<12Q', *range(12)), '.sa': struct.pack('<7I', *range(7)), '.sb': b'\x05' * 20,
            '.data': struct.pack('<2Q', 0x1122334455667788, 0x99), '.root': b'RTS0 synthetic compute root',
            '.c67': struct.pack('<2I', 0x7e020280, 0xbf810000)}
+MESH_OLD = {'.ps57': b'', '.root': b'RTS0 synthetic mesh root', '.m57': b'synthetic mesh'}
+MESH_CURRENT = {'.ps57': b'synthetic pixel stage', '.root': b'RTS0 synthetic mesh root',
+                '.m57': b'another synthetic mesh'}
 
 
 def ckey(module, parts):
     return module.compute_key(parts['.c67'], parts['.data'], parts['.root'], parts['.desc'], parts['.sa'], parts['.sb'])
+
+
+def mkey(module, parts):
+    return module.mesh57_key(parts['.m57'], parts['.ps57'], parts['.root'])
 
 
 def rtv_text(base):
@@ -108,7 +115,7 @@ def run(src, dst, jobs='2'):
                           env=env, timeout=120)
 
 
-def expected_files(module, requests, computes, rtv_bases):
+def expected_files(module, requests, computes, rtv_bases, meshes):
     """{name: bytes} of the requests named under module's revision."""
     files = {}
     for parts in requests:
@@ -120,6 +127,9 @@ def expected_files(module, requests, computes, rtv_bases):
     for parts in rtv_bases:
         text = rtv_text(gkey(module, parts)).encode('ascii')
         files['req_%016x.rtv' % G.fnv(text)] = text
+    for parts in meshes:
+        for ext, data in parts.items():
+            files['req_%016x%s' % (mkey(module, parts), ext)] = data
     return files
 
 
@@ -143,7 +153,12 @@ def main():
         old_rtv = write_rtv(src, gkey(older, g1))
         write_request(src, gkey(G, g1), g1)  # the same pipeline at the current revision
         write_request(src, gkey(G, g3), g3)  # current only
-        write_request(src, 0x123456789abcdef0, {'.ps57': b'', '.root': b'RTS0 mesh', '.m57': b'\x01' * 8})
+        meshes = (MESH_OLD, MESH_CURRENT)
+        old_mesh = mkey(G, MESH_OLD) ^ 1
+        mesh_keys = {mkey(G, parts) for parts in meshes}
+        write_request(src, old_mesh, MESH_OLD)
+        write_request(src, mkey(G, MESH_CURRENT), MESH_CURRENT)
+        write_request(src, 0x123456789abcdef0, {'.m86': b'synthetic slot 86 marker'})
         (src / ('%016x.txt' % gkey(older, g1))).write_text('synthetic result\n')
         (src / ('%016x.fail' % gkey(older, g2))).write_text('synthetic refusal\n')
         before = snapshot(src)
@@ -152,22 +167,26 @@ def main():
         current_names = {gkey(G, g1), gkey(G, g2), ckey(G, COMPUTE)}
         check('older-revision names differ from the current keys', not old_names & current_names)
 
-        # (a) re-keyed names are pipeline_key / compute_key of the current revision, with the same bytes.
+        # (a) re-keyed names use the current key functions, with the same bytes.
         dst = tmp / 'rekeyed'
         first = run(src, dst)
         check('re-key exits 0', first.returncode == 0, first.stderr.strip())
-        want = expected_files(G, (g1, g2, g3), (COMPUTE,), (g1,))
+        want = expected_files(G, (g1, g2, g3), (COMPUTE,), (g1,), meshes)
         got = contents(dst) if dst.is_dir() else {}
         check('re-keyed files are exactly the current requests', got == want,
               'extra %s missing %s' % (sorted(set(got) - set(want)), sorted(set(want) - set(got))))
         check('no results or .fail written', all(name.startswith('req_') for name in got))
         check('graphics summary counts the duplicate and the current request',
               'graphics: 4 requests, 2 already current -> 3 keys' in first.stdout, first.stdout)
-        check('mesh request counted, not re-keyed', 'm57 1, m86 0' in first.stdout, first.stdout)
+        check('mesh summary counts the old and current slot 57 requests',
+              'm57: 2 requests, 1 already current -> 2 keys' in first.stdout, first.stdout)
+        check('slot 86 marker is only counted', 'not re-keyed (own key strings): m86 1' in first.stdout,
+              first.stdout)
         pending = G.pending_keys(str(dst), False)
         rtv_new = G.fnv(rtv_text(gkey(G, g1)).encode('ascii'))
         check('gfx2hlsl.pending_keys lists the re-keyed requests',
-              pending == sorted({gkey(G, g1), gkey(G, g2), gkey(G, g3), ckey(G, COMPUTE), rtv_new}), pending)
+              pending == sorted({gkey(G, g1), gkey(G, g2), gkey(G, g3), ckey(G, COMPUTE), rtv_new} | mesh_keys),
+              pending)
 
         # (e) the RTV variant names the new base and is named by the hash of its new text.
         rtv_file = dst / ('req_%016x.rtv' % rtv_new)
@@ -186,7 +205,8 @@ def main():
         third = run(dst, again, jobs='1')
         check('current requests keep their names', third.returncode == 0 and contents(again) == want
               and 'graphics: 3 requests, 3 already current -> 3 keys' in third.stdout
-              and 'compute: 1 requests, 1 already current -> 1 keys' in third.stdout, third.stdout + third.stderr)
+              and 'compute: 1 requests, 1 already current -> 1 keys' in third.stdout
+              and 'm57: 2 requests, 2 already current -> 2 keys' in third.stdout, third.stdout + third.stderr)
 
         # (b) under a newer revision the same requests get other names (in process: one job keeps the patch).
         R.g, saved = newer, R.g
@@ -198,18 +218,23 @@ def main():
             R.g = saved
         got_newer = contents(newest) if newest.is_dir() else {}
         check('newer revision re-keys to its own names', code == 0
-              and got_newer == expected_files(newer, (g1, g2, g3), (COMPUTE,), (g1,)))
-        check('newer names differ from the current names', not set(got_newer) & set(want))
+              and got_newer == expected_files(newer, (g1, g2, g3), (COMPUTE,), (g1,), meshes))
+        check('only mesh names are shared between the graphics and compute revisions',
+              set(got_newer) & set(want) == set(expected_files(G, (), (), (), meshes)))
 
         # (f) negative controls: an incomplete request, a truncated RTV variant or an RTV variant without its base
-        # request writes nothing. Without the base's ready marker (.a) there is one graphics request less: 5, not 6.
+        # request writes nothing. Without the base's ready marker (.a), the request count drops from 8 to 7.
         for label, total, reason, damage in (
-                ('missing .root', 6, 'unreadable req_%016x.root' % gkey(older, g2),
+                ('missing .root', 8, 'unreadable req_%016x.root' % gkey(older, g2),
                  lambda d: (d / ('req_%016x.root' % gkey(older, g2))).unlink()),
-                ('truncated RTV variant', 6, '.rtv text does not hash to its name',
+                ('missing slot 57 .root', 8, 'unreadable req_%016x.root' % old_mesh,
+                 lambda d: (d / ('req_%016x.root' % old_mesh)).unlink()),
+                ('missing slot 57 .ps57', 8, 'unreadable req_%016x.ps57' % old_mesh,
+                 lambda d: (d / ('req_%016x.ps57' % old_mesh)).unlink()),
+                ('truncated RTV variant', 8, '.rtv text does not hash to its name',
                  lambda d: (d / ('req_%016x.rtv' % old_rtv)).write_bytes(
                      rtv_text(gkey(older, g1)).encode('ascii')[:-3])),
-                ('missing RTV base', 5, '.rtv base request %016x is not a complete graphics request' % gkey(older, g1),
+                ('missing RTV base', 7, '.rtv base request %016x is not a complete graphics request' % gkey(older, g1),
                  lambda d: (d / ('req_%016x.a' % gkey(older, g1))).unlink())):
             bad = tmp / ('bad_' + label.replace(' ', '_'))
             shutil.copytree(src, bad)
