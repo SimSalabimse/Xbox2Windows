@@ -14428,18 +14428,20 @@ VGPRs and the eight image descriptor words come from an unmodified fixed table
 offset. The translator emits `asfloat(uint4(...))` into a `RWTexture2D<float4>`
 under the lane's EXEC bit and records `uav N tex2d float table P O channels 4`
 in the version 2 compute manifest. Pixel-stage 2D `image_store` also accepts
-`unorm`.
+`unorm` and a sparse DMASK: channels selected by the mask are written in order
+from consecutive VDATA registers via a float4 read-modify-write of the typed
+UAV (M200-01 I). Compute still requires DMASK `0xf`.
 
-The standalone dispatch reuses the source and CPU reference from the
-[gfx1013 2D float store fixture](#gfx1013-2d-float-image-stores-and-mip-loads).
-Two groups write 16 texels to mip zero of an `R32G32B32A32_FLOAT` UAV while
-comparing all 1,344 words across three mips. A second program masks out the
-second row. Omitting the store, swapping R/B, swapping RG/BA and dropping the
-EXEC guard produce 64, 32, 64 and 32 mismatches respectively.
+`tests/startup_pixel_image_store_check.py` covers the full-mask store and a
+`dmask:0x5` (x and z) program whose UAV starts at -1 in every channel; after the
+store the named texel is `(1, -1, 2, -1)` and every other texel stays -1. Replacing
+the RMW with a full four-channel write must mismatch. Empty and out-of-range
+masks stay refused.
 
 ```powershell
 cmake --build --preset release --target offscreen_check
 ctest --preset release --no-tests=error -R '^startup_compute_image_store(_warp|_hardware)?$' -V
+ctest --preset dev --no-tests=error -R '^startup_pixel_image_store' -V
 ```
 
 ### Explicit-LOD 2D gather

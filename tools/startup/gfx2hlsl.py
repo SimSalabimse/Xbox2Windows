@@ -5116,13 +5116,14 @@ class Stage:
         return self.descriptor(operand)
 
     def op_image_store(self, ops, mods):
-        """Write one four-channel 2D texel from pixel FP32 or compute packed FP16 data.
+        """Write selected 2D texel channels from pixel FP32 or compute packed FP16 data.
 
         MIMG opcode 0x08 (LLVM AMDGPU MIMGInstructions.td, IMAGE_STORE via MIMG_Store): VDATA is the
         source, VADDR the integer texel address (x, y for dim 2D) and SRSRC the image descriptor; the
         channels selected by DMASK are written in order from consecutive VDATA registers. HLSL's typed UAV
-        store writes every channel of the view, so only DMASK 0xf is exact here; a partial mask would need a
-        read-modify-write and is refused. The data is stored as float4, so the bound view must be of a
+        store writes every channel of the view, so a full DMASK 0xf is a direct assignment. A partial mask
+        on a pixel stage is a read-modify-write of the float4 texel (M200-01 I / #2618 starter). Compute
+        and D16 stores still require DMASK 0xf. The data is stored as float4, so the bound view must be of a
         float or normalized format (the runtime side is not part of this lowering). The store runs under the
         lane's exec bit, like the other per-lane writes, and D3D drops UAV writes from helper lanes as the
         hardware drops them for lanes outside exec.
@@ -5149,12 +5150,18 @@ class Stage:
             mask = int(masks[0], 0)
         except ValueError:
             raise Unsupported('%s with dmask %s: not an integer' % (name, masks[0])) from None
-        if mask != 0xf:
-            raise Unsupported('%s with dmask %s: a typed UAV store writes all four channels' % (name, masks[0]))
+        sparse = self.kind == 'ps' and not d16 and mask and not (mask & ~0xf) and mask != 0xf
+        if d16 or self.kind == 'cs' or not sparse:
+            if mask != 0xf:
+                raise Unsupported('%s with dmask %s: a typed UAV store writes all four channels' % (
+                    name, masks[0]))
+            count = 2 if d16 else 4
+        else:
+            count = bin(mask).count('1')
         data = reg_range(ops[0])
-        count = 2 if d16 else 4
         if not data or data[0] != 'v' or data[2] - data[1] + 1 != count or data[2] > 255:
-            raise Unsupported('%s data %s: %s VGPRs expected' % (name, ops[0], 'two' if d16 else 'four'))
+            raise Unsupported('%s data %s: %s VGPRs expected' % (
+                name, ops[0], 'two' if d16 else ('four' if count == 4 else str(count))))
         coords = ops[1]
         if coords.startswith('['):
             cs = [c.strip() for c in coords[1:-1].split(',')]
@@ -5170,15 +5177,31 @@ class Stage:
             key = self.fixed_table_image(ops[2], name)
         else:
             key = self.descriptor(ops[2])
+        image = self.pipe.uav(key, 'tex2d')
+        index = 'uint2(%s, %s)' % (self.u(cs[0]), self.u(cs[1]))
         if d16:
             # RDNA 2 ISA §8.2.5: RG occupy VDATA, BA occupy VDATA+1, low half first.
             rgba = ['f16tof32(%s & 0xffffu), f16tof32(%s >> 16)' % (word, word) for word in words]
-            value = 'float4(%s)' % ', '.join(rgba)
+            body = '%s[%s] = float4(%s);' % (image, index, ', '.join(rgba))
+        elif sparse:
+            # Typed UAV writes all four channels: read the texel, overwrite DMASK channels in VDATA order.
+            # Reuse the stage's scratch float4 `t` (declared in every pixel entry) so the RMW stays one emit.
+            parts = ['t = %s[%s]' % (image, index)]
+            src = 0
+            for bit, channel in enumerate('xyzw'):
+                if mask & (1 << bit):
+                    parts.append('t.%s = asfloat(%s)' % (channel, words[src]))
+                    src += 1
+            parts.append('%s[%s] = t' % (image, index))
+            body = '; '.join(parts) + ';'
         else:
-            value = 'asfloat(uint4(%s))' % ', '.join(words)
-        image = self.pipe.uav(key, 'tex2d')
-        body = '%s[uint2(%s, %s)] = %s;' % (image, self.u(cs[0]), self.u(cs[1]), value)
-        self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
+            body = '%s[%s] = asfloat(uint4(%s));' % (image, index, ', '.join(words))
+        if self.exec_known:
+            self.emit(body)
+        elif sparse:
+            self.emit('if (exec & 1) { %s }' % body)
+        else:
+            self.emit('if (exec & 1) ' + body)
 
     def gather_2d_setup(self, name, ops, mods, addr_count, addr_label, *, mip_preclamp):
         if self.kind not in ('ps', 'cs') or len(ops) != 4:

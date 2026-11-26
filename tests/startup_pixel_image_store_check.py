@@ -1,9 +1,13 @@
-"""Check gfx2hlsl's pixel-stage image_store on a hand-assembled gfx1013 program (#1996 item F).
+"""Check gfx2hlsl's pixel-stage image_store on a hand-assembled gfx1013 program (#1996 item F; M200-01 I).
 
 The pixel program loads an image descriptor from descriptor table 0, sets the texel address (1, 2) and
 four distinct binary32 values, stores them with image_store ... dmask:0xf dim:SQ_RSRC_IMG_2D, and exports
 the same values to mrt0. The words were assembled by hand from the MIMG layout and are decoded back by
 tools/disasm_rdna2.py here; --llvm-mc reassembles the source and compares the words.
+
+A second program uses dmask:0x5 (x and z) so VDATA is two registers: the UAV starts at -1 in every
+channel, the store writes 1.0 and 2.0 into x and z, and y/w stay -1. That is the sparse-mask RMW the
+M200-01 I starter asks for.
 
 Without arguments: translation controls and refusals. With draw: also compile the translation with DXC and
 draw it through offscreen_check --startup-image-store, which reads every texel of a 4x4 image back. Negative
@@ -45,12 +49,19 @@ exp mrt0 v4, v5, v6, v7 done vm
 s_endpgm
 """
 STORE = bytes.fromhex('080f20f000040400')
+# dmask:0x5 → VDATA v[4:5] written to channels x then z (same PREFIX: v4=1.0, v5=2.0).
+STORE_XZ = bytes.fromhex('080520f000040400')
 PREFIX = bytes.fromhex('04040cf4000000fa' '8102007e' '8202027e' 'f202087e' 'f4020a7e' 'ff020c7e00004040'
                        'f6020e7e' '7fc08cbf')
 SUFFIX = bytes.fromhex('703f8cbf' '0f1800f804050607' '000081bf')
 WORDS = PREFIX + STORE + SUFFIX
+WORDS_XZ = PREFIX + STORE_XZ + SUFFIX
 STORE_LINE = 'w0[uint2(v0, v1)] = asfloat(uint4(v4, v5, v6, v7));'
+# Init -1: after xz store, texel is (1.0, -1.0, 2.0, -1.0).
+SPARSE_LINE = ('t = w0[uint2(v0, v1)]; t.x = asfloat(v4); t.z = asfloat(v5); '
+               'w0[uint2(v0, v1)] = t;')
 GUARDED_LINE = 'if (exec & 1) ' + STORE_LINE
+SPARSE_BITS = ['3f800000', 'bf800000', '40000000', 'bf800000']  # 1.0, -1.0, 2.0, -1.0
 
 
 def cmpx_eq(constant):
@@ -107,7 +118,7 @@ def controls():
     print('glc, slc, dlc and unorm accepted')
 
     # Refusals, each by name: packed data or addresses, fault-status returns, a 128-bit descriptor,
-    # a partial channel mask and other image dimensions.
+    # and other image dimensions.
     cases = (('d16', patched(7, 0x80)), ('a16', patched(7, 0x40)), ('tfe', patched(2, 0x01)),
              ('lwe', patched(2, 0x02)), ('r128', patched(1, 0x80)), ('reserved', patched(1, 0x40)),
              ('SQ_RSRC_IMG_3D', bytes.fromhex('100f20f000040400')),
@@ -118,22 +129,38 @@ def controls():
         message = refused(with_store(store), 'image_store')
         print('refused %-20s %s' % (name + ':', message))
         assert decoded.startswith('image_store'), decoded
-    # A partial channel mask, encoded: the decoder sizes VDATA from the mask (v[4:6], v4), so each must be
-    # refused for the mask itself, which the translator checks before the data registers.
-    for mask, data in ((0x7, 'v[4:6]'), (0x1, 'v4')):
+    # Sparse DMASK: channels selected by the mask are written in order from consecutive VDATA registers.
+    # The UAV starts at -1; dmask:0x5 with v[4:5] = (1.0, 2.0) yields (1, -1, 2, -1).
+    decoded_xz = D.decode_instruction(STORE_XZ, 0)[2]
+    assert decoded_xz == 'image_store v[4:5], v[0:1], s[16:23] dmask:0x5 dim:SQ_RSRC_IMG_2D', decoded_xz
+    sparse_ps = translate(WORDS_XZ).hlsl_ps()
+    assert '    ' + SPARSE_LINE in sparse_ps, sparse_ps
+    print('sparse dmask 0x5: %s' % SPARSE_LINE)
+    for mask, data, count in ((0x7, 'v[4:6]', 3), (0x1, 'v4', 1), (0x3, 'v[4:5]', 2)):
         store = patched(1, 0, mask)
         decoded = D.decode_instruction(store, 0)[2]
         assert decoded.startswith('image_store %s, ' % data) and 'dmask:%#x' % mask in decoded, decoded
-        message = refused(with_store(store), 'dmask %#x' % mask, 'writes all four channels')
-        print('refused %-20s %s' % ('dmask %#x:' % mask, message))
-    # The same partial mask with four data registers, through the handler: only the mask guard can refuse it.
+        text = translate(with_store(store)).hlsl_ps()
+        store_line = next(line for line in text.splitlines() if 't = w0[uint2(v0, v1)];' in line)
+        assert store_line.count('t.') == count, (mask, store_line)
+        print('sparse dmask %#x accepted (%d channel(s))' % (mask, count))
+    # Wrong VGPR count for a sparse mask is refused for the data, not the mask.
     try:
-        pipe.ps.op_image_store(['v[4:7]', 'v[0:1]', 's[16:23]'], ['dmask:0x7', 'dim:SQ_RSRC_IMG_2D'])
+        pipe.ps.op_image_store(['v[4:7]', 'v[0:1]', 's[16:23]'], ['dmask:0x5', 'dim:SQ_RSRC_IMG_2D'])
     except G.Unsupported as error:
-        assert 'dmask 0x7' in str(error) and 'writes all four channels' in str(error), error
+        assert '2 VGPRs expected' in str(error), error
     else:
-        raise AssertionError('a partial dmask with four data registers was accepted')
-    print('refused dmask 0x7 with four data registers (v[4:7])')
+        raise AssertionError('dmask 0x5 with four data registers was accepted')
+    print('refused dmask 0x5 with four data registers (v[4:7])')
+    # Empty and out-of-range masks still refuse like a full-channel typed store.
+    for bad in (0x0, 0x10):
+        try:
+            pipe.ps.op_image_store(['v4', 'v[0:1]', 's[16:23]'], ['dmask:%#x' % bad, 'dim:SQ_RSRC_IMG_2D'])
+        except G.Unsupported as error:
+            assert 'writes all four channels' in str(error), error
+        else:
+            raise AssertionError('dmask %#x was accepted' % bad)
+    print('refused dmask 0x0 and 0x10')
     # Four data registers are required for the full mask: three are refused for the data, not the mask.
     try:
         pipe.ps.op_image_store(['v[4:6]', 'v[0:1]', 's[16:23]'], ['dmask:0xf', 'dim:SQ_RSRC_IMG_2D'])
@@ -142,6 +169,17 @@ def controls():
     else:
         raise AssertionError('dmask 0xf with three data registers was accepted')
     print('refused dmask 0xf with three data registers (v[4:6])')
+    # Compute still requires the full mask (shared handler; pixel-only sparse).
+    try:
+        pipe.ps.kind = 'cs'
+        pipe.ps.op_image_store(['v[4:5]', 'v[0:1]', 's[16:23]'], ['dmask:0x5', 'dim:SQ_RSRC_IMG_2D'])
+    except G.Unsupported as error:
+        assert 'writes all four channels' in str(error), error
+    else:
+        raise AssertionError('compute sparse dmask was accepted')
+    finally:
+        pipe.ps.kind = 'ps'
+    print('refused compute-stage sparse dmask 0x5')
     # Mask text that is not an integer is a named refusal, not a ValueError.
     try:
         pipe.ps.op_image_store(['v[4:7]', 'v[0:1]', 's[16:23]'], ['dmask:0xz', 'dim:SQ_RSRC_IMG_2D'])
@@ -246,6 +284,23 @@ def check_draw(dxc, renderer, adapter):
         if run.returncode == 0 or needle not in run.stderr:
             raise AssertionError('control exec guard removed was not detected\n%s\n%s' % (run.stdout, run.stderr))
         print('control exec guard removed: fails as expected (%s)' % mismatch_line(run.stderr))
+
+        # Sparse dmask 0x5: only x and z change; y and w stay at the UAV clear (-1.0).
+        sparse_want = ','.join(SPARSE_BITS)
+        sparse_source = translate(WORDS_XZ).hlsl_ps()
+        assert SPARSE_LINE in sparse_source, sparse_source
+        run = draw(sparse_source, 'store_xz', sparse_want)
+        if run.returncode:
+            raise AssertionError('sparse store draw failed\n%s\n%s' % (run.stdout, run.stderr))
+        print('draw sparse dmask 0x5: texel (1, 2) = %s' % sparse_want)
+        # Control: writing all four channels instead of the RMW must mismatch on y and w.
+        full_instead = sparse_source.replace(SPARSE_LINE, STORE_LINE)
+        assert full_instead != sparse_source
+        run = draw(full_instead, 'sparse_as_full', sparse_want)
+        needle = 'texel_mismatch x=1 y=2 expected=%s actual=%s' % (sparse_want, expected)
+        if run.returncode == 0 or needle not in run.stderr:
+            raise AssertionError('control sparse-as-full was not detected\n%s\n%s' % (run.stdout, run.stderr))
+        print('control sparse-as-full: fails as expected (%s)' % mismatch_line(run.stderr))
 
 
 def main():
