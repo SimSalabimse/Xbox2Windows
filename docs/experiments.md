@@ -16113,14 +16113,25 @@ then selects with `v_cndmask_b32` on s27. The traces stay `[9, 9, 9, 1, 1, 1, 1,
 `ACCUM_SCC_*` reads the SCC with `s_cselect_b32 s28, 1, 0` and stores s28. The wave word is
 nonzero, so every lane stores 1. A leaving lane's singleton stores 0. That program stays
 `branch out of the block`. With the dead-SCC check removed it translates, so the refusal
-depends on the check. The counted
+depends on the check.
+
+`ACCUM_KEPT_*` reads s26 per lane, clears s26, then reads s25 with `v_cndmask_b32`. s25 is
+still live at the exit. The wave cleared a leaving lane's bit and the model kept it, so lane 0
+is 9 in the wave and 1 in the model. Dropping the "sA dead at the exit" test accepts these
+words. `ACCUM_SAVEEXEC_*` is `s_and_saveexec_b32 s28, s26`, a restore of that saved EXEC, and
+`s_cselect_b32` of the SCC. The traces are the same 1-versus-0 split as `ACCUM_SCC_*`. A
+dead-SCC check that looks only at `s_and_b32` accepts it.
+
+The counted
 loop keeps its backward-latch diagnostic. This fixture does not translate that loop: the latch
 and the second saved mask are still refused. Run
 `python -B tests/startup_gfx2hlsl_compute_check.py` for the host controls and add
-`binary llvm-mc-15` to reassemble the fixture. Dispatch readback is left for the Windows test PC:
+`binary llvm-mc-15` to reassemble the fixture. None of these programs is a dispatch case, so a
+ctest filter that only runs the compute dispatches does not exercise them. The host controls
+on the Windows test PC are:
 
 ```powershell
-ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_compute_'
+ctest --preset dev --no-tests=error -j 1 -R '^startup_gfx2hlsl_compute_controls$'
 ```
 
 ### Startup compute formatted buffer reads

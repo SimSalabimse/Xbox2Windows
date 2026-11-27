@@ -3481,9 +3481,11 @@ class Stage:
         """True when SCC written at `at` is not read on any later path.
 
         A per-lane `s_and_b32 sX, sB, exec_lo` writes the lane bit of sX and sets SCC from the whole word
-        (`sX != 0`). The wave's SCC is true when any staying lane's bit is set. A lane that left has only its
-        own clear bit, so its SCC is false. live_in drops SCC at a later write that does not read it, so SCC is
-        dead when no successor still has it live.
+        (`sX != 0`). `s_and_saveexec_b32 sX, sB` does the same for SCC, from the new EXEC. The wave's SCC is
+        true when any staying lane's bit is set. A lane that left has only its own clear bit, so its SCC is
+        false. live_in drops SCC at a later write that does not read it, so SCC is dead when no successor
+        still has it live. The same rule covers both forms; a check that only looks at `s_and_b32` would
+        accept the saveexec form.
         """
         if 'scc' not in effects[at][1]:
             return True

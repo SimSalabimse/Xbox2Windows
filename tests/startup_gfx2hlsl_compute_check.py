@@ -521,6 +521,27 @@ ACCUM_SCC_SOURCE = ACCUM_SOURCE.replace(
     'v_mov_b32 v5, s28\n')
 ACCUM_SCC_WORDS = ACCUM_WORDS.replace(
     bytes.fromhex('050001d5050d6a00'), bytes.fromhex('1a7e1b8781801c851c020a7e'))
+# cndmask of s26, then s_mov_b32 s26, 0, then cndmask of s25. s26 dies, so the later read is s25, which is still
+# live at the exit. The wave cleared a leaving lane's bit of s25; the model kept the entry bit.
+ACCUM_KEPT_SOURCE = ACCUM_SOURCE.replace(
+    _ACCUM_CND,
+    'v_cndmask_b32 v5, v5, v6, s26\n'
+    's_mov_b32 s26, 0\n'
+    'v_cndmask_b32 v5, v5, v6, s25\n')
+ACCUM_KEPT_WORDS = ACCUM_WORDS.replace(
+    bytes.fromhex('050001d5050d6a00'),
+    bytes.fromhex('050001d5050d6a0080039abe050001d5050d6600'))
+# s_and_saveexec_b32 s28, s26 sets SCC from the whole new EXEC. Restoring exec from s28 and s_cselect of that SCC
+# stores 1 on every lane of the wave and 0 for a leaving lane's singleton.
+ACCUM_SAVEEXEC_SOURCE = ACCUM_SOURCE.replace(
+    _ACCUM_CND,
+    's_and_saveexec_b32 s28, s26\n'
+    's_mov_b32 exec_lo, s28\n'
+    's_cselect_b32 s29, 1, 0\n'
+    'v_mov_b32 v5, s29\n')
+ACCUM_SAVEEXEC_WORDS = ACCUM_WORDS.replace(
+    bytes.fromhex('050001d5050d6a00'),
+    bytes.fromhex('1a3c9cbe1c03febe81801d851d020a7e'))
 
 
 def saveexec_fixture():
@@ -1321,6 +1342,118 @@ def check_execz_exit_run():
     assert any(reason in text for text, _ in refusals), refusals
 
 
+def check_execz_accumulated_mask():
+    # s25 is the entry EXEC copy and s26 starts at 0. The execz target is the staying remask, so a lane that
+    # misses the guard still runs the pair; a lane that takes the scc0 exit does not. In an 8-lane group the
+    # remask is bits 3-7. v_cndmask then writes 1 where that lane's bit of s26 is set and keeps 9 where it is clear.
+    def trace(lanes, mix=False, observe='bit'):
+        values = dict.fromkeys(lanes, 9)
+        saved = set(lanes)
+        masked, accum = set(saved), set()
+        active = set(lanes) & {lane for lane in lanes if lane < 6}  # s_and_saveexec
+        if active:
+            active &= {lane for lane in lanes if lane < 3}
+            stayed = saved - active                                 # s_andn2, then s_mov exec, s0
+            if stayed:
+                for lane in stayed:
+                    values[lane] = KEY ^ lane
+                if mix:
+                    accum |= saved
+                else:
+                    masked &= stayed
+                    accum |= masked
+        else:                                                       # execz lands on the staying remask
+            for lane in saved:
+                values[lane] = KEY ^ lane
+            if mix:
+                accum |= saved
+            else:
+                masked &= saved
+                accum |= masked
+        out = []
+        for lane in sorted(lanes):
+            if observe == 'word':
+                out.append(sum(1 << bit for bit in accum))
+            elif observe == 'masked':
+                out.append(1 if lane in masked else values[lane])
+            elif observe == 'scc':
+                # s_cselect of the AND's SCC stores 1 for every lane in this call when any bit of s26 is set.
+                out.append(1 if accum else 0)
+            else:
+                out.append(1 if lane in accum else values[lane])
+        return out
+
+    lanes = range(8)
+    def singletons(lanes, **kwargs):
+        return [trace([lane], **kwargs)[0] for lane in lanes]
+
+    assert trace(lanes) == singletons(lanes) == [9, 9, 9, 1, 1, 1, 1, 1]
+    assert trace(range(3)) == singletons(range(3)) == [9, 9, 9]
+    text = translate('O', code=ACCUM_WORDS).hlsl_cs()
+    translate('O', code=ACCUM_WORDS, group=(3, 1, 1)).hlsl_cs()
+    assert '(!scc) ?' in text and 'exec = (s21) & 1;' in text and 's26' in text, text
+    reason = 's_cbranch_scc0 inside a block s_cbranch_execz skips per lane: branch out of the block'
+    # A whole-word read of s26: the wave holds bits 3-7 (248) in every lane, each singleton only its own bit.
+    assert trace(lanes, observe='word') == [248] * 8
+    assert singletons(lanes, observe='word') == [0, 0, 0, 8, 16, 32, 64, 128]
+    word_read = ACCUM_WORDS.replace(bytes.fromhex('050001d5050d6a00'), bytes.fromhex(ACCUM_WORD_READ))
+    refused(reason, lambda: translate('O', code=word_read).hlsl_cs())
+    # s_or of the saved entry mask sets bits of lanes that already left. Lane 0 stays 9 in the model and becomes 1
+    # in the wave.
+    assert trace(lanes, mix=True)[0] == 1 and singletons(lanes, mix=True)[0] == 9
+    mixed = ACCUM_WORDS.replace(bytes.fromhex('1a191a88'), bytes.fromhex(ACCUM_MIX))
+    refused(reason, lambda: translate('O', code=mixed).hlsl_cs())
+    # A per-lane read of s25: the wave cleared lane 0's bit, and the model kept the entry 1.
+    assert trace(lanes, observe='masked')[0] == 9 and singletons(lanes, observe='masked')[0] == 1
+    read_masked = ACCUM_WORDS.replace(bytes.fromhex('050001d5050d6a00'), bytes.fromhex(ACCUM_READ_S25))
+    refused(reason, lambda: translate('O', code=read_masked).hlsl_cs())
+    # AND of s26 with exec, then a compare that kills SCC, then a per-lane read of the AND result.
+    assert trace(lanes) == singletons(lanes)
+    and_text = translate('O', code=ACCUM_AND_WORDS).hlsl_cs()
+    translate('O', code=ACCUM_AND_WORDS, group=(3, 1, 1)).hlsl_cs()
+    # s4 is the root constant, so the compare is emitted on ud0 and overwrites the AND's SCC.
+    assert 's27 = (s26 & exec) & 1;' in and_text and 'scc = ud0 == ud0;' in and_text, and_text
+    # The same AND whose SCC is read by s_cselect. The wave's word is nonzero, so every lane stores 1.
+    # A leaving lane's singleton has a clear bit, so SCC is false and it stores 0.
+    assert trace(lanes, observe='scc') == [1] * 8
+    assert singletons(lanes, observe='scc') == [0, 0, 0, 1, 1, 1, 1, 1]
+    refused(reason, lambda: translate('O', code=ACCUM_SCC_WORDS).hlsl_cs())
+    # Without the dead-SCC check the same words translate, so the refusal above depends on that check.
+    original_scc = G.Stage.accum_scc_dead
+    G.Stage.accum_scc_dead = lambda self, *args, **kwargs: True
+    try:
+        try:
+            refused(reason, lambda: translate('O', code=ACCUM_SCC_WORDS).hlsl_cs())
+        except AssertionError as err:
+            assert 'accepted, expected a refusal' in str(err), err
+        else:
+            raise AssertionError('dropping the SCC check still refused the SCC-live AND')
+    finally:
+        G.Stage.accum_scc_dead = original_scc
+    refused(reason, lambda: translate('O', code=ACCUM_SCC_WORDS).hlsl_cs())
+    # s25 stays live at the exit. The first cndmask reads s26 per lane, s_mov clears s26, and the second
+    # cndmask reads s25. A leaving lane's bit of s25 is clear in the wave and set in the model.
+    assert trace(lanes, observe='masked')[0] == 9 and singletons(lanes, observe='masked')[0] == 1
+    refused(reason, lambda: translate('O', code=ACCUM_KEPT_WORDS).hlsl_cs())
+    # saveexec of the accumulated word sets SCC from the whole new EXEC, and s_cselect reads it.
+    assert trace(lanes, observe='scc') == [1] * 8
+    assert singletons(lanes, observe='scc') == [0, 0, 0, 1, 1, 1, 1, 1]
+    refused(reason, lambda: translate('O', code=ACCUM_SAVEEXEC_WORDS).hlsl_cs())
+    # The same words are refused when the accumulation is not recognised, which is the translator without this pass.
+    original = G.Stage.execz_accumulated_mask
+
+    def reverted(self, *args, **kwargs):
+        found = original(self, *args, **kwargs)
+        return False if found else found
+
+    G.Stage.execz_accumulated_mask = reverted
+    try:
+        refused(reason, lambda: translate('O', code=ACCUM_WORDS).hlsl_cs())
+    finally:
+        G.Stage.execz_accumulated_mask = original
+    translate('O', code=ACCUM_WORDS).hlsl_cs()
+
+
 def check_execz_mask_subset():
     """Pre-branch EXEC subset tracking (#2645 T1): sM <= EXEC carried into an execz block lets remasks preserve skipped bits."""
     # With the early exit branch replaced by s_nop, the counted loop still exercises s_mov_b32 exec_lo, s22 before
@@ -1443,110 +1576,6 @@ def check_execz_mask_subset():
     assert G.subset_after('s_or_saveexec_b32', 's_or_saveexec_b32 s21, vcc_lo',
                           {'s21', 'exec', 'exec_hi', 'scc'}, {('exec', 0), ('exec_hi', 1), ('s22', 0)}) == (
         {('exec', 0), ('exec_hi', 1), ('s21', 0), ('s22', 0)})
-
-def check_execz_accumulated_mask():
-    # s25 is the entry EXEC copy and s26 starts at 0. The execz target is the staying remask, so a lane that
-    # misses the guard still runs the pair; a lane that takes the scc0 exit does not. In an 8-lane group the
-    # remask is bits 3-7. v_cndmask then writes 1 where that lane's bit of s26 is set and keeps 9 where it is clear.
-    def trace(lanes, mix=False, observe='bit'):
-        values = dict.fromkeys(lanes, 9)
-        saved = set(lanes)
-        masked, accum = set(saved), set()
-        active = set(lanes) & {lane for lane in lanes if lane < 6}  # s_and_saveexec
-        if active:
-            active &= {lane for lane in lanes if lane < 3}
-            stayed = saved - active                                 # s_andn2, then s_mov exec, s0
-            if stayed:
-                for lane in stayed:
-                    values[lane] = KEY ^ lane
-                if mix:
-                    accum |= saved
-                else:
-                    masked &= stayed
-                    accum |= masked
-        else:                                                       # execz lands on the staying remask
-            for lane in saved:
-                values[lane] = KEY ^ lane
-            if mix:
-                accum |= saved
-            else:
-                masked &= saved
-                accum |= masked
-        out = []
-        for lane in sorted(lanes):
-            if observe == 'word':
-                out.append(sum(1 << bit for bit in accum))
-            elif observe == 'masked':
-                out.append(1 if lane in masked else values[lane])
-            elif observe == 'scc':
-                # s_cselect of the AND's SCC stores 1 for every lane in this call when any bit of s26 is set.
-                out.append(1 if accum else 0)
-            else:
-                out.append(1 if lane in accum else values[lane])
-        return out
-
-    lanes = range(8)
-    def singletons(lanes, **kwargs):
-        return [trace([lane], **kwargs)[0] for lane in lanes]
-
-    assert trace(lanes) == singletons(lanes) == [9, 9, 9, 1, 1, 1, 1, 1]
-    assert trace(range(3)) == singletons(range(3)) == [9, 9, 9]
-    text = translate('O', code=ACCUM_WORDS).hlsl_cs()
-    translate('O', code=ACCUM_WORDS, group=(3, 1, 1)).hlsl_cs()
-    assert '(!scc) ?' in text and 'exec = (s21) & 1;' in text and 's26' in text, text
-    reason = 's_cbranch_scc0 inside a block s_cbranch_execz skips per lane: branch out of the block'
-    # A whole-word read of s26: the wave holds bits 3-7 (248) in every lane, each singleton only its own bit.
-    assert trace(lanes, observe='word') == [248] * 8
-    assert singletons(lanes, observe='word') == [0, 0, 0, 8, 16, 32, 64, 128]
-    word_read = ACCUM_WORDS.replace(bytes.fromhex('050001d5050d6a00'), bytes.fromhex(ACCUM_WORD_READ))
-    refused(reason, lambda: translate('O', code=word_read).hlsl_cs())
-    # s_or of the saved entry mask sets bits of lanes that already left. Lane 0 stays 9 in the model and becomes 1
-    # in the wave.
-    assert trace(lanes, mix=True)[0] == 1 and singletons(lanes, mix=True)[0] == 9
-    mixed = ACCUM_WORDS.replace(bytes.fromhex('1a191a88'), bytes.fromhex(ACCUM_MIX))
-    refused(reason, lambda: translate('O', code=mixed).hlsl_cs())
-    # A per-lane read of s25: the wave cleared lane 0's bit, and the model kept the entry 1.
-    assert trace(lanes, observe='masked')[0] == 9 and singletons(lanes, observe='masked')[0] == 1
-    read_masked = ACCUM_WORDS.replace(bytes.fromhex('050001d5050d6a00'), bytes.fromhex(ACCUM_READ_S25))
-    refused(reason, lambda: translate('O', code=read_masked).hlsl_cs())
-    # AND of s26 with exec, then a compare that kills SCC, then a per-lane read of the AND result.
-    assert trace(lanes) == singletons(lanes)
-    and_text = translate('O', code=ACCUM_AND_WORDS).hlsl_cs()
-    translate('O', code=ACCUM_AND_WORDS, group=(3, 1, 1)).hlsl_cs()
-    # s4 is the root constant, so the compare is emitted on ud0 and overwrites the AND's SCC.
-    assert 's27 = (s26 & exec) & 1;' in and_text and 'scc = ud0 == ud0;' in and_text, and_text
-    # The same AND whose SCC is read by s_cselect. The wave's word is nonzero, so every lane stores 1.
-    # A leaving lane's singleton has a clear bit, so SCC is false and it stores 0.
-    assert trace(lanes, observe='scc') == [1] * 8
-    assert singletons(lanes, observe='scc') == [0, 0, 0, 1, 1, 1, 1, 1]
-    refused(reason, lambda: translate('O', code=ACCUM_SCC_WORDS).hlsl_cs())
-    # Without the dead-SCC check the same words translate, so the refusal above depends on that check.
-    original_scc = G.Stage.accum_scc_dead
-    G.Stage.accum_scc_dead = lambda self, *args, **kwargs: True
-    try:
-        try:
-            refused(reason, lambda: translate('O', code=ACCUM_SCC_WORDS).hlsl_cs())
-        except AssertionError as err:
-            assert 'accepted, expected a refusal' in str(err), err
-        else:
-            raise AssertionError('dropping the SCC check still refused the SCC-live AND')
-    finally:
-        G.Stage.accum_scc_dead = original_scc
-    refused(reason, lambda: translate('O', code=ACCUM_SCC_WORDS).hlsl_cs())
-    # The same words are refused when the accumulation is not recognised, which is the translator without this pass.
-    original = G.Stage.execz_accumulated_mask
-
-    def reverted(self, *args, **kwargs):
-        found = original(self, *args, **kwargs)
-        return False if found else found
-
-    G.Stage.execz_accumulated_mask = reverted
-    try:
-        refused(reason, lambda: translate('O', code=ACCUM_WORDS).hlsl_cs())
-    finally:
-        G.Stage.execz_accumulated_mask = original
-    translate('O', code=ACCUM_WORDS).hlsl_cs()
-
 
 def check_mbcnt():
     for _, words, reason in MBCNT_REFUSALS:
@@ -2709,6 +2738,8 @@ def check_binary(llvm_mc):
     assert assemble(llvm_mc, ACCUM_SOURCE) == ACCUM_WORDS
     assert assemble(llvm_mc, ACCUM_AND_SOURCE) == ACCUM_AND_WORDS
     assert assemble(llvm_mc, ACCUM_SCC_SOURCE) == ACCUM_SCC_WORDS
+    assert assemble(llvm_mc, ACCUM_KEPT_SOURCE) == ACCUM_KEPT_WORDS
+    assert assemble(llvm_mc, ACCUM_SAVEEXEC_SOURCE) == ACCUM_SAVEEXEC_WORDS
     for name, (source, words, *_rest) in CASES.items():
         built = assemble(llvm_mc, source)
         assert built == words, '%s: assembled %s, recorded %s' % (name, built.hex(), words.hex())
