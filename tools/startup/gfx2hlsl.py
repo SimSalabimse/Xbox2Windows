@@ -3211,7 +3211,8 @@ class Stage:
         or a backward s_cbranch_execz is refused. A proven straight lane-exhaustion exit can leave the block for a
         scalar run ending in an EXEC restore (execz_scalar_exit, #2645 T3). Between the staying remask and that
         exit, `s_and_b32 sA, sA, exec_lo` then `s_or_b32 sB, sB, sA` keeps a leaving lane's own bit of sB; sA must
-        be dead at the exit and every later read of sB must be per lane (#2645 T4).
+        be dead at the exit and every later read of sB must be per lane (#2645 T4). An `s_and_b32` of sB with
+        exec_lo is one of those reads only while the SCC it writes is dead: that SCC is the whole word, not the lane bit.
 
         The other accepted live definition is the i1-phi lane mask of the compiler's if-conversion, a 32-bit M (vcc_lo
         or one sN) zeroed before the branch (`s_mov_b32 M, 0`) and set in the block from exec only (`s_mov_b32 M,
@@ -3423,7 +3424,8 @@ class Stage:
         rest of sB still holds other lanes' bits. sA is not lane-kept for the lane that left: the wave clears a
         bit the model keeps, so sA must be dead at the exit. sB must be live there, and every later read of sB,
         until a write of sB ends the definition, must be per lane (per_lane_read), the same reads as the
-        if-conversion mask. Any other scalar op in the span stays refused.
+        if-conversion mask. `s_and_b32 sX, sB, exec_lo` is per lane for sX and also sets SCC from the whole word
+        (accum_scc_dead). That SCC is accepted only when it is dead. Any other scalar op in the span stays refused.
         """
         def vector_span(i):
             name, asm = self.ins[i][2:]
@@ -3468,10 +3470,24 @@ class Stage:
             reads, writes = effects[j][0], effects[j][2]
             if kept in reads or (accum in reads and not self.per_lane_read(j, accum)):
                 return False
+            if accum in reads and not self.accum_scc_dead(j, effects, live_in, succ):
+                return False
             if accum in writes:
                 continue
             work.extend(succ[j])
         return kept, accum
+
+    def accum_scc_dead(self, at, effects, live_in, succ):
+        """True when SCC written at `at` is not read on any later path.
+
+        A per-lane `s_and_b32 sX, sB, exec_lo` writes the lane bit of sX and sets SCC from the whole word
+        (`sX != 0`). The wave's SCC is true when any staying lane's bit is set. A lane that left has only its
+        own clear bit, so its SCC is false. live_in drops SCC at a later write that does not read it, so SCC is
+        dead when no successor still has it live.
+        """
+        if 'scc' not in effects[at][1]:
+            return True
+        return not any('scc' in live_in[s] for s in succ[at])
 
     def execz_live_read(self, t, word, halves, effects, succ, quiet, unread):
         """None when every read of `word` from the join t of an execz block on, until a write of it ends the block's

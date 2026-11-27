@@ -16105,7 +16105,15 @@ Three controls stay `branch out of the block` and the traces disagree: a `v_mov`
 `s26` word (wave 248, singletons `[0, 0, 0, 8, 16, 32, 64, 128]`), an `s_or` of the saved entry
 mask instead of the exec-masked word (lane 0 is 1 in the wave and 9 in the model), and a
 per-lane read of `s25` (lane 0 is 9 in the wave and 1 in the model). With the accumulation
-pass removed, the accepted words are refused as `branch out of the block` again. The counted
+pass removed, the accepted words are refused as `branch out of the block` again.
+
+`s_and_b32 s27, s26, exec_lo` after the restore writes s27's lane bit and sets SCC from the
+whole word. `ACCUM_AND_*` overwrites that SCC with `s_cmp_eq_u32 s4, s4` before any read and
+then selects with `v_cndmask_b32` on s27. The traces stay `[9, 9, 9, 1, 1, 1, 1, 1]`.
+`ACCUM_SCC_*` reads the SCC with `s_cselect_b32 s28, 1, 0` and stores s28. The wave word is
+nonzero, so every lane stores 1. A leaving lane's singleton stores 0. That program stays
+`branch out of the block`. With the dead-SCC check removed it translates, so the refusal
+depends on the check. The counted
 loop keeps its backward-latch diagnostic. This fixture does not translate that loop: the latch
 and the second saved mask are still refused. Run
 `python -B tests/startup_gfx2hlsl_compute_check.py` for the host controls and add

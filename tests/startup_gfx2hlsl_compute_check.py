@@ -501,6 +501,26 @@ ACCUM_MIX = '1a151a88'
 ACCUM_WORD_READ = '1a020a7e'
 # v_cndmask_b32 v5, v5, v6, s25 reads s25, which the wave clears for a lane that left.
 ACCUM_READ_S25 = '050001d5050d6600'
+# Same program, but the post-restore consumer ANDs s26 with exec_lo into s27. s_cmp_eq_u32 s4, s4 overwrites
+# that AND's SCC before any read, and v_cndmask uses s27 per lane. The lane bit of s27 matches s26. s4 is a
+# root constant, so the compare does not read the mask.
+_ACCUM_CND = 'v_cndmask_b32 v5, v5, v6, s26\n'
+ACCUM_AND_SOURCE = ACCUM_SOURCE.replace(
+    _ACCUM_CND,
+    's_and_b32 s27, s26, exec_lo\n'
+    's_cmp_eq_u32 s4, s4\n'
+    'v_cndmask_b32 v5, v5, v6, s27\n')
+ACCUM_AND_WORDS = ACCUM_WORDS.replace(
+    bytes.fromhex('050001d5050d6a00'), bytes.fromhex('1a7e1b87040406bf050001d5050d6e00'))
+# The same AND, then s_cselect_b32 s28, 1, 0 and v_mov_b32 v5, s28. SCC is the whole word, so the wave stores 1
+# on every lane and a leaving lane's singleton stores 0.
+ACCUM_SCC_SOURCE = ACCUM_SOURCE.replace(
+    _ACCUM_CND,
+    's_and_b32 s27, s26, exec_lo\n'
+    's_cselect_b32 s28, 1, 0\n'
+    'v_mov_b32 v5, s28\n')
+ACCUM_SCC_WORDS = ACCUM_WORDS.replace(
+    bytes.fromhex('050001d5050d6a00'), bytes.fromhex('1a7e1b8781801c851c020a7e'))
 
 
 def saveexec_fixture():
@@ -1458,6 +1478,9 @@ def check_execz_accumulated_mask():
                 out.append(sum(1 << bit for bit in accum))
             elif observe == 'masked':
                 out.append(1 if lane in masked else values[lane])
+            elif observe == 'scc':
+                # s_cselect of the AND's SCC stores 1 for every lane in this call when any bit of s26 is set.
+                out.append(1 if accum else 0)
             else:
                 out.append(1 if lane in accum else values[lane])
         return out
@@ -1486,6 +1509,30 @@ def check_execz_accumulated_mask():
     assert trace(lanes, observe='masked')[0] == 9 and singletons(lanes, observe='masked')[0] == 1
     read_masked = ACCUM_WORDS.replace(bytes.fromhex('050001d5050d6a00'), bytes.fromhex(ACCUM_READ_S25))
     refused(reason, lambda: translate('O', code=read_masked).hlsl_cs())
+    # AND of s26 with exec, then a compare that kills SCC, then a per-lane read of the AND result.
+    assert trace(lanes) == singletons(lanes)
+    and_text = translate('O', code=ACCUM_AND_WORDS).hlsl_cs()
+    translate('O', code=ACCUM_AND_WORDS, group=(3, 1, 1)).hlsl_cs()
+    # s4 is the root constant, so the compare is emitted on ud0 and overwrites the AND's SCC.
+    assert 's27 = (s26 & exec) & 1;' in and_text and 'scc = ud0 == ud0;' in and_text, and_text
+    # The same AND whose SCC is read by s_cselect. The wave's word is nonzero, so every lane stores 1.
+    # A leaving lane's singleton has a clear bit, so SCC is false and it stores 0.
+    assert trace(lanes, observe='scc') == [1] * 8
+    assert singletons(lanes, observe='scc') == [0, 0, 0, 1, 1, 1, 1, 1]
+    refused(reason, lambda: translate('O', code=ACCUM_SCC_WORDS).hlsl_cs())
+    # Without the dead-SCC check the same words translate, so the refusal above depends on that check.
+    original_scc = G.Stage.accum_scc_dead
+    G.Stage.accum_scc_dead = lambda self, *args, **kwargs: True
+    try:
+        try:
+            refused(reason, lambda: translate('O', code=ACCUM_SCC_WORDS).hlsl_cs())
+        except AssertionError as err:
+            assert 'accepted, expected a refusal' in str(err), err
+        else:
+            raise AssertionError('dropping the SCC check still refused the SCC-live AND')
+    finally:
+        G.Stage.accum_scc_dead = original_scc
+    refused(reason, lambda: translate('O', code=ACCUM_SCC_WORDS).hlsl_cs())
     # The same words are refused when the accumulation is not recognised, which is the translator without this pass.
     original = G.Stage.execz_accumulated_mask
 
@@ -2660,6 +2707,8 @@ def check_binary(llvm_mc):
     assert assemble(llvm_mc, LOOP_BREAK_SOURCE) == LOOP_BREAK_WORDS
     assert assemble(llvm_mc, EXIT_RUN_SOURCE) == EXIT_RUN_WORDS
     assert assemble(llvm_mc, ACCUM_SOURCE) == ACCUM_WORDS
+    assert assemble(llvm_mc, ACCUM_AND_SOURCE) == ACCUM_AND_WORDS
+    assert assemble(llvm_mc, ACCUM_SCC_SOURCE) == ACCUM_SCC_WORDS
     for name, (source, words, *_rest) in CASES.items():
         built = assemble(llvm_mc, source)
         assert built == words, '%s: assembled %s, recorded %s' % (name, built.hex(), words.hex())
