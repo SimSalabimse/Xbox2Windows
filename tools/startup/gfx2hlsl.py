@@ -3209,7 +3209,9 @@ class Stage:
         the join is accepted when every read of it after the join is proven (execz_live_read), or when it has the
         shape below. Any other live definition, an unproven exec write, a refused effect, a branch leaving the block
         or a backward s_cbranch_execz is refused. A proven straight lane-exhaustion exit can leave the block for a
-        scalar run ending in an EXEC restore (execz_scalar_exit, #2645 T3).
+        scalar run ending in an EXEC restore (execz_scalar_exit, #2645 T3). Between the staying remask and that
+        exit, `s_and_b32 sA, sA, exec_lo` then `s_or_b32 sB, sB, sA` keeps a leaving lane's own bit of sB; sA must
+        be dead at the exit and every later read of sB must be per lane (#2645 T4).
 
         The other accepted live definition is the i1-phi lane mask of the compiler's if-conversion, a 32-bit M (vcc_lo
         or one sN) zeroed before the branch (`s_mov_b32 M, 0`) and set in the block from exec only (`s_mov_b32 M,
@@ -3328,7 +3330,7 @@ class Stage:
                             and target in index and index[target] <= b for latch, target in jumps):
                         reason = 'loop exit crosses a backward s_cbranch_scc0'
                     elif not (inner == 's_cbranch_scc0' and exit_index > t and
-                              self.execz_scalar_exit(b, i, t, exit_index, effects, live_in, into)):
+                              self.execz_scalar_exit(b, i, t, exit_index, effects, live_in, into, succ)):
                         reason = 'branch out of the block'
                 elif may & EXEC_KEYS and (entered or i in before and
                                           not EXEC_SUBSET <= clear_after(inner, inner_asm, may, before[i])):
@@ -3342,7 +3344,7 @@ class Stage:
                     refused.setdefault(at, '%s inside a block s_cbranch_execz skips per lane: %s' % (inner, reason))
         return refused
 
-    def execz_scalar_exit(self, guard, branch, join, target, effects, live_in, into):
+    def execz_scalar_exit(self, guard, branch, join, target, effects, live_in, into, succ):
         """Prove the straight b32 lane-exhaustion exit and its shared scalar run before restoring EXEC (#2645 T3).
 
         ANDN2 clears the breaking lanes from a saved mask, SCC tests whether that mask is empty, and the staying
@@ -3350,6 +3352,9 @@ class Stage:
         `mask` or `scc` is live at `target`. The wave can do extra vector work only with the exiting lane disabled.
         A lane that skipped the guard keeps its original mask bit through ANDN2 because EXEC was clear for that lane.
         The shared run can read neither incoming EXEC nor scalar values that differ between the wave and model.
+        One staying-span pair, `s_and_b32 sA, sA, exec_lo` then `s_or_b32 sB, sB, sA`, is lane-kept for sB
+        (execz_accumulated_mask, #2645 T4): the exit branch jumps over it, so a leaving lane skips it while the
+        wave runs it with that lane's exec bit clear.
         """
         x, y, z = self.pipe.group
         if (x * y * z > 32 or into.get(join) != [guard]
@@ -3385,12 +3390,8 @@ class Stage:
                 return False
         if parse(self.ins[branch + 1][3]) != ('s_mov_b32', ['exec_lo', mask], []):
             return False
-        for k in range(branch + 2, target):
-            name, asm = self.ins[k][2:]
-            if name not in EXECZ_EXIT_WAITS and (
-                    not self.vector_only_instruction(name, asm) or name.endswith('_dpp') or
-                    name.startswith(('v_permlane', 'v_movrel')) or effects[k][0] & (EXEC_KEYS | {mask, 'scc'})):
-                return False
+        if self.execz_accumulated_mask(branch, target, effects, mask, live_in, succ) is False:
+            return False
 
         for k in range(target, len(self.ins)):
             if k != target and k in into:
@@ -3412,6 +3413,65 @@ class Stage:
                              or op in FLOATS) for op in ops)):
                 return False
         return False
+
+    def execz_accumulated_mask(self, branch, target, effects, mask, live_in, succ):
+        """(sA, sB) for one lane-kept accumulation in the staying span, None when that span has none, else False.
+
+        The pair is `s_and_b32 sA, sA, exec_lo` then `s_or_b32 sB, sB, sA` (#2645 T4). The exit branch jumps over
+        it. A lane that leaves does not execute it; the wave runs it only when some lane stays, with the leaving
+        lane's exec bit clear, so `s_and` clears that bit of sA and `s_or` leaves that bit of sB unchanged. The
+        rest of sB still holds other lanes' bits. sA is not lane-kept for the lane that left: the wave clears a
+        bit the model keeps, so sA must be dead at the exit. sB must be live there, and every later read of sB,
+        until a write of sB ends the definition, must be per lane (per_lane_read), the same reads as the
+        if-conversion mask. Any other scalar op in the span stays refused.
+        """
+        def vector_span(i):
+            name, asm = self.ins[i][2:]
+            return name in EXECZ_EXIT_WAITS or (
+                self.vector_only_instruction(name, asm) and not name.endswith('_dpp')
+                and not name.startswith(('v_permlane', 'v_movrel'))
+                and not effects[i][0] & (EXEC_KEYS | {mask, 'scc'}))
+
+        def scalar_word(ops, mods, sources):
+            return (not mods and len(ops) == 3 and re.fullmatch(r's\d+', ops[0])
+                    and set(ops[1:]) == sources)
+
+        pair = None
+        i = branch + 2
+        while i < target:
+            name, ops, mods = parse(self.ins[i][3])
+            base = re.sub(r'_e(32|64)$', '', name)
+            if (pair is None and base == 's_and_b32' and i + 1 < target and ops
+                    and scalar_word(ops, mods, {ops[0], 'exec_lo'})):
+                name2, ops2, mods2 = parse(self.ins[i + 1][3])
+                if (ops2 and re.sub(r'_e(32|64)$', '', name2) == 's_or_b32'
+                        and scalar_word(ops2, mods2, {ops2[0], ops[0]}) and ops2[0] != ops[0]
+                        and ops[0] != mask and ops2[0] != mask):
+                    pair = (ops[0], ops2[0], i + 1)
+                    i += 2
+                    continue
+            if not vector_span(i):
+                return False
+            i += 1
+        if pair is None:
+            return None
+        kept, accum, or_at = pair
+        # sA dies at the exit; sB is the value the two paths must agree on per lane.
+        if kept in live_in[target] or accum not in live_in[target]:
+            return False
+        seen, work = {or_at}, list(succ[or_at])
+        while work:
+            j = work.pop()
+            if j in seen or not 0 <= j < len(self.ins):
+                continue
+            seen.add(j)
+            reads, writes = effects[j][0], effects[j][2]
+            if kept in reads or (accum in reads and not self.per_lane_read(j, accum)):
+                return False
+            if accum in writes:
+                continue
+            work.extend(succ[j])
+        return kept, accum
 
     def execz_live_read(self, t, word, halves, effects, succ, quiet, unread):
         """None when every read of `word` from the join t of an execz block on, until a write of it ends the block's

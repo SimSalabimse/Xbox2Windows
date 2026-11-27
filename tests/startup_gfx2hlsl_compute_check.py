@@ -455,6 +455,53 @@ EXIT_RUN_WORDS = bytes.fromhex(
     '6a3c80be' '040088bf' '8300887d' '7e6a7e87' '007e008a' '020084bf' '0003febe' '04000a3a'
     '06038abe' '80038bbe' '05030cf4000000fa' '7fc08cbf' '1503febe' '001070e004050480' '000081bf')
 
+# #2645 T4: the straight exit with s_and_b32 s25, s25, exec_lo; s_or_b32 s26, s26, s25 between the staying
+# remask and the exit. s25 starts as the entry EXEC and s26 as 0, so the pair sets s26's bit for each lane that
+# stays. The exit branch jumps over the pair. After the EXEC restore, v_cndmask reads s26 per lane into v5.
+# Displacements name the join and the exit run. s_cbranch_scc0 is 4 dwords because the pair sits in front of the run.
+ACCUM_SOURCE = """\
+s_mov_b32 s10, s6
+s_mov_b32 s11, 0
+s_load_dwordx8 s[12:19], s[10:11], 0x0
+s_waitcnt lgkmcnt(0)
+v_lshlrev_b32 v4, 2, v0
+v_mov_b32 v5, 9
+s_mov_b32 s21, exec_lo
+s_mov_b32 s25, exec_lo
+s_mov_b32 s26, 0
+v_cmp_gt_u32 vcc_lo, 6, v0
+s_and_saveexec_b32 s0, vcc_lo
+s_cbranch_execz 4
+v_cmp_gt_u32 vcc_lo, 3, v0
+s_and_b32 exec_lo, exec_lo, vcc_lo
+s_andn2_b32 s0, s0, exec_lo
+s_cbranch_scc0 4
+s_mov_b32 exec_lo, s0
+v_xor_b32 v5, s4, v0
+s_and_b32 s25, s25, exec_lo
+s_or_b32 s26, s26, s25
+s_mov_b32 s10, s6
+s_mov_b32 s11, 0
+s_load_dwordx8 s[12:19], s[10:11], 0x0
+s_waitcnt lgkmcnt(0)
+s_mov_b32 exec_lo, s21
+v_mov_b32 v6, 1
+v_cndmask_b32 v5, v5, v6, s26
+buffer_store_dword v5, v4, s[16:19], 0 offen
+s_endpgm
+"""
+ACCUM_WORDS = bytes.fromhex(
+    '06038abe' '80038bbe' '05030cf4000000fa' '7fc08cbf' '82000834' '89020a7e' '7e0395be' '7e0399be'
+    '80039abe' '8600887d' '6a3c80be' '040088bf' '8300887d' '7e6a7e87' '007e008a' '040084bf'
+    '0003febe' '04000a3a' '197e1987' '1a191a88' '06038abe' '80038bbe' '05030cf4000000fa' '7fc08cbf'
+    '1503febe' '81020c7e' '050001d5050d6a00' '001070e004050480' '000081bf')
+# s_or_b32 s26, s26, s21 mixes the saved entry mask instead of the exec-masked s25.
+ACCUM_MIX = '1a151a88'
+# v_mov_b32 v5, s26 copies the whole accumulated word.
+ACCUM_WORD_READ = '1a020a7e'
+# v_cndmask_b32 v5, v5, v6, s25 reads s25, which the wave clears for a lane that left.
+ACCUM_READ_S25 = '050001d5050d6600'
+
 
 def saveexec_fixture():
     # RDNA 2 ISA, SOP1: D takes old EXEC, then EXEC takes the bitwise result and SCC reports nonzero.
@@ -1377,6 +1424,82 @@ def check_execz_mask_subset():
                           {'s21', 'exec', 'exec_hi', 'scc'}, {('exec', 0), ('exec_hi', 1), ('s22', 0)}) == (
         {('exec', 0), ('exec_hi', 1), ('s21', 0), ('s22', 0)})
 
+def check_execz_accumulated_mask():
+    # s25 is the entry EXEC copy and s26 starts at 0. The execz target is the staying remask, so a lane that
+    # misses the guard still runs the pair; a lane that takes the scc0 exit does not. In an 8-lane group the
+    # remask is bits 3-7. v_cndmask then writes 1 where that lane's bit of s26 is set and keeps 9 where it is clear.
+    def trace(lanes, mix=False, observe='bit'):
+        values = dict.fromkeys(lanes, 9)
+        saved = set(lanes)
+        masked, accum = set(saved), set()
+        active = set(lanes) & {lane for lane in lanes if lane < 6}  # s_and_saveexec
+        if active:
+            active &= {lane for lane in lanes if lane < 3}
+            stayed = saved - active                                 # s_andn2, then s_mov exec, s0
+            if stayed:
+                for lane in stayed:
+                    values[lane] = KEY ^ lane
+                if mix:
+                    accum |= saved
+                else:
+                    masked &= stayed
+                    accum |= masked
+        else:                                                       # execz lands on the staying remask
+            for lane in saved:
+                values[lane] = KEY ^ lane
+            if mix:
+                accum |= saved
+            else:
+                masked &= saved
+                accum |= masked
+        out = []
+        for lane in sorted(lanes):
+            if observe == 'word':
+                out.append(sum(1 << bit for bit in accum))
+            elif observe == 'masked':
+                out.append(1 if lane in masked else values[lane])
+            else:
+                out.append(1 if lane in accum else values[lane])
+        return out
+
+    lanes = range(8)
+    def singletons(lanes, **kwargs):
+        return [trace([lane], **kwargs)[0] for lane in lanes]
+
+    assert trace(lanes) == singletons(lanes) == [9, 9, 9, 1, 1, 1, 1, 1]
+    assert trace(range(3)) == singletons(range(3)) == [9, 9, 9]
+    text = translate('O', code=ACCUM_WORDS).hlsl_cs()
+    translate('O', code=ACCUM_WORDS, group=(3, 1, 1)).hlsl_cs()
+    assert '(!scc) ?' in text and 'exec = (s21) & 1;' in text and 's26' in text, text
+    reason = 's_cbranch_scc0 inside a block s_cbranch_execz skips per lane: branch out of the block'
+    # A whole-word read of s26: the wave holds bits 3-7 (248) in every lane, each singleton only its own bit.
+    assert trace(lanes, observe='word') == [248] * 8
+    assert singletons(lanes, observe='word') == [0, 0, 0, 8, 16, 32, 64, 128]
+    word_read = ACCUM_WORDS.replace(bytes.fromhex('050001d5050d6a00'), bytes.fromhex(ACCUM_WORD_READ))
+    refused(reason, lambda: translate('O', code=word_read).hlsl_cs())
+    # s_or of the saved entry mask sets bits of lanes that already left. Lane 0 stays 9 in the model and becomes 1
+    # in the wave.
+    assert trace(lanes, mix=True)[0] == 1 and singletons(lanes, mix=True)[0] == 9
+    mixed = ACCUM_WORDS.replace(bytes.fromhex('1a191a88'), bytes.fromhex(ACCUM_MIX))
+    refused(reason, lambda: translate('O', code=mixed).hlsl_cs())
+    # A per-lane read of s25: the wave cleared lane 0's bit, and the model kept the entry 1.
+    assert trace(lanes, observe='masked')[0] == 9 and singletons(lanes, observe='masked')[0] == 1
+    read_masked = ACCUM_WORDS.replace(bytes.fromhex('050001d5050d6a00'), bytes.fromhex(ACCUM_READ_S25))
+    refused(reason, lambda: translate('O', code=read_masked).hlsl_cs())
+    # The same words are refused when the accumulation is not recognised, which is the translator without this pass.
+    original = G.Stage.execz_accumulated_mask
+
+    def reverted(self, *args, **kwargs):
+        found = original(self, *args, **kwargs)
+        return False if found else found
+
+    G.Stage.execz_accumulated_mask = reverted
+    try:
+        refused(reason, lambda: translate('O', code=ACCUM_WORDS).hlsl_cs())
+    finally:
+        G.Stage.execz_accumulated_mask = original
+    translate('O', code=ACCUM_WORDS).hlsl_cs()
+
 
 def check_mbcnt():
     for _, words, reason in MBCNT_REFUSALS:
@@ -1930,6 +2053,7 @@ def check_controls():
     check_scc_modelled()
     check_mbcnt()
     check_execz_exit_run()
+    check_execz_accumulated_mask()
     check_execz_loop_break()
     check_execz_mask_subset()
     check_lane_mask_data()
@@ -2535,6 +2659,7 @@ def assemble(llvm_mc, source):
 def check_binary(llvm_mc):
     assert assemble(llvm_mc, LOOP_BREAK_SOURCE) == LOOP_BREAK_WORDS
     assert assemble(llvm_mc, EXIT_RUN_SOURCE) == EXIT_RUN_WORDS
+    assert assemble(llvm_mc, ACCUM_SOURCE) == ACCUM_WORDS
     for name, (source, words, *_rest) in CASES.items():
         built = assemble(llvm_mc, source)
         assert built == words, '%s: assembled %s, recorded %s' % (name, built.hex(), words.hex())
