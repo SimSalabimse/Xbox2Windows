@@ -15,8 +15,8 @@ tests/startup_compute_dispatch_input_check.py still expects that sentence for a 
 warp and hardware dispatch case A. A typed R32_UINT view and a raw R32_TYPELESS view of the placed
 input buffer, which aliases title memory, match all 320 words. A texture token, an unknown token,
 an unordered-access token, a sampler token, a typed view of a buffer the desktop cannot alias, and
-a typed view that runs past the buffer are refused. The output stays at the sentinel. Exit 77 when
-the adapter is not available.
+a typed view that runs past a custom-heap buffer are refused. That past view is recorded and not
+created on the desktop. The output stays at the sentinel. Exit 77 when the adapter is not available.
 """
 
 from pathlib import Path
@@ -26,6 +26,8 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 HEADER = ROOT / "src" / "startup_stubs" / "input_view_token.h"
 DRAW = ROOT / "src" / "startup_stubs" / "d3d12_draw.inl"
+DEVICE = ROOT / "src" / "startup_stubs" / "d3d12_xs_device.cpp"
+CONSUMER = ROOT / "tests" / "startup_stream_consumer.cpp"
 EXISTING = ROOT / "tests" / "startup_compute_dispatch_input_check.py"
 
 HISTORICAL = "an input view token is not a buffer view of a desktop resource"
@@ -134,6 +136,11 @@ def controls():
     assert HISTORICAL not in draw, "the historical sentence now lives only in input_view_token.h"
     assert "an input is in a placed buffer that does not alias title memory" in draw
     assert "an input range is outside its desktop buffer" in draw
+    device = DEVICE.read_text(encoding="utf-8")
+    assert 'skip = "a buffer shader resource view extends past the resource"' in device
+    consumer = CONSUMER.read_text(encoding="utf-8")
+    assert 'mode == "dispatch-input-token-past"' in consumer
+    assert "D3D12_HEAP_TYPE_CUSTOM" in consumer
     existing = EXISTING.read_text(encoding="utf-8")
     assert "('dispatch-input-token', 'an input view token is not a buffer view of a desktop resource')" in existing
     print("startup_compute_input_view_token controls: runtime uses the table; the texture token sentence is unchanged")

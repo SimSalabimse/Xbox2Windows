@@ -5313,6 +5313,19 @@ __declspec(noinline) u64 view_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d)
                 if (first_calls(mismatched, 6))
                     log("x2w-d3d12 Device::slot%d view dimension %u needs resource dimension %u, resource has %u", N, view_dimension,
                         x2w_view_dimension::needed(N, view_dimension), dimension);
+            } else if (N == 18 && view_dimension == D3D12_SRV_DIMENSION_BUFFER &&
+                       x2w_local::readable(reinterpret_cast<const void*>(described), sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC))) {
+                // Desktop CreateShaderResourceView removes the device when a buffer view runs past the resource.
+                // Record the guest description and leave a null descriptor, the same as the other refused views.
+                D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+                std::memcpy(&view, reinterpret_cast<const void*>(described), sizeof(view));
+                const UINT element = x2w_startup::buffer_srv_element_bytes(view);
+                const UINT64 width = resource_desc.Width;
+                const UINT64 first = view.Buffer.FirstElement;
+                const UINT64 count = view.Buffer.NumElements;
+                if (element && (first > UINT64_MAX / element || count > UINT64_MAX / element ||
+                                first * element > width || count * element > width - first * element))
+                    skip = "a buffer shader resource view extends past the resource";
             } else if constexpr (N == 19) {
                 if (view_dimension == D3D12_UAV_DIMENSION_TEXTURE3D &&
                     x2w_local::readable(reinterpret_cast<const void*>(described), sizeof(D3D12_UNORDERED_ACCESS_VIEW_DESC))) {

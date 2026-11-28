@@ -29,7 +29,10 @@ alias is still refused with `an input is in a placed buffer that does not alias 
 placed or copied resource with no desktop object stays refused; the fixture does not construct one,
 and the Linux reference is what checks that sentence. The sampler refusal copies a token out of a
 one-entry sampler heap. The compute table is a CBV/SRV/UAV heap, and a sampler descriptor written
-there faults in the desktop runtime before the dispatch is recorded.
+there faults in the desktop runtime before the dispatch is recorded. A buffer view that extends
+past its resource is recorded and not created: the desktop call removes the device. The fixture's
+past-the-end token is that view of a custom-heap buffer, so the range is refused against the
+desktop width rather than as a placed allocation.
 
 `tests/startup_compute_dispatch_input_check.py` still expects the historical sentence for
 `dispatch-input-token`. This note does not change that test.

@@ -223,7 +223,8 @@ static void* make_committed(void* device, D3D12_HEAP_TYPE type, const D3D12_RESO
 // dispatch-input-null (all four words zero, an unbound buffer) is not refused and reads zeros;
 // dispatch-input-token writes the token of a texture view where the input descriptor was.
 // dispatch-input-token-typed and -raw replace it with a buffer view of the aliased input buffer (R32_UINT, or a raw
-// R32_TYPELESS view). dispatch-input-token-past is that typed view four elements past the buffer.
+// R32_TYPELESS view). dispatch-input-token-past is that typed view four elements past a custom-heap buffer: the
+// desktop call is not made, and the range is checked against the buffer's width.
 // dispatch-input-token-copied is a typed view of the buffer placed where the desktop cannot alias it.
 // dispatch-input-token-unknown writes a token id no view record has. dispatch-input-token-uav writes an
 // unordered-access token in the input slot. dispatch-input-token-sampler records a sampler in its own sampler
@@ -612,13 +613,40 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     const auto restore_output_descriptor = [&] {
         std::memcpy(reinterpret_cast<void*>(cpu + sizeof(descriptors[0])), descriptors[1], sizeof(descriptors[1]));
     };
-    if (mode == "dispatch-input-token-typed" || mode == "dispatch-input-token-raw" || mode == "dispatch-input-token-past" ||
+    if (mode == "dispatch-input-token-past") {
+        // A placed buffer refuses a range past its allocation before the desktop width is checked. This buffer is
+        // committed on a custom heap, so it has no placed address and the view's byte range is compared with the
+        // desktop width. The view runs past that width; the device records the description and does not create it.
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_CUSTOM;
+        heap.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+        heap.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+        heap.CreationNodeMask = 1;
+        heap.VisibleNodeMask = 1;
+        const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, words * sizeof(UINT), 1, 1, 1, DXGI_FORMAT_UNKNOWN,
+            {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
+        using Create = HRESULT(WINAPI*)(void*, const D3D12_HEAP_PROPERTIES*, UINT, const D3D12_RESOURCE_DESC*, UINT,
+                                        const void*, void*, UINT, const void*, const GUID*, void**);
+        void* resource = nullptr;
+        if (FAILED(reinterpret_cast<Create>((*static_cast<void***>(device))[127])(
+                device, &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, nullptr, 0, nullptr,
+                &__uuidof(ID3D12Resource), &resource)) || !resource)
+            return 71;
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+        view.Format = DXGI_FORMAT_R32_UINT;
+        view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.Buffer.NumElements = words + 4;
+        invoke(device, 18, word(resource), word(&view), cpu);
+        restore_output_descriptor();
+    }
+    if (mode == "dispatch-input-token-typed" || mode == "dispatch-input-token-raw" ||
         mode == "dispatch-input-token-copied") {
         D3D12_SHADER_RESOURCE_VIEW_DESC view{};
         view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
         view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         view.Buffer.FirstElement = 0;
-        view.Buffer.NumElements = mode == "dispatch-input-token-past" ? words + 4 : words;
+        view.Buffer.NumElements = words;
         if (mode == "dispatch-input-token-raw") {
             view.Format = DXGI_FORMAT_R32_TYPELESS;
             view.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
