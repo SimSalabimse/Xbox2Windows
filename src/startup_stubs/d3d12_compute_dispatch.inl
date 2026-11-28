@@ -2,7 +2,8 @@
 // the key of its published request; gfx2hlsl.py --pending answers the request with <key>.txt (`stage cs`) and
 // <key>.cs.cso. Bound from the compute tables recorded by slot 35 and compute root SRVs recorded by slot 43: raw
 // buffers (`srv <i> buf table <param> <byte>` and `srv <i> buf root <param>` inputs, `uav <i> table <param> <byte>`
-// outputs, or `uav <i> bufhalf table <param> <byte> bytes <stride>` for typed half stores)
+// outputs, `uav <i> bufhalf table <param> <byte> bytes <stride>` for typed half stores, or
+// `uav <i> bufd16x table <param> <byte> bytes 2` for a one-component packed D16 store)
 // named by hardware buffer descriptors or 64-bit root SRV addresses, and textures
 // (`srv <i> tex1d|tex2d|tex2da|tex3d table <param> <byte>` inputs, `uav <i> tex1d/tex2d/tex2da/tex3d float table <param> <byte> channels <n>` outputs) named
 // by the token of a view the title created (device slots 18 and 19). `smp`, `smpl` and `smpc` lines become static samplers. Entry
@@ -90,6 +91,50 @@ unsigned float_output_channels(DXGI_FORMAT format)
     default:
         return 0;
     }
+}
+
+// Published `bufd16x` stores one halfword. native_buffer_store_view accepts an R32_UINT element
+// (two halfwords, stride widened to 4) and rewrites R16_FLOAT / R16_UINT to R16_UINT. This path
+// keeps that check, then refuses anything that is not the rewritten one-halfword view: a 32-bit
+// element would store a zero-extended payload over both halfwords.
+const char* packed_d16_x_view_refusal(const std::uint32_t* words, UINT64 offset, UINT64 resource_bytes,
+                                      D3D12_UNORDERED_ACCESS_VIEW_DESC& out)
+{
+    D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+    view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    const unsigned stride_field = words[1] >> 16;
+    const unsigned stride = stride_field & 0x3fffu;
+    const unsigned word3 = words[3];
+    const unsigned format = (word3 >> 12) & 127u;
+    const bool unified = (word3 & 0x01000000u) != 0;
+    unsigned element = 0;
+    if (unified && format == 13) {
+        view.Format = DXGI_FORMAT_R16_FLOAT;
+        element = 2;
+    } else if (unified && format == 11) {
+        view.Format = DXGI_FORMAT_R16_UINT;
+        element = 2;
+    } else if (unified && format == 20) {
+        view.Format = DXGI_FORMAT_R32_UINT;
+        element = 4;
+    }
+    // TYPE, reserved, ADD_TID_ENABLE and INDEX_STRIDE, plus SWIZZLE_ENABLE / CACHE_SWIZZLE and OOB_SELECT.
+    constexpr unsigned word3_flags = 0xcef80000u;
+    const bool flags = (stride_field & 0xc000u) != 0 || (word3 & word3_flags) != 0 || ((word3 >> 28) & 3u) != 0;
+    if (flags)
+        view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+    if (!element || (word3 & 7u) != 4u || stride != element)
+        view.Format = DXGI_FORMAT_UNKNOWN;
+    const unsigned step = element ? element : 1u;
+    if (offset % step)
+        return "an output packed D16 buffer is not element-aligned in its resource";
+    view.Buffer.FirstElement = static_cast<UINT>(offset / step);
+    view.Buffer.NumElements = words[2] ? words[2] : 1u;
+    const x2w::ComputeViewBinding binding{x2w::ComputeViewKind::packed_d16_x_uav, 0, 0, 0, 2};
+    if (!x2w::native_buffer_store_view(binding, view, resource_bytes) || view.Format != DXGI_FORMAT_R16_UINT)
+        return "formatted D16 write has an incompatible typed buffer UAV";
+    out = view;
+    return nullptr;
 }
 
 bool half_buffer_descriptor_matches(const std::uint32_t* words, unsigned bytes)
@@ -222,6 +267,11 @@ const char* load_compute_translation(ComputeTranslation& tr)
                  whole() && i == tr.uavs.size() && x2w::native_half_buffer_format(x) != DXGI_FORMAT_UNKNOWN) {
             tr.uavs.push_back({a, b});
             tr.uavs.back().half_buffer_bytes = x;
+        }
+        else if (std::sscanf(line.c_str(), "uav %u bufd16x table %d %d bytes %u%n", &i, &a, &b, &x, &used) == 4 &&
+                 whole() && i == tr.uavs.size() && x == 2) {
+            tr.uavs.push_back({a, b});
+            tr.uavs.back().packed_d16_x = true;
         }
         else if (std::sscanf(line.c_str(), "uav %u tex2d uint table %d %d channels 1%n", &i, &a, &b, &used) == 3 &&
                  whole() && i == tr.uavs.size()) {
@@ -820,6 +870,13 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                     reason = "formatted D16 write has an incompatible typed buffer UAV";
             }
 #endif
+            if (!reason && slot.packed_d16_x && !slot.half_typed_bytes) {
+                token.view.Format = desktop_format(token.view.Format);
+                const x2w::ComputeViewBinding binding{x2w::ComputeViewKind::packed_d16_x_uav, 0, 0, 0, 2};
+                if (!x2w::native_buffer_store_view(binding, token.view, token.backing.Width) ||
+                    token.view.Format != DXGI_FORMAT_R16_UINT)
+                    reason = "formatted D16 write has an incompatible typed buffer UAV";
+            }
             if (reason && token.placement == Placement::copied_buffer &&
                 trace_copied_compute_output(key, token.guest_resource, token.guest_base, token.offset, token.bytes)) {
                 log("x2w-compute-output-watch key=%016llx groups=%u,%u,%u indirect=%u owner=0x%llx gpuva=0x%llx",
@@ -849,7 +906,7 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                     token.description_bytes, token.offset, token.bytes, reason ? reason : "bound");
             }
             views[i] = {token.resource, token.offset, token.bytes, true};
-            if (!reason && slot.half_typed_bytes) {
+            if (!reason && (slot.half_typed_bytes || slot.packed_d16_x)) {
                 views[i].described = true;
                 views[i].desc.uav = token.view;
             }
@@ -863,9 +920,10 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
         const u64 address = words[0] | (u64{words[1] & 0xffff} << 32);
         const UINT stride = (words[1] >> 16) & 0x3fff;
         const unsigned half_bytes = slot.half_buffer_bytes;
-        const unsigned alignment = half_bytes ? half_bytes : D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT;
+        const bool packed = slot.packed_d16_x && !slot.half_typed_bytes;
+        const unsigned alignment = half_bytes ? half_bytes : (packed ? 2u : D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT);
         const u64 bytes = u64{stride ? stride : 1} * words[2];
-        const bool sized = words[0] != view_token_magic && bytes && (half_bytes || bytes % 4 == 0) && bytes <= (16u << 20);
+        const bool sized = words[0] != view_token_magic && bytes && (half_bytes || packed || bytes % 4 == 0) && bytes <= (16u << 20);
         const auto placed = sized ? placed_buffer_range(self->own().list_device, address, bytes) : PlacedVertexView{};
         const ResourceInfo* info = placed.alias ? resource_info(placed.owner) : nullptr;
         const u64 offset = placed.alias ? address - reinterpret_cast<u64>(placed.owner->own().title_memory) : 0;
@@ -874,18 +932,23 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
             reason = "a half buffer store requires matching format, stride and structured bounds";
         else if (!bytes) reason = "an output buffer descriptor has zero records";
         else if (!sized) reason = half_bytes ? "an output half buffer range is over 16 MiB"
-                                           : "an output buffer range is over 16 MiB or not whole dwords";
+                                           : packed ? "an output packed D16 buffer range is over 16 MiB"
+                                                    : "an output buffer range is over 16 MiB or not whole dwords";
         else if (placed.reject) reason = "an output range crosses the end of a placed buffer";
         else if (!placed.owner) reason = "an output is in title memory outside any placed buffer";
         else if (!placed.alias) reason = "an output is in a placed buffer that does not alias title memory";
         else if (!info || info->initial_state != D3D12_RESOURCE_STATE_COMMON)
             reason = "an output buffer's resource was not created in the common state";
         else if (offset % alignment) reason = half_bytes ? "an output half buffer is not element-aligned in its resource"
-                                                       : "an output buffer range is not 16-byte aligned in its resource";
+                                                       : packed ? "an output packed D16 buffer is not element-aligned in its resource"
+                                                                : "an output buffer range is not 16-byte aligned in its resource";
         else if (!(placed.alias->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
             reason = "an output buffer has no unordered access";
         for (std::size_t input = 0; input < inputs && !reason; ++input)
             if (views[input].resource == placed.alias) reason = "an output buffer is also an input";
+        D3D12_UNORDERED_ACCESS_VIEW_DESC packed_desc{};
+        if (!reason && packed)
+            reason = packed_d16_x_view_refusal(words, offset, placed.alias->GetDesc().Width, packed_desc);
         if (reason && !tr->first_refusal)
             log("x2w-draw compute raw UAV %016llx table=%d+%d entry=0x%llx words=%08x/%08x/%08x/%08x "
                 "stride=%u bytes=%llu result=%s", key, slot.a, slot.b, entry, words[0], words[1], words[2], words[3],
@@ -907,6 +970,18 @@ const char* record_translated_dispatch(Wrapper* self, const TranslatedDispatch& 
                 desc.Buffer.FirstElement = offset / half_bytes;
                 desc.Buffer.NumElements = words[2];
                 views[i].desc.uav = desc;
+            }
+        }
+        if (!reason && packed) {
+            D3D12_FEATURE_DATA_FORMAT_SUPPORT support{packed_desc.Format};
+            constexpr UINT required = D3D12_FORMAT_SUPPORT1_BUFFER | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
+            if (FAILED(device_of(the_device)->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) ||
+                (support.Support1 & required) != required ||
+                !(support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE)) {
+                reason = "an output packed D16 buffer format does not support typed UAV stores";
+            } else {
+                views[i].described = true;
+                views[i].desc.uav = packed_desc;
             }
         }
         std::memcpy(views[i].words, words, sizeof(views[i].words));

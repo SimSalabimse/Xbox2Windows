@@ -893,7 +893,8 @@ static const char *view_kind_name(ComputeViewKind kind) {
         "heap_stride_srv", "raw_buffer_uav", "typed_buffer_uav", "half_buffer_uav", "root_buffer_srv",
         "comparison_texture_srv", "half2_texture_uav", "half4_texture_uav", "cube_sample_srv", "cube_comparison_srv",
         "indexed_atomic_uav", "d16_sample_srv", "byte_window_srv", "heap_buffer_srv", "heap_sampler",
-        "uint_texture_uav", "float_texture_uav", "float2_texture_uav", "float3_texture_uav"};
+        "uint_texture_uav", "float_texture_uav", "float2_texture_uav", "float3_texture_uav",
+        "packed_d16_x_uav", "indexed_raw_srv"};
     const auto index = static_cast<size_t>(kind);
     return index < std::size(names) ? names[index] : "unknown";
 }
@@ -978,6 +979,10 @@ std::optional<std::string> format_compute_runtime_manifest(const NativeComputeSh
             } else if (b.kind == ComputeViewKind::half_buffer_uav && b.array_count == 1 &&
                        (b.required_bytes == 2 || b.required_bytes == 4 || b.required_bytes == 8)) {
                 uav_lines << "uav " << b.shader_register << " bufhalf table " << b.root_parameter << ' '
+                          << b.byte_offset << " bytes " << b.required_bytes << '\n';
+            } else if (b.kind == ComputeViewKind::packed_d16_x_uav && b.array_count == 1 && b.required_bytes == 2) {
+                // One halfword. A wider element (R32_UINT holds two) is not published as this store.
+                uav_lines << "uav " << b.shader_register << " bufd16x table " << b.root_parameter << ' '
                           << b.byte_offset << " bytes " << b.required_bytes << '\n';
             } else if (b.kind == ComputeViewKind::uint_texture_uav && b.image_dimension == 1 && b.array_count == 1) {
                 uav_lines << "uav " << b.shader_register << " tex2d uint table " << b.root_parameter << ' '
