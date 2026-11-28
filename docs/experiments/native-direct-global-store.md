@@ -18,6 +18,10 @@ immediate, a data range past v255, and a scalar address that is not the matching
 The view has to cover every byte the program writes. An address outside that view does not reach the guest
 memory that would have been there.
 
+This is a direct-translation lowering. The startup runtime manifest and the native dispatch path have no
+case for `root_buffer_uav`, as they have none for `root_buffer_srv`. A program that reaches those paths is
+refused with `UAV kind root_buffer_uav` rather than dispatched.
+
 ## Fixture
 
 `tests/native_global_store_check.py`
@@ -32,5 +36,10 @@ shader model 6.6 with wave32. A missing wave32 adapter is a skip (77), not a pas
 
 The readback checks one root UAV across two groups: the four store widths, an address that aliases its data, a
 negative immediate, even lanes under a narrowed EXEC, a guarded load of vaddr 0xfffffff4 offset 16, and a
-poison store at that address which must not appear. Swapping the two dwords of the x2 reference changes the expected
-buffer. The x4 at immediate 2044 asks for a 2060-byte view and is not dispatched.
+poison store at that address which must not appear. An x4 at vaddr 0xffffffe8 offset 16 has its first DWORD
+inside the 32-bit range and its last DWORD past it; the whole store is skipped. The DXIL upper bound for that
+store is 4294967267 (`2^32 - 1 - (16 + 12)`). Dropping `(count - 1) * 4` from `last_offset` removes that
+constant, so the hardware test fails. After the stores and `s_waitcnt`, each lane loads the DWORD it wrote at
+the start of its record and writes it to a free slot. A second program binds two root SRVs and one root UAV
+and must report `t0`, `t1` and `u0`. Swapping the two dwords of the x2 reference changes the expected buffer.
+The x4 at immediate 2044 asks for a 2060-byte view and is not dispatched.

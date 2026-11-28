@@ -428,15 +428,17 @@ struct DirectCompute {
                           raw ? 0u : width, 0, count},
                          indexed && count > 1 ? read(base) : "");
     }
-    string load_buffer(const string &h, const string &addr, bool raw, unsigned count) {
+    string load_buffer(const string &h, const string &addr, bool raw, unsigned count, bool readonly = true) {
         using Arg = std::pair<string, string>;
         std::vector<Arg> args{{"%dx.types.Handle", h}, {"i32", addr}, {"i32", "undef"}};
         if (raw) {
             args.emplace_back("i8", to_string((1u << count) - 1));
             args.emplace_back("i32", "4");
         }
+        // A UAV load must not be readonly: the same module stores that resource, and a readonly
+        // declaration would not observe those stores (s_waitcnt itself lowers to nothing).
         return ir.invoke("%dx.types.ResRet.i32", raw ? "rawBufferLoad.i32" : "bufferLoad.i32", raw ? 139 : 68, args,
-                         "nounwind readonly");
+                         readonly ? "nounwind readonly" : "nounwind");
     }
     void buffer_atomic(const Inst &i, const State &s, const string &pixel_predicate = {}) {
         // The operation set and VGPR ordering follow gfx2hlsl.MUBUF_ATOMIC_OPS.
@@ -593,7 +595,8 @@ struct DirectCompute {
             refuse(i.pc, "global load destination register range");
         string handle, aligned, in_range;
         global_root(i, s, false, count, handle, aligned, in_range);
-        const auto ret = load_buffer(handle, aligned, true, count);
+        const bool uav_load = s.at((i.b >> 16) & 127).index_mask == 1;
+        const auto ret = load_buffer(handle, aligned, true, count, !uav_load);
         for (unsigned j = 0; j < count; ++j) {
             auto value = ir.value("extractvalue %dx.types.ResRet.i32 " + ret + ", " + to_string(j));
             if (!in_range.empty())
