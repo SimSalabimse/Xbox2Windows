@@ -225,8 +225,9 @@ static void* make_committed(void* device, D3D12_HEAP_TYPE type, const D3D12_RESO
 // dispatch-input-token-typed and -raw replace it with a buffer view of the aliased input buffer (R32_UINT, or a raw
 // R32_TYPELESS view). dispatch-input-token-past is that typed view four elements past the buffer.
 // dispatch-input-token-copied is a typed view of the buffer placed where the desktop cannot alias it.
-// dispatch-input-token-unknown writes a token id no view record has. dispatch-input-token-uav and -sampler write
-// those view tokens in the input slot.
+// dispatch-input-token-unknown writes a token id no view record has. dispatch-input-token-uav writes an
+// unordered-access token in the input slot. dispatch-input-token-sampler records a sampler in its own sampler
+// heap (a sampler descriptor is not valid in the compute view heap) and copies that token over the input.
 // Output descriptors the dispatch refuses, one reason each: dispatch-output-texture-token, -unplaced and -copied do
 // to the output what dispatch-input-token, -unplaced and -copied do to the input, dispatch-output-unaligned starts
 // the output 8 bytes into its buffer and dispatch-output-state places the output buffer in the unordered access state.
@@ -644,11 +645,33 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         restore_output_descriptor();
     }
     if (mode == "dispatch-input-token-sampler") {
+        // Slot 22 writes a sampler descriptor. The compute table is a CBV/SRV/UAV heap, and a sampler
+        // descriptor there faults in the desktop runtime, so the sampler is created in a one-entry sampler
+        // heap whose title memory receives the token. Those 16 bytes then replace the input descriptor.
+        constexpr UINT sampler_stride = 16;
+        auto* const backing = static_cast<unsigned char*>(VirtualAlloc(nullptr, sampler_stride, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        if (!backing) return 70;
+        const struct {
+            D3D12_DESCRIPTOR_HEAP_DESC desc;
+            UINT64 address, bytes;
+        } sampler_heap{{D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE},
+                       reinterpret_cast<UINT64>(backing), sampler_stride};
+        void* sampler_slots = nullptr;
+        if (FAILED(static_cast<HRESULT>(invoke(device, 14, word(&sampler_heap), word(&__uuidof(ID3D12DescriptorHeap)),
+                                               word(&sampler_slots)))) || !sampler_slots)
+            return 72;
+        const StreamWord sampler_cpu = invoke(sampler_slots, 9);
+        if (!sampler_cpu) return 73;
         D3D12_SAMPLER_DESC sampler{};
         sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
         sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        sampler.MaxAnisotropy = 1;
+        sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
         sampler.MaxLOD = D3D12_FLOAT32_MAX;
-        invoke(device, 22, word(&sampler), cpu);
+        invoke(device, 22, word(&sampler), sampler_cpu);
+        constexpr UINT token_magic = 0x56573258;  // "X2WV"
+        if (reinterpret_cast<const UINT*>(backing)[0] != token_magic) return 82;
+        std::memcpy(reinterpret_cast<void*>(cpu), backing, sampler_stride);
     }
     if (root_srv && mode != "dispatch-root-srv-unset") {
         UINT64 addr0 = reinterpret_cast<UINT64>(buffers[0]);

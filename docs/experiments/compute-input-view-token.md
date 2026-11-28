@@ -27,7 +27,9 @@ two of those on the placed input buffer that aliases title memory, an `R32_UINT`
 `R32_TYPELESS` view, and reads all 320 words of case A back. A placed buffer the desktop cannot
 alias is still refused with `an input is in a placed buffer that does not alias title memory`. A
 placed or copied resource with no desktop object stays refused; the fixture does not construct one,
-and the Linux reference is what checks that sentence.
+and the Linux reference is what checks that sentence. The sampler refusal copies a token out of a
+one-entry sampler heap. The compute table is a CBV/SRV/UAV heap, and a sampler descriptor written
+there faults in the desktop runtime before the dispatch is recorded.
 
 `tests/startup_compute_dispatch_input_check.py` still expects the historical sentence for
 `dispatch-input-token`. This note does not change that test.
