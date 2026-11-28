@@ -28,7 +28,7 @@ UINT constant(UINT index) {
 UINT format_width(ComputeViewKind kind, UINT bytes) {
     if (kind == ComputeViewKind::typed_buffer_srv) return 16;
     if (kind == ComputeViewKind::buffer_srv || kind == ComputeViewKind::root_buffer_srv ||
-        kind == ComputeViewKind::raw_buffer_uav) return 4;
+        kind == ComputeViewKind::root_buffer_uav || kind == ComputeViewKind::raw_buffer_uav) return 4;
     return bytes;
 }
 DXGI_FORMAT typed_format(unsigned bytes, bool half, bool reference) {
@@ -160,11 +160,12 @@ int wmain(int argc, wchar_t **argv) {
             const UINT position=reference?b.root_parameter*256+b.byte_offset/32:UINT(windows.size());
             if (position>=hd.NumDescriptors) return 2;
             auto cpu=heap->GetCPUDescriptorHandleForHeapStart();cpu.ptr+=UINT64(position)*step;
-            Window w;w.write=compute_buffer_uav(b.kind);
+            const bool root_uav = b.kind == ComputeViewKind::root_buffer_uav;
+            Window w;w.write=compute_buffer_uav(b.kind) || root_uav;
             const bool vector_bytes = b.kind == ComputeViewKind::raw_vector_srv;
             const bool root_bytes = b.kind == ComputeViewKind::root_buffer_srv;
             if (!w.write && b.kind!=ComputeViewKind::typed_buffer_srv && b.kind!=ComputeViewKind::buffer_srv && !vector_bytes && !root_bytes) return 2;
-            const bool raw=root_bytes || vector_bytes || b.kind==ComputeViewKind::buffer_srv || b.kind==ComputeViewKind::raw_buffer_uav;
+            const bool raw=root_bytes || root_uav || vector_bytes || b.kind==ComputeViewKind::buffer_srv || b.kind==ComputeViewKind::raw_buffer_uav;
             const bool indexed = b.kind == ComputeViewKind::indexed_atomic_uav;
             const UINT stride = indexed && b.byte_offset == 32 ? 16 :
                                 indexed && b.byte_offset == 64 ? 12 : format_width(b.kind,b.required_bytes);

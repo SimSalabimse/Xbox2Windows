@@ -256,14 +256,24 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
         i.name = encoded.name;
         i.dst = (i.b >> 8) & 255;
     } else if (direct && !graphics && (a & 0xfc000000u) == 0xdc000000u) {
-        // FLAT encoding, segment 2 (GLOBAL), with an SGPR-pair base:
-        // ADDR = SADDR + zext(VADDR) + sext(OFFSET).
-        // SADDR 125 is `off` on gfx10. LDS, the other segments and opcodes stay refused.
+        // FLAT encoding. Global DWORD loads and stores use an SGPR-pair base:
+        // ADDR = SADDR + zext(VADDR) + sext(OFFSET). SADDR 125 is the VGPR-pair `off` form.
         i.b = take();
         i.op = (a >> 18) & 127;
         const unsigned saddr = (i.b >> 16) & 127;
-        if (((a >> 14) & 3) != 2 || i.op < 12 || i.op > 15 || (a & 0x2000u) || saddr == 125 || saddr == 127)
-            refuse(pc, "direct global memory supports only DWORD loads with a scalar address pair");
+        const unsigned segment = (a >> 14) & 3;
+        const bool dword_load = i.op >= 12 && i.op <= 15;
+        const bool dword_store = i.op >= 0x1c && i.op <= 0x1f;
+        if (segment != 2)
+            refuse(pc, "direct flat or scratch memory is not a global root access");
+        if (a & 0x2000u)
+            refuse(pc, "direct global memory does not lower an LDS result");
+        if (saddr == 125)
+            refuse(pc, "direct global memory with a VGPR address pair is not a root buffer offset");
+        if (saddr == 127)
+            refuse(pc, "direct global memory scalar address is not an SGPR pair");
+        if (!(dword_load || dword_store))
+            refuse(pc, "direct global memory supports only DWORD loads and stores with a scalar address pair");
         i.enc = Encoding::Mubuf;
         i.name = encoded.name;
         i.dst = i.b >> 24;
@@ -575,13 +585,15 @@ static void clear_vector_spills(const Inst &i, State &s) {
 }
 // FSSM root descriptors carry a guest address in two SGPRs. Preserve the
 // identity of each half through scalar moves and CFG joins (Victory resource.rs).
-void bind_root_address(State &state, const ShaderRootInput &input, unsigned limit) {
+// resource_class 0 is a root CBV or SRV. resource_class 1 is a root UAV. Both halves carry it so a
+// copied pair still matches.
+void bind_root_address(State &state, const ShaderRootInput &input, unsigned limit, unsigned resource_class = 0) {
     const unsigned at = input.user_data;
-    if (input.sgpr_count != 2 || at >= limit || limit - at < 2 || input.root_parameter >= 16 ||
+    if (resource_class > 1 || input.sgpr_count != 2 || at >= limit || limit - at < 2 || input.root_parameter >= 16 ||
         input.offset_dwords || state[at].type != Symbol::Type::unbound || state[at+1].type != Symbol::Type::unbound)
         refuse(0, "invalid FSSM root descriptor pair");
     for (unsigned half = 0; half < 2; ++half)
-        state[at + half] = {Symbol::Type::root_address, input.root_parameter, half};
+        state[at + half] = {Symbol::Type::root_address, input.root_parameter, half, resource_class};
 }
 Symbol source(const Inst &i, unsigned code, const State &s) {
     if (code < 128)
@@ -1811,7 +1823,9 @@ static NativeComputeShader translate_program(const ComputeRequest &request, unsi
             // occupies two consecutive SGPRs, even when only later parameters are used.
             if (next > user || user - next < 2)
                 refuse(entry, "root descriptor pair exceeds user SGPRs");
-            bind_root_address(initial, {1, 0, 2, 0, static_cast<uint8_t>(next), static_cast<uint8_t>(i)}, user);
+            const unsigned root_class = param.ParameterType == D3D12_ROOT_PARAMETER_TYPE_UAV ? 1u : 0u;
+            bind_root_address(initial, {1, 0, 2, 0, static_cast<uint8_t>(next), static_cast<uint8_t>(i)}, user,
+                              root_class);
             next += 2;
         } else
             refuse(entry, "root-address parameter");
@@ -1892,13 +1906,17 @@ static NativeComputeShader translate_program(const ComputeRequest &request, unsi
                     if (param.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
                         apply_scalar_table_layout(binding, param.DescriptorTable);
                 }
-                if (binding.kind != ComputeViewKind::root_buffer_srv) continue;
+                if (binding.kind != ComputeViewKind::root_buffer_srv &&
+                    binding.kind != ComputeViewKind::root_buffer_uav)
+                    continue;
                 if (binding.root_parameter >= desc.NumParameters)
                     refuse(entry, "missing compute root descriptor");
                 const auto &param = desc.pParameters[binding.root_parameter];
-                if ((param.ParameterType != D3D12_ROOT_PARAMETER_TYPE_CBV &&
-                     param.ParameterType != D3D12_ROOT_PARAMETER_TYPE_SRV) ||
-                    param.ShaderVisibility != D3D12_SHADER_VISIBILITY_ALL)
+                const bool root_uav = binding.kind == ComputeViewKind::root_buffer_uav;
+                const bool type_ok = root_uav ? param.ParameterType == D3D12_ROOT_PARAMETER_TYPE_UAV
+                                              : (param.ParameterType == D3D12_ROOT_PARAMETER_TYPE_CBV ||
+                                                 param.ParameterType == D3D12_ROOT_PARAMETER_TYPE_SRV);
+                if (!type_ok || param.ShaderVisibility != D3D12_SHADER_VISIBILITY_ALL)
                     refuse(entry, "compute root descriptor type or visibility");
             }
         }
@@ -1994,7 +2012,8 @@ uint fpClass(uint v){
 bool x2w::apply_reflected_table_use(ComputeViewBinding &binding, const GuestShaderStage &stage,
                                     std::optional<unsigned> packed_sgpr) {
     if (binding.array_count != 1 || binding.kind == ComputeViewKind::heap_stride_srv ||
-        binding.kind == ComputeViewKind::root_buffer_srv || binding.root_parameter == compute_resource_heap)
+        binding.kind == ComputeViewKind::root_buffer_srv || binding.kind == ComputeViewKind::root_buffer_uav ||
+        binding.root_parameter == compute_resource_heap)
         return false;
     const ShaderResourceUse *match = nullptr;
     for (const auto &use : stage.resources) {

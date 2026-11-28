@@ -55,19 +55,19 @@ LOADS = {
 EPILOGUE = words('70008cbf 001070e008140a80 041070e008150a80 081070e008160a80 0c1070e008170a80 '
                  '101070e008180a80 000081bf')
 REFUSALS = [
-    ('008030dc01007d14', 'DWORD loads with a scalar address pair'),               # v[1:2], off
+    ('008030dc01007d14', 'VGPR address pair is not a root buffer offset'),        # v[1:2], off
     ('008030dc01001414', 'global load base is not a root buffer address'),        # s[20:21], a table pointer
     ('028030dc01000414', 'global load at an unaligned immediate offset'),         # offset:2
     ('008034dc010004ff', 'global load destination register range'),             # x2 beginning at v255
     ('00803cdc010004fe', 'global load destination register range'),             # x3 beginning at v254
     ('008038dc010004fd', 'global load destination register range'),             # x4 beginning at v253
-    ('008070dc01140400', 'DWORD loads with a scalar address pair'),             # global_store_dword
+    ('008070dc01140400', 'global store base is not a root buffer address'),     # global_store_dword through the table pointer
     ('800385be 008030dc01000414', 'global load base is an advanced or mismatched root address'),  # s_mov_b32 s5, 0
     ('04900480 008030dc01000414', 'unbound numeric SGPR s4'),  # s_add_u32 s4, s4, 16 on the root address
-    ('00a030dc01000414', 'DWORD loads with a scalar address pair'),               # the lds bit
-    ('000030dc01007d14', 'DWORD loads with a scalar address pair'),               # flat_load_dword (segment 0)
-    ('004030dc01007d14', 'DWORD loads with a scalar address pair'),               # scratch_load_dword (segment 1)
-    ('0080c8dc01140400', 'DWORD loads with a scalar address pair'),               # global_atomic_add
+    ('00a030dc01000414', 'does not lower an LDS result'),                         # the lds bit
+    ('000030dc01007d14', 'flat or scratch memory is not a global root access'),   # flat_load_dword (segment 0)
+    ('004030dc01007d14', 'flat or scratch memory is not a global root access'),   # scratch_load_dword (segment 1)
+    ('0080c8dc01140400', 'only DWORD loads and stores with a scalar address pair'),  # global_atomic_add
 ]
 POLICY = '009033dc01000414'  # global_load_dword v20, v1, s[4:5] glc slc dlc: accepted
 INACTIVE = 0x13579bdf
@@ -150,8 +150,9 @@ def main(compiler, replay, sdk):
             assert run.returncode and message in run.stderr, (code, message, run.stdout, run.stderr)
         _, run = compile_words(PROLOGUE + words(POLICY) + EPILOGUE)
         assert run.returncode == 0, run.stderr
-        print('refused: off, a table pointer, offset:2, VGPR overflows, store, a replaced high half, an advanced pointer, '
-              'lds, flat and scratch segments, an atomic; glc slc dlc accepted')
+        print('refused: off, a table pointer, offset:2, VGPR overflows, a store through a table pointer, '
+              'a replaced high half, an advanced pointer, lds, flat and scratch segments, an atomic; '
+              'glc slc dlc accepted')
 
         code = PROLOGUE + words(' '.join(LOADS.values())) + EPILOGUE
         marker, run = compile_words(code)

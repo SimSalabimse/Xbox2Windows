@@ -54,7 +54,7 @@ inline bool native_buffer_store_view(const ComputeViewBinding &binding, D3D12_UN
     }
     if (view.Buffer.StructureByteStride) return false;
     UINT stride = binding.required_bytes;
-    if (binding.kind == ComputeViewKind::raw_buffer_uav) {
+    if (binding.kind == ComputeViewKind::raw_buffer_uav || binding.kind == ComputeViewKind::root_buffer_uav) {
         if (view.Format != DXGI_FORMAT_R32_TYPELESS || view.Buffer.Flags != D3D12_BUFFER_UAV_FLAG_RAW ||
             view.Buffer.FirstElement % (D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT / 4))
             return false;

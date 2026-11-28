@@ -8,8 +8,8 @@ the Python path. Before, the frontend refused it with `unsupported instruction g
 ## The form
 
 ADDR = SADDR + zext(VADDR) + sext(OFFSET[11:0]) (RDNA 2 ISA, FLAT/GLOBAL addressing). SADDR must be the unadvanced
-root address of a root SRV, with its matching high half: the same symbol and binding (`root_buffer_srv`) the
-scalar root loads of this path already use. The load becomes a raw buffer load from that view.
+root address, with its matching high half. A root CBV or SRV is the `root_buffer_srv` binding the scalar root
+loads of this path already use. A root UAV is `root_buffer_uav`. The load becomes a raw buffer load from that view.
 
 - The 32-bit byte offset zext(VADDR) + OFFSET is guarded to [0, 2^32): a positive offset reads 0 when VADDR is
   above 2^32 - 1 - OFFSET, a negative one reads 0 when VADDR is below -OFFSET. Above the range, the unguarded
@@ -22,11 +22,12 @@ scalar root loads of this path already use. The load becomes a raw buffer load f
 - The binding's minimum size grows to the immediate offset plus 4 bytes for a positive offset; other loads keep
   the size the scalar loads need.
 
-Refused by name: the `off` form (no SADDR), the FLAT and scratch segments, other opcodes (stores,
-atomics), the `lds` form, an SADDR that is not a root address, a replaced high half, and an unaligned immediate
-offset. An SADDR advanced by scalar arithmetic is refused earlier, as an unbound numeric SGPR; `gfx2hlsl.py` accepts
-a pointer advanced by a known literal. Graphics stages never decode the FLAT encoding and keep
-`unsupported instruction` (not covered by the fixture).
+Refused by name: the `off` form (a VGPR address pair, not a root offset), the FLAT and scratch segments,
+sub-DWORD opcodes and atomics, the `lds` form, an SADDR that is not a root address, a replaced high half, and an
+unaligned immediate offset. DWORD stores through a root UAV are a separate lowering
+([root-UAV global stores](native-direct-global-store.md)). An SADDR advanced by scalar arithmetic is refused
+earlier, as an unbound numeric SGPR; `gfx2hlsl.py` accepts a pointer advanced by a known literal. Graphics stages
+never decode the FLAT encoding and keep `unsupported instruction` (not covered by the fixture).
 
 ## Limits
 

@@ -539,31 +539,43 @@ struct DirectCompute {
         return ir.handle({0, binding->shader_register, 11});
     }
 
-    // Global DWORD loads in the saddr form: ADDR = SADDR + zext(VADDR) + sext(OFFSET[11:0]) (RDNA 2 ISA,
-    // FLAT/GLOBAL addressing), with SADDR the unadvanced root address of a root SRV, as for the scalar root loads.
-    // Guard the first and last DWORD offsets against 32-bit wrap. The low two address bits are dropped,
+    // Global DWORD memory in the saddr form: ADDR = SADDR + zext(VADDR) + sext(OFFSET[11:0]) (RDNA 2 ISA,
+    // FLAT/GLOBAL addressing). SADDR is the unadvanced root address. A CBV or SRV is read; a UAV is read or
+    // written. Guard the first and last DWORD against 32-bit wrap. The low two address bits are dropped,
     // as for buffer_load_dword in this path (DWORD alignment mode).
-    void global_load(const Inst &i, const State &s) {
-        constexpr unsigned widths[]{1, 2, 4, 3}; // GFX10 opcodes 12..15.
-        const unsigned count = widths[i.op - 12];
-        if (i.dst + count > 256)
-            refuse(i.pc, "global load destination register range");
+    void global_root(const Inst &i, const State &s, bool store, unsigned count, string &handle, string &aligned,
+                     string &in_range) {
+        const char *what = store ? "global store" : "global load";
         const unsigned base = (i.b >> 16) & 127;
         if (base > 104 || (base & 1))
-            refuse(i.pc, "global load base must be an aligned SGPR pair");
+            refuse(i.pc, string(what) + " base must be an aligned SGPR pair");
         const auto &low = s.at(base);
         if (low.type != Symbol::Type::root_address)
-            refuse(i.pc, "global load base is not a root buffer address");
-        const Symbol high{Symbol::Type::root_address, low.value, 1};
+            refuse(i.pc, string(what) + " base is not a root buffer address");
+        const Symbol high{Symbol::Type::root_address, low.value, 1u, low.index_mask};
         if (low.offset || !(s.at(base + 1) == high))
-            refuse(i.pc, "global load base is an advanced or mismatched root address");
+            refuse(i.pc, string(what) + " base is an advanced or mismatched root address");
+        if (store && low.index_mask != 1)
+            refuse(i.pc, "global store base is not a root UAV");
         const int offset = int(Word(i.a) << 20) >> 20;
         if (offset % 4)
-            refuse(i.pc, "global load at an unaligned immediate offset");
-        const unsigned span = static_cast<unsigned>((std::max)(offset, 0)) + count * 4;
-        const auto h = root_buffer_handle(low.value, span);
+            refuse(i.pc, string(what) + " at an unaligned immediate offset");
+        const unsigned span = static_cast<unsigned>((std::max)(offset, 0)) + count * 4u;
+        const bool uav = low.index_mask == 1;
+        const auto kind = uav ? ComputeViewKind::root_buffer_uav : ComputeViewKind::root_buffer_srv;
+        auto &bindings = analysis.result.bindings;
+        auto binding = std::find_if(bindings.begin(), bindings.end(), [&](const auto &b) {
+            return b.kind == kind && b.root_parameter == low.value && b.byte_offset == 0;
+        });
+        if (binding == bindings.end()) {
+            const unsigned reg = uav ? analysis.uav++ : analysis.srv++;
+            bindings.push_back({kind, low.value, 0u, reg, span});
+            binding = std::prev(bindings.end());
+        } else
+            binding->required_bytes = (std::max)(binding->required_bytes, span);
+        ir.features |= 16;
+        handle = ir.handle({unsigned(uav), binding->shader_register, 11u});
         const auto vaddr = read(256 + (i.b & 255));
-        string in_range;
         if (offset < 0)
             in_range = cmp("uge", vaddr, to_string(-offset));
         const int last_offset = offset + static_cast<int>((count - 1) * 4);
@@ -572,7 +584,16 @@ struct DirectCompute {
             in_range = in_range.empty() ? upper : ir.value("and i1 " + in_range + ", " + upper);
         }
         const auto addr = offset ? ir.binary("add", vaddr, to_string(offset)) : vaddr;
-        const auto ret = load_buffer(h, ir.binary("and", addr, "4294967292"), true, count);
+        aligned = ir.binary("and", addr, "4294967292");
+    }
+    void global_load(const Inst &i, const State &s) {
+        constexpr unsigned widths[]{1u, 2u, 4u, 3u}; // GFX10 opcodes 12..15.
+        const unsigned count = widths[i.op - 12];
+        if (i.dst + count > 256)
+            refuse(i.pc, "global load destination register range");
+        string handle, aligned, in_range;
+        global_root(i, s, false, count, handle, aligned, in_range);
+        const auto ret = load_buffer(handle, aligned, true, count);
         for (unsigned j = 0; j < count; ++j) {
             auto value = ir.value("extractvalue %dx.types.ResRet.i32 " + ret + ", " + to_string(j));
             if (!in_range.empty())
@@ -580,9 +601,38 @@ struct DirectCompute {
             vector_write(256 + i.dst + j, value);
         }
     }
+    void global_store(const Inst &i, const State &s) {
+        constexpr unsigned widths[]{1u, 2u, 4u, 3u}; // GFX10 opcodes 0x1c..0x1f.
+        const unsigned count = widths[i.op - 0x1c];
+        const unsigned data = (i.b >> 8) & 255;
+        if (data + count > 256)
+            refuse(i.pc, "global store data register range");
+        string handle, aligned, in_range;
+        global_root(i, s, true, count, handle, aligned, in_range);
+        std::array<string, 4> values;
+        for (unsigned j = 0; j < count; ++j)
+            values[j] = read(256 + data + j);
+        string pred = active();
+        if (!in_range.empty())
+            pred = ir.value("and i1 " + pred + ", " + in_range);
+        const string tag = to_string(label_number++);
+        ir.body << "  br i1 " << pred << ", label %gstore" << tag << ", label %gstoreEnd" << tag << "\ngstore" << tag
+                << ":\n";
+        std::vector<std::pair<string, string>> args{{"%dx.types.Handle", handle}, {"i32", aligned}, {"i32", "undef"}};
+        for (unsigned j = 0; j < 4; ++j)
+            args.emplace_back("i32", j < count ? values[j] : "undef");
+        args.emplace_back("i8", to_string((1u << count) - 1u));
+        args.emplace_back("i32", "4");
+        ir.invoke("void", "rawBufferStore.i32", 140, args, "nounwind");
+        ir.body << "  br label %gstoreEnd" << tag << "\ngstoreEnd" << tag << ":\n";
+    }
     void memory(const Inst &i, const State &s) {
         if (i.name.substr(0, 17) == "global_load_dword") {
             global_load(i, s);
+            return;
+        }
+        if (i.name.substr(0, 18) == "global_store_dword") {
+            global_store(i, s);
             return;
         }
         if (i.enc == Encoding::Mubuf && i.name.substr(0, 8) == "tbuffer_") {
@@ -697,9 +747,9 @@ struct DirectCompute {
             unsigned off = i.b & 0xfffff, n = memory_count(i);
             string h;
             if (root) {
-                const Symbol high{Symbol::Type::root_address, low.value, 1};
+                const Symbol high{Symbol::Type::root_address, low.value, 1u, low.index_mask};
                 const bool stride_one = i.op >= 8 && s.at(i.src[0] + 1) ==
-                    Symbol{Symbol::Type::root_stride_one_high, low.value, 1};
+                    Symbol{Symbol::Type::root_stride_one_high, low.value, 1u};
                 if (low.offset || (!(s.at(i.src[0] + 1) == high) && !stride_one))
                     refuse(i.pc, "mismatched root address high half");
                 // Like Victory's Source::Built, retain the root identity through
