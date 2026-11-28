@@ -1,12 +1,14 @@
 """Publish a source-built one-component D16 buffer store and check the written halfwords.
 
 No game data. The program is a gfx1013 `buffer_store_format` with the D16 bit and one
-component (the direct compiler's `packed_d16_x_uav`). `compile_dxil --requests` must
-publish `uav 0 bufd16x table 1 32 bytes 2`. The stand-in then dispatches that translation.
-The reference halfwords are the low half of `v_xor_b32` of the literal `0xc0003c00` with
-the lane id, which for lanes 0..12 is `0x3c00 + lane`. An R32_UINT view (two halfwords
-per element), a stride other than 2, and a descriptor with swizzle flags set must refuse
-by name. Before publication the dispatch stays `no translation`.
+component. That store is the half-buffer UAV, so `compile_dxil --requests` must publish
+`uav 0 bufhalf table 1 32 bytes 2` and must not publish `bufd16x`. `bufd16x` is only for
+a binding whose kind is `packed_d16_x_uav`. The stand-in then dispatches the half-buffer
+translation. The reference halfwords are the low half of `v_xor_b32` of the literal
+`0xc0003c00` with the lane id, which for lanes 0..12 is `0x3c00 + lane`. An R32_UINT
+view (two halfwords per element), a stride other than 2, and a descriptor with swizzle
+flags set must refuse by the half-buffer name. Before publication the dispatch stays
+`no translation`.
 
 usage:
   startup_compute_packed_d16_x_uav_check.py
@@ -31,9 +33,9 @@ STRIDE = 2
 FLOAT16 = 13
 UINT32 = 20
 WORD3_BASE = 0x01000fac
-INCOMPATIBLE = 'formatted D16 write has an incompatible typed buffer UAV'
+INCOMPATIBLE = 'a half buffer store requires matching format, stride and structured bounds'
 MODE = 'dispatch-records32-output-offset'
-MANIFEST_LINE = f'uav 0 bufd16x table 1 32 bytes {STRIDE}'
+MANIFEST_LINE = f'uav 0 bufhalf table 1 32 bytes {STRIDE}'
 
 
 def vop2(op, dst, src0, src1):
@@ -130,6 +132,7 @@ def publish(compile_dxil, sdk, cache, key):
     assert result.returncode == 0 and manifest.is_file(), (result.returncode, result.stdout, result.stderr)
     text = manifest.read_text()
     assert MANIFEST_LINE in text.splitlines(), text
+    assert not any(line.startswith('uav ') and ' bufd16x ' in line for line in text.splitlines()), text
     assert not (cache / f'{key}.cs.hlsl').exists(), 'expected native publication'
 
 

@@ -744,9 +744,10 @@ struct DirectCompute {
         unsigned n = raw ? widths[i.op & 3] : (i.op & 3) + 1, data = 256 + i.dst;
         if (i.dst + (half ? (n + 1) / 2 : n) > 256)
             refuse(i.pc, "direct buffer data overflow");
-        const bool packed_x = half && n == 1 && !graphics_input;
-        auto kind = store ? (raw    ? ComputeViewKind::raw_buffer_uav
-                             : packed_x ? ComputeViewKind::packed_d16_x_uav
+        // A one-component D16 store is the half-buffer UAV. Its published line is
+        // `bufhalf` with a 2-byte stride. packed_d16_x_uav is a different binding
+        // and is the only kind that publishes `bufd16x`.
+        auto kind = store ? (raw  ? ComputeViewKind::raw_buffer_uav
                              : half ? ComputeViewKind::half_buffer_uav
                                     : ComputeViewKind::typed_buffer_uav)
                     : raw && s.at(((i.b >> 16) & 31) * 4 + 1).type == Symbol::Type::zero_stride_word
@@ -823,22 +824,20 @@ struct DirectCompute {
             if (j < n || !raw) {
                 const unsigned component = (std::min)(j, n - 1);
                 value = read(data + (half ? component / 2 : component));
-                if (packed_x) {
-                    value = ir.binary("and", value, "65535");
-                } else if (half) {
+                if (half) {
                     if (component % 2)
                         value = ir.binary("lshr", value, "16");
                     value = ir.invoke("float", "legacyF16ToF32", 131, {{"i32", value}}, "nounwind readnone");
                 }
             }
-            args.emplace_back(half && !packed_x ? "float" : "i32", value);
+            args.emplace_back(half ? "float" : "i32", value);
         }
         args.emplace_back("i8", to_string(raw ? (1u << n) - 1 : 15));
         if (raw)
             args.emplace_back("i32", "4");
         ir.invoke("void",
-                  raw    ? "rawBufferStore.i32"
-                  : half && !packed_x ? "bufferStore.f32"
+                  raw  ? "rawBufferStore.i32"
+                  : half ? "bufferStore.f32"
                          : "bufferStore.i32",
                   raw ? 140 : 69, args, "nounwind");
         if (!graphics_input)
