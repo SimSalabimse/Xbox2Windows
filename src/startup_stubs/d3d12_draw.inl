@@ -2609,6 +2609,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
         : "an input buffer range exceeds the D3D12 raw SRV limit or is not whole dwords");
     ID3D12Resource* native = nullptr;
     bool upload = false;
+    bool reject_heap = false;
     int input_source = 0;
     Wrapper* device = self->own().list_device;
     if (address) {
@@ -2656,8 +2657,9 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
         D3D12_HEAP_FLAGS flags{};
         if (FAILED(native->GetHeapProperties(&props, &flags)) ||
             (props.Type != D3D12_HEAP_TYPE_DEFAULT && props.Type != D3D12_HEAP_TYPE_UPLOAD))
-            return refuse("an input buffer view token's resource is not on a default or upload heap");
-        upload = props.Type == D3D12_HEAP_TYPE_UPLOAD;
+            reject_heap = true;  // after the desktop range check: a range past the resource wins
+        else
+            upload = props.Type == D3D12_HEAP_TYPE_UPLOAD;
     }
     if (!native) return refuse("an input buffer descriptor has a null address");
     if (offset % alignment) return refuse(alignment == 4 ? "typed input range is not dword aligned" :
@@ -2670,6 +2672,12 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
     if (FAILED(native->GetDevice(IID_PPV_ARGS(native_device.GetAddressOf()))) || native_device.Get() != device_of(device))
         return refuse("an input buffer's resource is on another device");
     const auto desc = native->GetDesc();
+    // A view recorded without a desktop descriptor still names this resource. Its byte range is decided
+    // before the heap type, so a range past the end is not reported as the wrong kind of heap.
+    if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && !(desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) &&
+        (offset > desc.Width || bytes > desc.Width - offset))
+        return refuse("an input range is outside its desktop buffer");
+    if (reject_heap) return refuse("an input buffer view token's resource is not on a default or upload heap");
     if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || (desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) ||
         offset > desc.Width || bytes > desc.Width - offset) return refuse("an input range is outside its desktop buffer");
     trace_compute_output_use(self, OutputUse::shader_gpu_read, "raw-SRV-range-resolved", owner, 0, offset, bytes);

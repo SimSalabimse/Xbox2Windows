@@ -19,8 +19,15 @@ used to share one census sentence, `an input view token is not a buffer view of 
 11. `an input view token's placed or copied resource has no desktop backing`
 12. `an input view token has no desktop resource`
 
-The census still keeps the first reason of each key. A later range check is unchanged: a view that
-passes this gate can still be refused because its element size, alignment, alias, or span fails.
+The census still keeps the first reason of each key. A buffer view that passes this gate is then
+refused, in this order, for element size, an empty or oversized range, a placed span or alias, a
+null address, alignment, a released resource, a resource not created in the common state, or a
+resource on another device. The next check is the desktop width,
+`an input range is outside its desktop buffer`. A resource with no title memory is refused for its
+heap type only after that, with
+`an input buffer view token's resource is not on a default or upload heap`. A view recorded
+without a desktop descriptor still names its resource, so a range past that resource's width uses
+the width sentence.
 
 A typed or raw buffer view whose resource has a desktop object passes this gate. The fixture binds
 two of those on the placed input buffer that aliases title memory, an `R32_UINT` view and a raw
@@ -31,8 +38,8 @@ and the Linux reference is what checks that sentence. The sampler refusal copies
 one-entry sampler heap. The compute table is a CBV/SRV/UAV heap, and a sampler descriptor written
 there faults in the desktop runtime before the dispatch is recorded. A buffer view that extends
 past its resource is recorded and not created: the desktop call removes the device. The fixture's
-past-the-end token is that view of a custom-heap buffer, so the range is refused against the
-desktop width rather than as a placed allocation.
+past-the-end token is that view of a custom-heap buffer with no title memory. The width sentence
+is what refuses it. Removing that check leaves the heap-type sentence, and the control fails.
 
 `tests/startup_compute_dispatch_input_check.py` still expects the historical sentence for
 `dispatch-input-token`. This note does not change that test.

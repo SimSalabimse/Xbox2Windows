@@ -128,6 +128,41 @@ def reference():
     print(f"startup_compute_input_view_token reference: {len(CASES)} shapes, {len(set(declared))} refusal sentences")
 
 
+RANGE = "an input range is outside its desktop buffer"
+HEAP = "an input buffer view token's resource is not on a default or upload heap"
+
+
+def binding_body(draw):
+    start = draw.index("IndirectBufferView indirect_table_buffer")
+    end = draw.index("\nstruct FormattedBufferDescriptor", start)
+    return draw[start:end]
+
+
+def first_backing_reason(body, applicable):
+    for reason in re.findall(r'return refuse\("([^"]+)"\)', body):
+        if applicable.get(reason):
+            return reason
+    return None
+
+
+def backing_order(draw):
+    """A recorded past-the-end view is refused for its range before its heap type."""
+    body = binding_body(draw)
+    past = {RANGE: True, HEAP: True}
+    fitting = {RANGE: False, HEAP: True}
+    assert first_backing_reason(body, past) == RANGE
+    assert first_backing_reason(body, fitting) == HEAP, "a fitting view of a non-default heap must keep its heap reason"
+    mutant = body.replace('return refuse("%s")' % RANGE, "")
+    try:
+        assert first_backing_reason(mutant, past) == RANGE
+    except AssertionError:
+        got = first_backing_reason(mutant, past)
+        assert got == HEAP, got
+        print("past range check removed: refused for heap type, as required")
+    else:
+        raise AssertionError("past negative still passed after the range check was removed")
+
+
 def controls():
     reference()
     draw = DRAW.read_text(encoding="utf-8")
@@ -135,7 +170,8 @@ def controls():
     assert 'return refuse("an input view token has an unrecognized slot")' in draw
     assert HISTORICAL not in draw, "the historical sentence now lives only in input_view_token.h"
     assert "an input is in a placed buffer that does not alias title memory" in draw
-    assert "an input range is outside its desktop buffer" in draw
+    assert RANGE in draw
+    backing_order(draw)
     device = DEVICE.read_text(encoding="utf-8")
     assert 'skip = "a buffer shader resource view extends past the resource"' in device
     consumer = CONSUMER.read_text(encoding="utf-8")
