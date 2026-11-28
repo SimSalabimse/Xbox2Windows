@@ -61,7 +61,7 @@ REFUSALS = [
     ('008034dc010004ff', 'global load destination register range'),             # x2 beginning at v255
     ('00803cdc010004fe', 'global load destination register range'),             # x3 beginning at v254
     ('008038dc010004fd', 'global load destination register range'),             # x4 beginning at v253
-    ('008070dc01140400', 'global store base is not a root buffer address'),     # global_store_dword through the table pointer
+    ('008070dc01140400', 'global store base is not a root UAV'),                 # global_store_dword v1, v20, s[4:5] (root SRV)
     ('800385be 008030dc01000414', 'global load base is an advanced or mismatched root address'),  # s_mov_b32 s5, 0
     ('04900480 008030dc01000414', 'unbound numeric SGPR s4'),  # s_add_u32 s4, s4, 16 on the root address
     ('00a030dc01000414', 'does not lower an LDS result'),                         # the lds bit
@@ -150,7 +150,7 @@ def main(compiler, replay, sdk):
             assert run.returncode and message in run.stderr, (code, message, run.stdout, run.stderr)
         _, run = compile_words(PROLOGUE + words(POLICY) + EPILOGUE)
         assert run.returncode == 0, run.stderr
-        print('refused: off, a table pointer, offset:2, VGPR overflows, a store through a table pointer, '
+        print('refused: off, a table pointer, offset:2, VGPR overflows, a store through the root SRV, '
               'a replaced high half, an advanced pointer, lds, flat and scratch segments, an atomic; '
               'glc slc dlc accepted')
 
