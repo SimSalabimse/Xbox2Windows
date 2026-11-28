@@ -222,6 +222,11 @@ static void* make_committed(void* device, D3D12_HEAP_TYPE type, const D3D12_RESO
 // the two buffers, dispatch-input-copied a third buffer placed there at an offset the desktop cannot alias, and
 // dispatch-input-null (all four words zero, an unbound buffer) is not refused and reads zeros;
 // dispatch-input-token writes the token of a texture view where the input descriptor was.
+// dispatch-input-token-typed and -raw replace it with a buffer view of the aliased input buffer (R32_UINT, or a raw
+// R32_TYPELESS view). dispatch-input-token-past is that typed view four elements past the buffer.
+// dispatch-input-token-copied is a typed view of the buffer placed where the desktop cannot alias it.
+// dispatch-input-token-unknown writes a token id no view record has. dispatch-input-token-uav and -sampler write
+// those view tokens in the input slot.
 // Output descriptors the dispatch refuses, one reason each: dispatch-output-texture-token, -unplaced and -copied do
 // to the output what dispatch-input-token, -unplaced and -copied do to the input, dispatch-output-unaligned starts
 // the output 8 bytes into its buffer and dispatch-output-state places the output buffer in the unordered access state.
@@ -316,11 +321,11 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
     // exist only in title memory (the desktop copy of a buffer that does not alias holds zeros); dispatch-input-copied
     // leaves that memory zero.
     if (mode == "dispatch-input-snapshot" || long_run) std::memcpy(reinterpret_cast<void*>(between), input, sizeof(input));
+    void* copied = nullptr;
     if (mode == "dispatch-input-copied" || mode == "dispatch-input-snapshot" || long_run || mode == "dispatch-root-srv-copied" ||
-        mode == "dispatch-output-copied") {
+        mode == "dispatch-output-copied" || mode == "dispatch-input-token-copied") {
         const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, long_run ? long_records * sizeof(UINT) : words * sizeof(UINT), 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
             D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
-        void* copied = nullptr;
         if (FAILED(static_cast<HRESULT>(invoke(device, 133, word(reinterpret_cast<void*>(between)), word(&desc), D3D12_RESOURCE_STATE_COMMON, 0,
                 word(&__uuidof(ID3D12Resource)), word(&copied))))) return 71;
     }
@@ -602,6 +607,48 @@ static int dispatch_slot67(IDXGIAdapter* adapter, void* device, const std::strin
         // The token is wider than a table descriptor: the output descriptor after it is written again.
         std::memcpy(reinterpret_cast<void*>(cpu + sizeof(descriptors[0])), descriptors[1], sizeof(descriptors[1]));
         std::memcpy(unplaced + 4, buffers[0], words * sizeof(UINT));
+    }
+    const auto restore_output_descriptor = [&] {
+        std::memcpy(reinterpret_cast<void*>(cpu + sizeof(descriptors[0])), descriptors[1], sizeof(descriptors[1]));
+    };
+    if (mode == "dispatch-input-token-typed" || mode == "dispatch-input-token-raw" || mode == "dispatch-input-token-past" ||
+        mode == "dispatch-input-token-copied") {
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+        view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.Buffer.FirstElement = 0;
+        view.Buffer.NumElements = mode == "dispatch-input-token-past" ? words + 4 : words;
+        if (mode == "dispatch-input-token-raw") {
+            view.Format = DXGI_FORMAT_R32_TYPELESS;
+            view.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+        } else {
+            view.Format = DXGI_FORMAT_R32_UINT;
+        }
+        void* const resource = mode == "dispatch-input-token-copied" ? copied : placed[0];
+        if (!resource) return 71;
+        invoke(device, 18, word(resource), word(&view), cpu);
+        restore_output_descriptor();
+    }
+    if (mode == "dispatch-input-token-unknown") {
+        constexpr UINT token_magic = 0x56573258;  // "X2WV"
+        const UINT token[4] = {token_magic, 0x00ffffffu, 18, 0};
+        std::memcpy(reinterpret_cast<void*>(cpu), token, sizeof(token));
+    }
+    if (mode == "dispatch-input-token-uav") {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+        view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        view.Format = DXGI_FORMAT_R32_TYPELESS;
+        view.Buffer.NumElements = words;
+        view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+        invoke(device, 19, word(placed[1]), 0, word(&view), cpu);
+        restore_output_descriptor();
+    }
+    if (mode == "dispatch-input-token-sampler") {
+        D3D12_SAMPLER_DESC sampler{};
+        sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+        sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        sampler.MaxLOD = D3D12_FLOAT32_MAX;
+        invoke(device, 22, word(&sampler), cpu);
     }
     if (root_srv && mode != "dispatch-root-srv-unset") {
         UINT64 addr0 = reinterpret_cast<UINT64>(buffers[0]);

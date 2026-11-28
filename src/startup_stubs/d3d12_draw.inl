@@ -10,6 +10,12 @@
 // upload ring / a private descriptor heap.
 
 #include "startup_stubs/typed_uav_load.h"
+#include "startup_stubs/input_view_token.h"
+
+static_assert(D3D12_SRV_DIMENSION_BUFFER == 1, "input view token facts use 1 for a buffer SRV");
+static_assert(static_cast<unsigned>(Placement::none) == 0, "input view token facts use 0 for no placement");
+static_assert(static_cast<unsigned>(Placement::aliased_buffer) == 1, "input view token facts use 1 for an aliased buffer");
+static_assert(static_cast<unsigned>(Placement::copied_buffer) == 2, "input view token facts use 2 for a copied buffer");
 
 // A pixel-stage image store (#1996 item F, #2742): tools/startup/gfx2hlsl.py writes 'uav N tex2d|tex2da table P O'
 // for the RWTexture2D<float4> or RWTexture2DArray<float4> at u<N>, whose descriptor is at byte O of the title's
@@ -2525,20 +2531,37 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
     if (why) *why = nullptr;
     if (words[0] == view_token_magic) {
         ViewRecord record{};
+        bool known = false;
         AcquireSRWLockShared(&note_lock);
-        if (words[1] < view_records().size()) record = view_records()[words[1]];
+        if (words[1] < view_records().size()) {
+            record = view_records()[words[1]];
+            known = true;
+        }
         ReleaseSRWLockShared(&note_lock);
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+        const bool described = known && record.slot == 18 && record.desc_bytes >= 40;
+        if (described) std::memcpy(&view, record.desc, 40);
+        Wrapper* const token_owner = described ? as_wrapper(reinterpret_cast<const void*>(record.resource)) : nullptr;
+        const bool token_resource = token_owner && token_owner->own().kind == resource_kind;
+        const ResourceInfo* token_info = token_resource ? resource_info(token_owner) : nullptr;
+        InputViewTokenFacts facts;
+        facts.known = known;
+        facts.slot = record.slot;
+        facts.desc_bytes = record.desc_bytes;
+        facts.view_dimension = described ? static_cast<std::uint32_t>(view.ViewDimension) : 0;
+        facts.resource_pointer = record.resource != 0;
+        facts.wrapper = token_owner != nullptr;
+        facts.resource = token_resource;
+        facts.desktop = token_resource && token_owner->own().real != nullptr;
+        facts.placement = token_info ? static_cast<std::uint32_t>(token_info->placement) : 0;
+        if (const char* token_reason = input_view_token_refusal(facts)) return refuse(token_reason);
         if (record.slot == 17 && record.desc_bytes >= 12) {
             UINT size = 0;
             std::memcpy(&address, record.desc, 8);
             std::memcpy(&size, record.desc + 8, 4);
             bytes = size;
-        } else if (record.slot == 18 && record.desc_bytes >= 40) {
-            D3D12_SHADER_RESOURCE_VIEW_DESC view{};
-            std::memcpy(&view, record.desc, 40);
-            owner = as_wrapper(reinterpret_cast<const void*>(record.resource));
-            if (!owner || owner->own().kind != resource_kind || !owner->own().real ||
-                view.ViewDimension != D3D12_SRV_DIMENSION_BUFFER) return refuse("an input view token is not a buffer view of a desktop resource");
+        } else if (record.slot == 18 && record.desc_bytes >= 40 && view.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
+            owner = token_owner;
             const bool raw = view.Buffer.Flags == D3D12_BUFFER_SRV_FLAG_RAW && !view.Buffer.StructureByteStride &&
                 view.Format == DXGI_FORMAT_R32_TYPELESS;
             const bool structured = view.Buffer.Flags == D3D12_BUFFER_SRV_FLAG_NONE && view.Buffer.StructureByteStride &&
@@ -2563,7 +2586,7 @@ IndirectBufferView indirect_table_buffer(Wrapper* self, const std::uint32_t* wor
                 if (!own_memory) address = base + offset;
             }
         } else {
-            return refuse("an input view token is not a buffer view of a desktop resource");
+            return refuse("an input view token has an unrecognized slot");
         }
     } else {
         address = words[0] | (u64{words[1] & 0xffff} << 32);
