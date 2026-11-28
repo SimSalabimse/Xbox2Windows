@@ -31,12 +31,15 @@ tag = 0xA1000000 | N. Other regions, still inside the view:
   byte 5888         0, from a load of vaddr 0xfffffff4 offset 16 (the wrap guard)
   byte 6400+4*N     the tag loaded back from byte 48*N after the stores and s_waitcnt
 
-An x4 store of 0xEEEEEEEE at vaddr 0xffffffe8 offset 16 must not land. Its first DWORD is at 0xfffffff8, still
-inside the 32-bit range, and its last DWORD starts at 0x100000004. The upper guard is VADDR <= 2^32-1-(offset+12),
-which is 4294967267. Narrowing that to `last_offset = offset` accepts this VADDR and drops 4294967267 from the
-DXIL. The readback includes the 8-dword guard native_store_replay places in front of the view.
+An x4 store of 0xEEEEEEEE uses vaddr 0xffffffe4 + (group << 2) + (lane & 3) and offset 16. Every lane's
+first DWORD stays inside the 32-bit range and its last DWORD starts at or past 2^32, so the store must not land.
+The desktop compiler prints that i32 bound as a signed immediate and deletes the compare when the address is a
+constant, so the address stays data-dependent. Narrowing `last_offset` to `offset` changes the bound from -29
+to -16. The store's base is near 2^32, outside this view, so a readback of the view cannot see that mistake.
+The readback includes the 8-dword guard native_store_replay places in front of the view.
 """
 from pathlib import Path
+import re
 import struct
 import subprocess
 import sys
@@ -65,7 +68,8 @@ NEG_BASE = 4096
 SPARSE = 5120
 LOAD_SLOT = 5888
 RELOAD = 6400
-X4_WRAP = 0xffffffe8
+# First DWORD of the x4 still fits in 32 bits; the last does not. See wide_wrap_bound.
+X4_BASE = 0xffffffe4
 # s[4:5] root UAV, s6 = TGID_X. Wave32, one wave per group.
 SA = struct.pack('<7I', 0, 0, 0, 32 | 1 << 16, 1 | (1 << 20), 0, 0x80 | 6 << 1)
 # s[4:5] and s[6:7] root SRVs, s[8:9] root UAV. No group id.
@@ -95,7 +99,11 @@ def program():
         vmove(2, 255), 0xfffffff4,            # v_mov_b32 v2, 0xfffffff4
         vmove(3, 255), POISON,
         vmove(5, 255), LOAD_SLOT,
-        vmove(24, 255), X4_WRAP,
+        vmove(27, 6),                         # v_mov_b32 v27, s6
+        vop2(0x1a, 27, 128 + 2, 27),          # v_lshlrev_b32 v27, 2, v27
+        vop2(0x1b, 26, 128 + 3, 0),           # v_and_b32 v26, 3, v0
+        vop2(0x25, 24, 256 + 26, 27),         # v_add_nc_u32 v24, v26, v27
+        vop2(0x25, 24, 255, 24), X4_BASE,     # v24 = 0xffffffe4 + (group << 2) + (lane & 3)
         vmove(20, 255), POISON,
         vmove(21, 255), POISON,
         vmove(22, 255), POISON,
@@ -130,6 +138,12 @@ def program():
 
 def extent_program():
     return encode_global(0x1e, 0, 1, 4, data=10, offset=2044) + [0xbf810000]
+
+
+def wide_wrap_bound(dump):
+    # 2^32-1-(16+12) = 4294967267, printed by the desktop compiler as i32 -29.
+    # ule X, C is also written ult X, C+1 (-28). `last_offset = offset` emits -16 instead.
+    return re.search(r'(?<![\w-])(?:4294967267|-29|4294967268|-28)(?!\d)', dump) is not None
 
 
 def register_program():
@@ -197,6 +211,11 @@ def encodings():
         'global_store_dword v6, v11, s[4:5] offset:-4',
         'global_store_dword v7, v7, s[4:5]',
         'global_store_dword v2, v3, s[4:5] offset:16',
+        'v_mov_b32_e32 v27, s6',
+        'v_lshlrev_b32_e32 v27, 2, v27',
+        'v_and_b32_e32 v26, 3, v0',
+        'v_add_nc_u32_e32 v24, v26, v27',
+        'v_add_nc_u32_e32 v24, 0xffffffe4, v24',
         'global_store_dwordx4 v24, v[20:23], s[4:5] offset:16',
         'global_store_dword v8, v10, s[4:5]',
         'global_load_dword v4, v1, s[4:5]',
@@ -228,6 +247,12 @@ def encodings():
         if got != asm:
             raise AssertionError((asm, got))
     reference()
+    for sample in ('icmp ule i32 %a, -29', 'icmp ult i32 %a, -28', '4294967267', '4294967268'):
+        if not wide_wrap_bound(sample):
+            raise AssertionError(sample)
+    for sample in ('icmp ule i32 %a, -16', '4294967279', '-290', '42949672670'):
+        if wide_wrap_bound(sample):
+            raise AssertionError(sample)
     print('encodings: dword, x2, x3 and x4 stores, a UAV load, alias, negative offset and the wrap poison')
 
 
@@ -283,17 +308,17 @@ def main(compiler, replay, sdk):
         marker, run = compile_words(body, uav)
         if run.returncode != 0 or 'u0 root=0 bytes=0 min_size=48' not in run.stdout:
             raise AssertionError((run.stdout, run.stderr))
-        # x4 at offset 16 guards the last dword, 12 bytes past the first. `last_offset = offset`
-        # would emit 4294967279, the same bound as the single-dword poison store.
+        # x4 at offset 16 guards the last dword, 12 bytes past the first. The address is
+        # data-dependent so the compare is not deleted. `last_offset = offset` emits -16.
         dump = subprocess.run([Path(sdk) / 'dxc.exe', '-dumpbin', marker.with_suffix('.cso')],
                               capture_output=True, text=True, check=True).stdout
-        if '4294967267' not in dump:
+        if not wide_wrap_bound(dump):
             raise AssertionError('x4 wrap guard does not cover the last dword')
         _, regs = compile_words(register_program(), both, PAIR_SA)
         for line in ('t0 root=0 bytes=0 min_size=4', 't1 root=1 bytes=0 min_size=4', 'u0 root=2 bytes=0 min_size=4'):
             if regs.returncode != 0 or line not in regs.stdout:
                 raise AssertionError((line, regs.stdout, regs.stderr))
-        print('module: one root UAV, min_size 48, x4 wrap bound 4294967267, registers t0 t1 u0')
+        print('module: one root UAV, min_size 48, x4 wrap bound covers the last dword, registers t0 t1 u0')
 
         dest = work / 'readback.bin'
         result = subprocess.run([replay, sdk, marker, work / 'cache', '0', dest, '--direct'],

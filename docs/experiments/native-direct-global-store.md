@@ -36,10 +36,12 @@ shader model 6.6 with wave32. A missing wave32 adapter is a skip (77), not a pas
 
 The readback checks one root UAV across two groups: the four store widths, an address that aliases its data, a
 negative immediate, even lanes under a narrowed EXEC, a guarded load of vaddr 0xfffffff4 offset 16, and a
-poison store at that address which must not appear. An x4 at vaddr 0xffffffe8 offset 16 has its first DWORD
-inside the 32-bit range and its last DWORD past it; the whole store is skipped. The DXIL upper bound for that
-store is 4294967267 (`2^32 - 1 - (16 + 12)`). Dropping `(count - 1) * 4` from `last_offset` removes that
-constant, so the hardware test fails. After the stores and `s_waitcnt`, each lane loads the DWORD it wrote at
-the start of its record and writes it to a free slot. A second program binds two root SRVs and one root UAV
-and must report `t0`, `t1` and `u0`. Swapping the two dwords of the x2 reference changes the expected buffer.
-The x4 at immediate 2044 asks for a 2060-byte view and is not dispatched.
+poison store at that address which must not appear. An x4 at offset 16 uses a data-dependent vaddr whose first
+DWORD stays inside the 32-bit range and whose last DWORD does not; the whole store is skipped. The desktop
+compiler prints that bound as a signed i32 (`-29`, or `-28` if `ule` becomes `ult`) and drops the compare when
+the address is a constant. Dropping `(count - 1) * 4` from `last_offset` changes the bound to `-16`, so the
+hardware test fails. That store's base is near 2^32, outside the view, so the readback cannot show the mistake.
+After the stores and `s_waitcnt`, each lane loads the DWORD it wrote at the start of its record and writes it
+to a free slot. A second program binds two root SRVs and one root UAV and must report `t0`, `t1` and `u0`.
+Swapping the two dwords of the x2 reference changes the expected buffer. The x4 at immediate 2044 asks for a
+2060-byte view and is not dispatched.
